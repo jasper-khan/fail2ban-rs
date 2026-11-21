@@ -28,7 +28,10 @@ use crate::detect::ResumePoint;
 use crate::detect::date::DateParser;
 use crate::detect::ignore::IgnoreList;
 use crate::detect::line_matcher::LineMatcher;
+use crate::detect::reader::CheckpointSink;
 use crate::detect::watcher::Failure;
+
+use super::log_positions::LogPositionStore;
 
 /// Upper bound on waiting for all old watchers to report their position.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,7 +60,7 @@ pub(super) struct WatcherPlan {
 }
 
 /// Stable resume-map identity of one (jail, source) watcher.
-fn watcher_key(jail: &str, key_suffix: &str) -> String {
+pub(super) fn watcher_key(jail: &str, key_suffix: &str) -> String {
     format!("{jail}\u{1}{key_suffix}")
 }
 
@@ -136,6 +139,7 @@ pub(super) fn spawn_watchers(
     phase: &'static str,
     mut resume: HashMap<String, ResumePoint>,
     handoff: &Arc<AtomicBool>,
+    log_positions: Option<&Arc<LogPositionStore>>,
 ) -> Vec<WatcherHandle> {
     watcher_plan
         .into_iter()
@@ -152,6 +156,7 @@ pub(super) fn spawn_watchers(
                 phase,
                 start,
                 handoff.clone(),
+                log_positions.cloned(),
             );
             (key, handle)
         })
@@ -166,9 +171,10 @@ fn spawn_one(
     phase: &'static str,
     start: Option<ResumePoint>,
     handoff: Arc<AtomicBool>,
+    log_positions: Option<Arc<LogPositionStore>>,
 ) -> JoinHandle<Option<ResumePoint>> {
     let WatcherPlan {
-        key: _,
+        key,
         jail,
         source,
         matcher,
@@ -176,18 +182,30 @@ fn spawn_one(
         ignore_list,
     } = plan;
     match source {
-        PlanSource::File(path) => tokio::spawn(crate::detect::watcher::run_supervised_from(
-            jail,
-            path,
-            matcher,
-            date_parser,
-            ignore_list,
-            tx,
-            cancel,
-            phase,
-            start,
-            handoff,
-        )),
+        PlanSource::File(path) => {
+            let checkpoint_sink: Option<CheckpointSink> = log_positions.map(|store| {
+                let sink_key = key;
+                let sink_jail = jail.clone();
+                Box::new(move |pos| {
+                    if let Err(err) = store.update_one(&sink_key, pos) {
+                        warn!(jail = %sink_jail, error = %err, "failed to persist log position");
+                    }
+                }) as CheckpointSink
+            });
+            tokio::spawn(crate::detect::watcher::run_supervised_from(
+                jail,
+                path,
+                matcher,
+                date_parser,
+                ignore_list,
+                tx,
+                cancel,
+                phase,
+                start,
+                handoff,
+                checkpoint_sink,
+            ))
+        }
         PlanSource::Journal(journalmatch) => {
             // The journal source speaks the native engine only; legacy
             // filters never reach it (compat admits only the polling backend).
@@ -217,24 +235,53 @@ pub(super) struct Watchers {
     cancel: CancellationToken,
     handles: Vec<WatcherHandle>,
     handoff: Arc<AtomicBool>,
+    log_positions: Option<Arc<LogPositionStore>>,
 }
 
 impl Watchers {
-    /// Spawn watchers for `plan` under a fresh token.
+    /// Spawn watchers for `plan` under a fresh token without persistent
+    /// log-position checkpointing.
+    #[cfg(test)]
     pub(super) fn spawn(
         plan: Vec<WatcherPlan>,
         failure_tx: &mpsc::Sender<Failure>,
         phase: &'static str,
         resume: HashMap<String, ResumePoint>,
     ) -> Self {
+        Self::spawn_with_positions(plan, failure_tx, phase, resume, None)
+    }
+
+    /// Spawn watchers for `plan` under a fresh token, optionally persisting
+    /// file checkpoints into `log_positions`.
+    pub(super) fn spawn_with_positions(
+        plan: Vec<WatcherPlan>,
+        failure_tx: &mpsc::Sender<Failure>,
+        phase: &'static str,
+        resume: HashMap<String, ResumePoint>,
+        log_positions: Option<Arc<LogPositionStore>>,
+    ) -> Self {
         let cancel = CancellationToken::new();
         let handoff = Arc::new(AtomicBool::new(false));
-        let handles = spawn_watchers(plan, failure_tx, &cancel, phase, resume, &handoff);
+        let handles = spawn_watchers(
+            plan,
+            failure_tx,
+            &cancel,
+            phase,
+            resume,
+            &handoff,
+            log_positions.as_ref(),
+        );
         Self {
             cancel,
             handles,
             handoff,
+            log_positions,
         }
+    }
+
+    /// Shared handle to the persistent log-position store, if enabled.
+    pub(super) fn log_positions(&self) -> Option<Arc<LogPositionStore>> {
+        self.log_positions.clone()
     }
 
     /// Reload must wait for every watcher to deliver queued failures and
@@ -248,6 +295,7 @@ impl Watchers {
                 points.insert(key, point);
             }
         }
+        self.persist_points(&points);
         points
     }
 
@@ -266,7 +314,16 @@ impl Watchers {
                 points.insert(key, point);
             }
         }
+        self.persist_points(&points);
         points
+    }
+
+    fn persist_points(&self, points: &HashMap<String, ResumePoint>) {
+        if let Some(store) = &self.log_positions
+            && let Err(err) = store.update_batch(points)
+        {
+            warn!(error = %err, "failed to persist final log positions");
+        }
     }
 }
 

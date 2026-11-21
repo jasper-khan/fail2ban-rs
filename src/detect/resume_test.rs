@@ -136,3 +136,82 @@ fn test_resume_point_kind_mismatch_is_ignored() {
     let file = ResumePoint::file(FilePosition::absent(PathBuf::from("/x")));
     assert!(file.into_journal_cursor().is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn test_start_for_persisted_valid_rotated_truncated_and_invalid() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a.log");
+    std::fs::write(&path, "first line\nsecond line\n").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let sha1 = crate::detect::legacy_file_identity::file_first_line_sha1(
+        &file,
+        crate::detect::watcher::MAX_LINE_LEN + 1,
+    )
+    .unwrap();
+    let meta = file.metadata().unwrap();
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+
+    // 1. Legacy-style valid checkpoint (no inode, matching SHA-1, 0 < offset <= size).
+    let valid = PersistedFilePosition {
+        path: path.clone(),
+        inode: None,
+        first_line_sha1: Some(sha1.clone()),
+        offset: Some(11),
+    };
+    assert_eq!(start_for_persisted(&path, &valid, &file), StartAt::Offset(11));
+
+    // 2. Valid at exact EOF.
+    let at_eof = PersistedFilePosition {
+        offset: Some(meta.len()),
+        ..valid.clone()
+    };
+    assert_eq!(
+        start_for_persisted(&path, &at_eof, &file),
+        StartAt::Offset(meta.len())
+    );
+
+    // 3. Truncated (size < offset) -> fallback to Start (0).
+    let truncated = PersistedFilePosition {
+        offset: Some(meta.len() + 1),
+        ..valid.clone()
+    };
+    assert_eq!(
+        start_for_persisted(&path, &truncated, &file),
+        StartAt::Start
+    );
+
+    // 4. Rotated (different first-line SHA-1) -> fallback to Start (0).
+    let rotated_hash = PersistedFilePosition {
+        first_line_sha1: Some("0".repeat(40)),
+        ..valid.clone()
+    };
+    assert_eq!(
+        start_for_persisted(&path, &rotated_hash, &file),
+        StartAt::Start
+    );
+
+    // 5. Rotated (Rust-persisted inode mismatch even with same first line) -> Start (0).
+    let rotated_ino = PersistedFilePosition {
+        inode: Some(ino.wrapping_add(1)),
+        ..valid.clone()
+    };
+    assert_eq!(
+        start_for_persisted(&path, &rotated_ino, &file),
+        StartAt::Start
+    );
+
+    // 6. Invalid checkpoints (offset None/0, hash None/empty) -> fallback to Start (0).
+    for invalid in [
+        PersistedFilePosition { offset: None, ..valid.clone() },
+        PersistedFilePosition { offset: Some(0), ..valid.clone() },
+        PersistedFilePosition { first_line_sha1: None, ..valid.clone() },
+        PersistedFilePosition { first_line_sha1: Some(String::new()), ..valid.clone() },
+    ] {
+        assert_eq!(start_for_persisted(&path, &invalid, &file), StartAt::Start);
+    }
+
+    // 7. Mismatched path -> End.
+    let other_path = dir.path().join("other.log");
+    assert_eq!(start_for_persisted(&other_path, &valid, &file), StartAt::End);
+}

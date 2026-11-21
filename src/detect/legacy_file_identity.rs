@@ -120,6 +120,13 @@ fn file_metadata(file: &File) -> io::Result<(Metadata, Identity)> {
     Ok((metadata, identity))
 }
 
+/// Compute the Fail2Ban 1.1.1 first-line SHA-1 hex fingerprint of `file`
+/// without moving its seek position. Returns `""` when the file is empty or
+/// its first line is not yet terminated.
+pub(crate) fn file_first_line_sha1(file: &File, max: usize) -> io::Result<String> {
+    first_fingerprint(file, max)
+}
+
 fn first_fingerprint(file: &File, max: usize) -> io::Result<String> {
     let mut record = Vec::new();
     let mut chunk = [0_u8; 4096];

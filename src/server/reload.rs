@@ -98,8 +98,9 @@ async fn restart_watchers(
     failure_tx: &mpsc::Sender<Failure>,
     watchers: &mut Watchers,
 ) {
+    let log_positions = watchers.log_positions();
     let resume = watchers.stop_for_reload().await;
-    *watchers = Watchers::spawn(plan, failure_tx, "reload", resume);
+    *watchers = Watchers::spawn_with_positions(plan, failure_tx, "reload", resume, log_positions);
 }
 
 /// Send the reloaded enabled-jail configs to the tracker; returns the count.

@@ -21,8 +21,8 @@ pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
 use crate::detect::date::DateParser;
 use crate::detect::ignore::IgnoreList;
 use crate::detect::line_matcher::LineMatcher;
-use crate::detect::reader::read_loop;
-use crate::detect::resume::{FilePosition, ResumePoint};
+use crate::detect::reader::{CheckpointSink, read_loop};
+use crate::detect::resume::{FilePosition, PersistedFilePosition, ResumePoint};
 
 /// A detected authentication failure.
 #[derive(Debug, Clone)]
@@ -108,6 +108,7 @@ pub async fn run_from(
         phase,
         resume,
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await
 }
@@ -126,13 +127,14 @@ pub(crate) async fn run_supervised_from(
     phase: &'static str,
     resume: Option<ResumePoint>,
     handoff: Arc<AtomicBool>,
+    checkpoint_sink: Option<CheckpointSink>,
 ) -> Option<ResumePoint> {
     info!(phase, jail = %jail_id, path = %log_path.display(), "watcher started");
 
     let (line_tx, mut line_rx) = mpsc::channel::<Failure>(LINE_CHANNEL_CAPACITY);
     let reader_cancel = cancel.child_token();
     let (reader_jail, rc) = (jail_id.clone(), reader_cancel.clone());
-    let start = resume.and_then(ResumePoint::into_file);
+    let start = resume.and_then(ResumePoint::into_file_start);
     let reader_handle = tokio::task::spawn_blocking(move || {
         read_loop(
             reader_jail,
@@ -143,6 +145,7 @@ pub(crate) async fn run_supervised_from(
             line_tx,
             rc,
             start,
+            checkpoint_sink,
         )
     });
 
@@ -268,10 +271,10 @@ async fn drain(
 /// Await the blocking reader and convert its final position.
 async fn join_reader(
     jail_id: &str,
-    handle: tokio::task::JoinHandle<Option<FilePosition>>,
+    handle: tokio::task::JoinHandle<Option<(FilePosition, Option<PersistedFilePosition>)>>,
 ) -> Option<ResumePoint> {
     match handle.await {
-        Ok(pos) => pos.map(ResumePoint::file),
+        Ok(pos) => pos.map(|(live, persisted)| ResumePoint::file_with_persisted(live, persisted)),
         Err(e) => {
             error!(jail = %jail_id, error = %e, "watcher reader task failed");
             None

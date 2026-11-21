@@ -459,3 +459,625 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     assert!(!runtime.join("control.sock").exists());
     assert_original_untouched();
 }
+
+/// The original `logs` schema, copied from Fail2Ban 1.1.1 database.py.
+const LOGS_DDL: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS logs(",
+    "jail TEXT NOT NULL, ",
+    "path TEXT, ",
+    "firstlinemd5 TEXT, ",
+    "lastfilepos INTEGER DEFAULT 0, ",
+    "UNIQUE(jail, path)",
+    ");"
+);
+
+/// Minimal SHA-1 hex helper matching Fail2Ban 1.1.1's Python 3 first-line hash.
+#[allow(clippy::many_single_char_names, clippy::indexing_slicing)]
+fn sha1_hex(input: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut state: [u32; 5] = [
+        0x6745_2301,
+        0xefcd_ab89,
+        0x98ba_dcfe,
+        0x1032_5476,
+        0xc3d2_e1f0,
+    ];
+    let transform = |st: &mut [u32; 5], block: &[u8; 64]| {
+        let mut w = [0_u32; 16];
+        for (slot, chunk) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+            *slot = u32::from_be_bytes(*chunk);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = *st;
+        for round in 0..80_usize {
+            let word = if round < 16 {
+                w[round]
+            } else {
+                let next = (w[(round - 3) % 16]
+                    ^ w[(round - 8) % 16]
+                    ^ w[(round - 14) % 16]
+                    ^ w[(round - 16) % 16])
+                    .rotate_left(1);
+                w[round % 16] = next;
+                next
+            };
+            let (mix, k) = match round {
+                0..=19 => ((b & c) | (!b & d), 0x5a82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let next = a
+                .rotate_left(5)
+                .wrapping_add(mix)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(word);
+            (a, b, c, d, e) = (next, a, b.rotate_left(30), c, d);
+        }
+        for (cur, delta) in st.iter_mut().zip([a, b, c, d, e]) {
+            *cur = cur.wrapping_add(delta);
+        }
+    };
+    let (blocks, tail) = input.as_chunks::<64>();
+    for block in blocks {
+        transform(&mut state, block);
+    }
+    let size = if tail.len() < 56 { 64 } else { 128 };
+    let mut pad = [0_u8; 128];
+    pad[..tail.len()].copy_from_slice(tail);
+    pad[tail.len()] = 0x80;
+    let bits = (input.len() as u64).wrapping_mul(8);
+    pad[size - 8..size].copy_from_slice(&bits.to_be_bytes());
+    for block in pad[..size].as_chunks::<64>().0 {
+        transform(&mut state, block);
+    }
+    let mut out = String::with_capacity(40);
+    for byte in state.into_iter().flat_map(u32::to_be_bytes) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn send_control(socket: &Path, req: &fail2ban_rs::control::Request) -> fail2ban_rs::control::Response {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("control tokio runtime");
+    rt.block_on(fail2ban_rs::control::send_request(socket, req))
+        .expect("send control request")
+}
+
+fn kill_hard(mut daemon: Daemon) {
+    let _ = daemon.child.kill();
+    let _ = daemon.child.wait();
+}
+
+#[test]
+fn compat_chain_legacy_checkpoints_restart_unban_and_reload() {
+    let tmp = tempfile::tempdir().expect("scratch dir");
+    let base = tmp.path().join("f2b");
+    let filter_dir = base.join("filter.d");
+    std::fs::create_dir_all(&filter_dir).expect("tree");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let socket = tmp.path().join("f2b.sock");
+    let record = tmp.path().join("decisions.log");
+    let runtime = tmp.path().join("decisions.log.fail2ban-rs");
+    let _original_listener = std::os::unix::net::UnixListener::bind(&socket)
+        .expect("bind independent original socket fixture");
+
+    let web1_path = tmp.path().join("web1.log");
+    let web2_path = tmp.path().join("web2.log");
+    let web3_path = tmp.path().join("web3.log");
+    let web4_path = tmp.path().join("web4.log");
+    let web1 = Tail::create(&web1_path).expect("web1");
+    let web2 = Tail::create(&web2_path).expect("web2");
+    let _web3 = Tail::create(&web3_path).expect("web3");
+    let web4 = Tail::create(&web4_path).expect("web4");
+
+    // Pre-populate logs before startup:
+    // - web1: valid checkpoint after 3 lines of 9.9.9.9; 2 lines of 1.2.3.4 appended after checkpoint.
+    let w1_line1 = format!("{}\n", failure("9.9.9.9"));
+    let w1_pre = format!("{w1_line1}{}\n{}\n", failure("9.9.9.9"), failure("9.9.9.9"));
+    let w1_checkpoint = w1_pre.len() as i64;
+    let w1_hash = sha1_hex(w1_line1.as_bytes());
+    std::fs::write(&web1_path, &w1_pre).expect("write web1 pre");
+    web1.append(vec![failure("1.2.3.4"), failure("1.2.3.4")]);
+
+    // - web2: rotated file (DB has a different first-line hash + offset 500) -> must read from 0.
+    web2.append(vec![
+        failure("2.3.4.5"),
+        failure("2.3.4.5"),
+        failure("2.3.4.5"),
+    ]);
+
+    // - web3: truncated file (DB has matching first-line hash + offset 99999 > size) -> must read from 0.
+    let w3_line1 = format!("{}\n", failure("3.4.5.6"));
+    let w3_hash = sha1_hex(w3_line1.as_bytes());
+    std::fs::write(
+        &web3_path,
+        format!("{w3_line1}{}\n{}\n", failure("3.4.5.6"), failure("3.4.5.6")),
+    )
+    .expect("write web3");
+
+    // - web4: invalid checkpoint (NULL hash, negative offset) -> must read from 0.
+    web4.append(vec![
+        failure("6.7.8.9"),
+        failure("6.7.8.9"),
+        failure("6.7.8.9"),
+    ]);
+
+    let dbfile = state.join("fail2ban.sqlite3");
+    std::fs::write(
+        base.join("fail2ban.conf"),
+        format!(
+            "[Definition]\nsocket = {}\ndbfile = {}\n",
+            socket.display(),
+            dbfile.display()
+        ),
+    )
+    .expect("fail2ban.conf");
+    std::fs::write(
+        base.join("jail.conf"),
+        format!(
+            "[DEFAULT]\n\
+             backend = polling\n\
+             usedns = no\n\
+             ignoreself = false\n\
+             action =\n\
+             \n\
+             [chain-jail]\n\
+             enabled = true\n\
+             port = 8081\n\
+             filter = chain-auth\n\
+             logpath = {}\n\
+             \x20   {}\n\
+             \x20   {}\n\
+             \x20   {}\n\
+             maxretry = 3\n\
+             findtime = 120s\n\
+             bantime = 600s\n",
+            web1_path.display(),
+            web2_path.display(),
+            web3_path.display(),
+            web4_path.display(),
+        ),
+    )
+    .expect("jail.conf");
+    std::fs::write(
+        filter_dir.join("chain-auth.conf"),
+        "[Definition]\n\
+         failregex = chain-auth\\[\\d+\\]: failed login for user \\S+ from <HOST> port \\d+\n\
+         ignoreregex =\n",
+    )
+    .expect("filter");
+
+    // Seed original SQLite with one long-lived ban (4.4.4.4) + all 4 log checkpoints.
+    seed_original_db(&dbfile, "chain-jail", "4.4.4.4", wall_now() - 1.0, 600);
+    {
+        let conn = rusqlite::Connection::open(&dbfile).expect("open db");
+        conn.execute_batch(LOGS_DDL).expect("logs ddl");
+        conn.execute(
+            "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES('chain-jail', ?1, ?2, ?3)",
+            rusqlite::params![web1_path.to_string_lossy().as_ref(), w1_hash, w1_checkpoint],
+        )
+        .expect("seed web1");
+        conn.execute(
+            "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES('chain-jail', ?1, ?2, 500)",
+            rusqlite::params![web2_path.to_string_lossy().as_ref(), "0".repeat(40)],
+        )
+        .expect("seed web2");
+        conn.execute(
+            "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES('chain-jail', ?1, ?2, 99999)",
+            rusqlite::params![web3_path.to_string_lossy().as_ref(), w3_hash],
+        )
+        .expect("seed web3");
+        conn.execute(
+            "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES('chain-jail', ?1, NULL, -10)",
+            rusqlite::params![web4_path.to_string_lossy().as_ref()],
+        )
+        .expect("seed web4");
+    }
+    let original_db = std::fs::read(&dbfile).expect("original DB bytes");
+
+    // Pre-populate a non-empty isolated WAL with a different active ban (198.51.100.10)
+    // to verify non-empty WAL still imports 4.4.4.4 without losing existing WAL entries.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let wal_dir = runtime.join("state");
+        std::fs::create_dir_all(&wal_dir).expect("wal dir");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod runtime 0700");
+        std::fs::set_permissions(&wal_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod state 0700");
+        let store = fail2ban_rs::track::persist::open_ban_store(wal_dir).expect("open wal");
+        let now = chrono::Utc::now().timestamp();
+        let ip: std::net::IpAddr = "198.51.100.10".parse().expect("ip");
+        store
+            .write_durable(|tx| {
+                tx.bans.put(
+                    (ip, "chain-jail".to_owned()),
+                    fail2ban_rs::track::state::BanRecord {
+                        ip,
+                        jail_id: "chain-jail".to_owned(),
+                        banned_at: now - 5,
+                        expires_at: Some(now + 600),
+                    },
+                )?;
+                Ok(())
+            })
+            .expect("seed non-empty wal");
+    }
+
+    // --- Run #1: first migration from legacy DB + non-empty WAL ---
+    let daemon1 = spawn_daemon(&base, &record).expect("spawn daemon 1");
+    let ctrl_sock = runtime.join("control.sock");
+    wait_for("daemon 1 startup", &daemon1, || {
+        daemon1.saw("fail2ban-rs started") && ctrl_sock.exists()
+    });
+
+    // Both the pre-existing WAL ban and the imported legacy ban must be applied,
+    // plus all three fallback logs (rotated/truncated/invalid) must ban immediately.
+    let initial_bans = [
+        "BAN chain-jail 198.51.100.10",
+        "BAN chain-jail 4.4.4.4",
+        "BAN chain-jail 2.3.4.5",
+        "BAN chain-jail 3.4.5.6",
+        "BAN chain-jail 6.7.8.9",
+    ];
+    wait_for("initial bans + fallbacks", &daemon1, || {
+        let rec = decisions(&record);
+        initial_bans.iter().all(|b| rec.iter().any(|l| l == b))
+    });
+
+    // Pre-checkpoint 9.9.9.9 must NOT have been read, and 1.2.3.4 only had 2 post-checkpoint lines.
+    std::thread::sleep(Duration::from_millis(600));
+    let rec = decisions(&record);
+    assert!(
+        !rec.iter().any(|l| l.contains("9.9.9.9")),
+        "pre-checkpoint lines were re-read: {rec:?}"
+    );
+    assert!(
+        !rec.iter().any(|l| l.contains("1.2.3.4")),
+        "1.2.3.4 had only 2 lines after checkpoint: {rec:?}"
+    );
+
+    // One more failure for 1.2.3.4 crosses maxretry=3 (proving the 2 post-checkpoint lines were read!).
+    web1.append(vec![failure("1.2.3.4")]);
+    wait_for("resumed 1.2.3.4 ban", &daemon1, || {
+        decisions(&record).contains(&"BAN chain-jail 1.2.3.4".to_owned())
+    });
+
+    // Manually unban the imported legacy ban 4.4.4.4 via the control socket.
+    let unban_resp = send_control(
+        &ctrl_sock,
+        &fail2ban_rs::control::Request::Unban {
+            ip: "4.4.4.4".parse().expect("ip"),
+            jail: "chain-jail".to_owned(),
+        },
+    );
+    assert!(matches!(unban_resp, fail2ban_rs::control::Response::Ok { .. }), "manual unban failed: {unban_resp:?}");
+    wait_for("manual unban recorded", &daemon1, || {
+        decisions(&record).contains(&"UNBAN chain-jail 4.4.4.4".to_owned())
+    });
+
+    // Reload via SIGHUP with a handover line.
+    daemon1.signal("HUP");
+    web1.append(vec![failure("7.7.7.1")]);
+    wait_for("reload complete", &daemon1, || {
+        daemon1.saw("config reload complete")
+    });
+    web1.append(vec![failure("7.7.7.1"), failure("7.7.7.1")]);
+    wait_for("post-reload ban 7.7.7.1", &daemon1, || {
+        decisions(&record).contains(&"BAN chain-jail 7.7.7.1".to_owned())
+    });
+
+    // Graceful shutdown persists Rust's own log_positions.json.
+    assert!(daemon1.terminate().success(), "daemon 1 clean exit");
+    assert!(
+        runtime.join("state").join("log_positions.json").is_file(),
+        "Rust must persist its own log_positions.json"
+    );
+    assert_eq!(
+        std::fs::read(&dbfile).expect("db bytes"),
+        original_db,
+        "original SQLite DB must stay strictly read-only"
+    );
+    assert_eq!(
+        std::fs::read_dir(&state).expect("original state dir").count(),
+        1,
+        "no WAL/SHM files beside original SQLite DB"
+    );
+
+    // Clear the decision log before Run #2 so we can verify exact post-restart behavior.
+    std::fs::write(&record, b"").expect("clear record before run 2");
+
+    // Append 3 lines for 8.8.8.1 while daemon is stopped.
+    web1.append(vec![
+        failure("8.8.8.1"),
+        failure("8.8.8.1"),
+        failure("8.8.8.1"),
+    ]);
+
+    // --- Run #2: restart from Rust's persisted WAL + log_positions.json ---
+    let daemon2 = spawn_daemon(&base, &record).expect("spawn daemon 2");
+    wait_for("daemon 2 startup", &daemon2, || {
+        daemon2.saw("fail2ban-rs started") && ctrl_sock.exists()
+    });
+    wait_for("offline lines read on restart", &daemon2, || {
+        decisions(&record).contains(&"BAN chain-jail 8.8.8.1".to_owned())
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    let rec2 = decisions(&record);
+    assert!(
+        !rec2.iter().any(|l| l.contains("4.4.4.4")),
+        "manually unbanned legacy IP 4.4.4.4 resurrected after restart: {rec2:?}"
+    );
+    assert!(
+        !rec2.iter().any(|l| l.contains("9.9.9.9")),
+        "pre-checkpoint 9.9.9.9 was read after restart: {rec2:?}"
+    );
+
+    // Wait until log_positions.json reflects the current web1.log length, then SIGKILL.
+    let web1_len = std::fs::metadata(&web1_path).expect("web1 meta").len();
+    wait_for("checkpoint flushed after 8.8.8.1", &daemon2, || {
+        std::fs::read_to_string(runtime.join("state").join("log_positions.json"))
+            .unwrap_or_default()
+            .contains(&format!("\"offset\":{web1_len}"))
+    });
+    kill_hard(daemon2);
+
+    // Remove stale control.sock only if needed? No — recording_listener refuses pre-existing
+    // sockets, so simulate clean runtime socket cleanup or verify fresh socket after SIGKILL?
+    // Wait: recording_listener refuses any pre-existing socket file by design (safety invariant),
+    // so remove only the dead control.sock left by SIGKILL before starting Run #3.
+    let _ = std::fs::remove_file(&ctrl_sock);
+
+    std::fs::write(&record, b"").expect("clear record before run 3");
+    // Append 3 lines for 8.8.8.2 while dead after SIGKILL.
+    web1.append(vec![
+        failure("8.8.8.2"),
+        failure("8.8.8.2"),
+        failure("8.8.8.2"),
+    ]);
+
+    // --- Run #3: recovery after SIGKILL post-checkpoint-save ---
+    let daemon3 = spawn_daemon(&base, &record).expect("spawn daemon 3");
+    wait_for("daemon 3 startup", &daemon3, || {
+        daemon3.saw("fail2ban-rs started") && ctrl_sock.exists()
+    });
+    wait_for("post-SIGKILL lines read", &daemon3, || {
+        decisions(&record).contains(&"BAN chain-jail 8.8.8.2".to_owned())
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    let rec3 = decisions(&record);
+    assert!(
+        !rec3.iter().any(|l| l.contains("4.4.4.4")),
+        "unbanned 4.4.4.4 resurrected after SIGKILL recovery: {rec3:?}"
+    );
+    assert!(
+        !rec3.iter().any(|l| l.contains("9.9.9.9")),
+        "pre-checkpoint 9.9.9.9 read after SIGKILL recovery: {rec3:?}"
+    );
+    assert!(daemon3.terminate().success(), "daemon 3 clean exit");
+    assert_eq!(
+        std::fs::read(&dbfile).expect("db bytes final"),
+        original_db,
+        "original SQLite DB must remain untouched across all restarts"
+    );
+}
+
+#[test]
+#[ignore = "requires local pinned Fail2Ban 1.1.1 via FAIL2BAN_111_SOURCE and Python 3"]
+fn compat_chain_real_fail2ban_111_db_migration_and_restart() {
+    let source = std::fs::canonicalize(
+        std::env::var_os("FAIL2BAN_111_SOURCE").expect("set FAIL2BAN_111_SOURCE"),
+    )
+    .expect("locate Fail2Ban 1.1.1 source");
+    let tmp = tempfile::tempdir().expect("scratch dir");
+    let base = tmp.path().join("f2b");
+    let filter_dir = base.join("filter.d");
+    std::fs::create_dir_all(&filter_dir).expect("tree");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let socket = tmp.path().join("f2b.sock");
+    let record = tmp.path().join("decisions.log");
+    let runtime = tmp.path().join("decisions.log.fail2ban-rs");
+    let dbfile = state.join("fail2ban.sqlite3");
+
+    let web1_path = tmp.path().join("web1.log");
+    let web2_path = tmp.path().join("web2.log");
+    let web3_path = tmp.path().join("web3.log");
+    let web1 = Tail::create(&web1_path).expect("web1");
+    let _web2 = Tail::create(&web2_path).expect("web2");
+    let _web3 = Tail::create(&web3_path).expect("web3");
+
+    let pre1 = format!(
+        "{}\n{}\n{}\n",
+        failure("9.9.9.9"),
+        failure("9.9.9.9"),
+        failure("9.9.9.9")
+    );
+    let pos1 = pre1.len();
+    std::fs::write(&web1_path, &pre1).expect("write web1");
+    std::fs::write(&web2_path, format!("{}\n", failure("9.9.9.8"))).expect("write web2 old");
+    let pre3 = format!("{}\n{}\n", failure("3.3.3.3"), failure("3.3.3.3"));
+    let pos3 = pre3.len();
+    std::fs::write(&web3_path, &pre3).expect("write web3 old");
+
+    // Generate a REAL Fail2Ban 1.1.1 SQLite DB using upstream Fail2BanDb + FileContainer + BanTicket.
+    let py = r"
+import sys, time
+from types import SimpleNamespace
+from fail2ban.server.database import Fail2BanDb
+from fail2ban.server.filter import FileContainer
+from fail2ban.server.ticket import BanTicket
+
+db_path, p1, pos1, p2, p3, pos3 = sys.argv[1:7]
+db = Fail2BanDb(db_path)
+class Jail:
+    name = 'chain-jail'
+    actions = SimpleNamespace(getBanTime=lambda: 600)
+jail = Jail()
+db.addJail(jail)
+
+for path, pos in [(p1, int(pos1)), (p2, 20), (p3, int(pos3))]:
+    fc = FileContainer(path, 'utf-8', tail=False)
+    fc.setPos(pos)
+    db.addLog(jail, fc)
+    db.updateLog(jail, fc)
+
+ticket = BanTicket('4.4.4.4', time.time() - 1.0, ['failed login from 4.4.4.4'])
+ticket.setBanTime(600)
+db.addBan(jail, ticket)
+db.close()
+";
+    let out = Command::new("python3")
+        .args(["-S", "-c", py])
+        .arg(&dbfile)
+        .arg(&web1_path)
+        .arg(pos1.to_string())
+        .arg(&web2_path)
+        .arg(&web3_path)
+        .arg(pos3.to_string())
+        .env("PYTHONPATH", &source)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run Fail2Ban 1.1.1 DB generator");
+    assert!(
+        out.status.success(),
+        "Fail2Ban 1.1.1 DB generator failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Mutate logs after 1.1.1 shut down:
+    // - web1: append 2 failures for 1.2.3.4 after checkpoint
+    web1.append(vec![failure("1.2.3.4"), failure("1.2.3.4")]);
+    // - web2: rotate to a new file with 3 failures for 2.3.4.5
+    std::fs::write(
+        &web2_path,
+        format!(
+            "{}\n{}\n{}\n",
+            failure("2.3.4.5"),
+            failure("2.3.4.5"),
+            failure("2.3.4.5")
+        ),
+    )
+    .expect("rotate web2");
+    // - web3: truncate shorter than pos3, keeping same first line, then 3 failures for 3.3.3.4?
+    //   Use 3 short lines that total less than pos3? Instead just write 1 line (shorter than pos3),
+    //   then after start append 2 more for 3.3.3.3 so all 3 count from offset 0!
+    std::fs::write(&web3_path, format!("{}\n", failure("3.3.3.3"))).expect("truncate web3");
+
+    std::fs::write(
+        base.join("fail2ban.conf"),
+        format!(
+            "[Definition]\nsocket = {}\ndbfile = {}\n",
+            socket.display(),
+            dbfile.display()
+        ),
+    )
+    .expect("fail2ban.conf");
+    std::fs::write(
+        base.join("jail.conf"),
+        format!(
+            "[DEFAULT]\n\
+             backend = polling\n\
+             usedns = no\n\
+             ignoreself = false\n\
+             action =\n\
+             \n\
+             [chain-jail]\n\
+             enabled = true\n\
+             port = 8081\n\
+             filter = chain-auth\n\
+             logpath = {}\n\
+             \x20   {}\n\
+             \x20   {}\n\
+             maxretry = 3\n\
+             findtime = 120s\n\
+             bantime = 600s\n",
+            web1_path.display(),
+            web2_path.display(),
+            web3_path.display(),
+        ),
+    )
+    .expect("jail.conf");
+    std::fs::write(
+        filter_dir.join("chain-auth.conf"),
+        "[Definition]\n\
+         failregex = chain-auth\\[\\d+\\]: failed login for user \\S+ from <HOST> port \\d+\n\
+         ignoreregex =\n",
+    )
+    .expect("filter");
+
+    let original_db = std::fs::read(&dbfile).expect("original 1.1.1 DB bytes");
+
+    let daemon1 = spawn_daemon(&base, &record).expect("spawn daemon 1");
+    let ctrl_sock = runtime.join("control.sock");
+    wait_for("daemon 1 startup", &daemon1, || {
+        daemon1.saw("fail2ban-rs started") && ctrl_sock.exists()
+    });
+    wait_for("1.1.1 ban + rotated log ban", &daemon1, || {
+        let rec = decisions(&record);
+        rec.contains(&"BAN chain-jail 4.4.4.4".to_owned())
+            && rec.contains(&"BAN chain-jail 2.3.4.5".to_owned())
+    });
+
+    // 1 more line on web1 bans 1.2.3.4; 2 more lines on truncated web3 bans 3.3.3.3.
+    web1.append(vec![failure("1.2.3.4")]);
+    Tail(web3_path.clone()).append(vec![failure("3.3.3.3"), failure("3.3.3.3")]);
+    wait_for("resumed web1 + truncated web3 bans", &daemon1, || {
+        let rec = decisions(&record);
+        rec.contains(&"BAN chain-jail 1.2.3.4".to_owned())
+            && rec.contains(&"BAN chain-jail 3.3.3.3".to_owned())
+    });
+    assert!(
+        !decisions(&record).iter().any(|l| l.contains("9.9.9.9")),
+        "pre-checkpoint 9.9.9.9 from real 1.1.1 DB must not be re-read"
+    );
+
+    // Unban 4.4.4.4, reload, shut down, append offline lines, restart!
+    assert!(matches!(
+        send_control(
+            &ctrl_sock,
+            &fail2ban_rs::control::Request::Unban {
+                ip: "4.4.4.4".parse().expect("ip"),
+                jail: "chain-jail".to_owned(),
+            },
+        ),
+        fail2ban_rs::control::Response::Ok { .. }
+    ));
+    daemon1.signal("HUP");
+    wait_for("reload complete", &daemon1, || {
+        daemon1.saw("config reload complete")
+    });
+    assert!(daemon1.terminate().success());
+
+    std::fs::write(&record, b"").expect("clear record");
+    web1.append(vec![
+        failure("8.8.8.8"),
+        failure("8.8.8.8"),
+        failure("8.8.8.8"),
+    ]);
+
+    let daemon2 = spawn_daemon(&base, &record).expect("spawn daemon 2");
+    wait_for("daemon 2 startup", &daemon2, || {
+        daemon2.saw("fail2ban-rs started") && ctrl_sock.exists()
+    });
+    wait_for("offline lines resumed on restart", &daemon2, || {
+        decisions(&record).contains(&"BAN chain-jail 8.8.8.8".to_owned())
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    let rec2 = decisions(&record);
+    assert!(
+        !rec2.iter().any(|l| l.contains("4.4.4.4")),
+        "unbanned 4.4.4.4 resurrected: {rec2:?}"
+    );
+    assert!(
+        !rec2.iter().any(|l| l.contains("9.9.9.9")),
+        "pre-checkpoint 9.9.9.9 re-read: {rec2:?}"
+    );
+    assert!(daemon2.terminate().success());
+    assert_eq!(std::fs::read(&dbfile).expect("1.1.1 DB bytes"), original_db);
+}

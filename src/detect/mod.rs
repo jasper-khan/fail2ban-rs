@@ -62,8 +62,8 @@ mod legacy_ssh_session_parity_test;
 #[allow(dead_code)]
 mod legacy_ssh_sessions;
 /// Blocking log-file read loop (internal to the watcher).
-mod reader;
+pub(crate) mod reader;
 /// Watcher resume points for gap-free reload handoff.
-mod resume;
+pub(crate) mod resume;
 
 pub use resume::ResumePoint;

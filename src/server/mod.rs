@@ -1,6 +1,7 @@
 //! Daemon lifecycle — spawns all tasks, handles signals and config reload.
 
 mod control_dispatch;
+mod log_positions;
 mod reload;
 mod reload_delta;
 mod restored;
@@ -8,6 +9,7 @@ mod startup;
 mod watchers;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -46,14 +48,25 @@ pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
     // Initialize remote logging (no-op if not configured).
     let logger = Logger::init(&config.logging);
     let mut restored = open_state(&config.global.state_dir).await?;
-    if let Source::Fail2BanIni { dir, .. } = &source {
+    let log_positions = if let Source::Fail2BanIni { dir, .. } = &source {
         restored::seed_original_once(&mut restored, || {
             let dbfile = crate::config::compat::dbfile_of(dir)?;
             crate::track::legacy_sqlite::restore_bans(&dbfile, &config)
         })?;
-    }
+        let positions = Arc::new(log_positions::LogPositionStore::open(
+            &config.global.state_dir,
+        ));
+        restored::seed_original_logs_once(&restored, &positions, || {
+            let dbfile = crate::config::compat::dbfile_of(dir)?;
+            crate::track::legacy_sqlite::restore_log_positions(&dbfile, &config)
+        })?;
+        Some(positions)
+    } else {
+        None
+    };
 
-    let mut daemon = start_tasks(config, source, restored, logger, cancel, bound).await?;
+    let mut daemon =
+        start_tasks(config, source, restored, log_positions, logger, cancel, bound).await?;
     info!(phase = "startup", "fail2ban-rs started");
     let result = daemon.serve().await;
 
@@ -72,6 +85,7 @@ async fn start_tasks(
     config: Config,
     source: Source,
     restored: Restored,
+    log_positions: Option<Arc<log_positions::LogPositionStore>>,
     logger: Option<Logger>,
     cancel: CancellationToken,
     bound: Option<BoundSocket>,
@@ -85,7 +99,11 @@ async fn start_tasks(
     let executor_tx = start_core(&config, restored, tracker_io, logger.clone(), &cancel).await?;
     // Watchers keep their own token and join handles, so a reload can hand
     // each jail's read position to its replacement.
-    let watchers = Watchers::spawn(plan, &failure_tx, "startup", HashMap::new());
+    let initial_resume = log_positions
+        .as_ref()
+        .map_or_else(HashMap::new, |store| store.snapshot_resume_points());
+    let watchers =
+        Watchers::spawn_with_positions(plan, &failure_tx, "startup", initial_resume, log_positions);
     let control_rx = spawn_control(&config, &cancel, bound);
     Ok(Daemon {
         config,

@@ -116,3 +116,78 @@ async fn test_failed_original_read_does_not_mark_migration_as_done() {
     seed_original_once(&mut state, || Ok(Vec::new())).unwrap();
     assert_eq!(state.store.read().meta.get(SQLITE_IMPORT_MARKER), Some(&1));
 }
+
+#[tokio::test]
+async fn test_original_log_seed_runs_once_and_recovers_from_interrupted_migration() {
+    use crate::server::log_positions::LogPositionStore;
+    use crate::track::legacy_sqlite::LegacyLogCheckpoint;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await.unwrap();
+    let log_positions = LogPositionStore::open(dir.path());
+
+    // 1. Failed read must not set the log-import marker.
+    assert!(
+        seed_original_logs_once(&state, &log_positions, || Err(
+            crate::error::Error::config("broken sqlite")
+        ))
+        .is_err()
+    );
+    assert!(!state.store.read().meta.contains_key(SQLITE_LOG_IMPORT_MARKER));
+
+    // 2. Simulate interruption AFTER log_positions.json already has a Rust-saved
+    //    position for web1.log, BEFORE SQLITE_LOG_IMPORT_MARKER is committed.
+    let key1 = watcher_key("chain-jail", "/tmp/web1.log");
+    let key2 = watcher_key("chain-jail", "/tmp/web2.log");
+    let rust_pos = PersistedFilePosition {
+        path: std::path::PathBuf::from("/tmp/web1.log"),
+        inode: Some(77),
+        first_line_sha1: Some("aaaa".to_owned()),
+        offset: Some(500),
+    };
+    log_positions.update_one(&key1, rust_pos.clone()).unwrap();
+
+    seed_original_logs_once(&state, &log_positions, || {
+        Ok(vec![
+            LegacyLogCheckpoint {
+                jail: "chain-jail".to_owned(),
+                path: std::path::PathBuf::from("/tmp/web1.log"),
+                first_line_sha1: Some("aaaa".to_owned()),
+                offset: Some(100),
+            },
+            LegacyLogCheckpoint {
+                jail: "chain-jail".to_owned(),
+                path: std::path::PathBuf::from("/tmp/web2.log"),
+                first_line_sha1: Some("bbbb".to_owned()),
+                offset: Some(200),
+            },
+        ])
+    })
+    .unwrap();
+
+    assert_eq!(state.store.read().meta.get(SQLITE_LOG_IMPORT_MARKER), Some(&1));
+    let snapshot = log_positions.snapshot_resume_points();
+    assert_eq!(
+        snapshot
+            .get(&key1)
+            .and_then(crate::detect::ResumePoint::persisted_file_position),
+        Some(&rust_pos),
+        "existing Rust position must not be overwritten by legacy SQLite"
+    );
+    assert_eq!(
+        snapshot
+            .get(&key2)
+            .and_then(crate::detect::ResumePoint::persisted_file_position)
+            .and_then(|p| p.offset),
+        Some(200)
+    );
+
+    // 3. Reopen after marker commit: original SQLite must never be read again.
+    drop(state);
+    let reopened = open_state(dir.path()).await.unwrap();
+    let reopened_logs = LogPositionStore::open(dir.path());
+    seed_original_logs_once(&reopened, &reopened_logs, || {
+        panic!("legacy logs must not be re-imported once marker is set")
+    })
+    .unwrap();
+}

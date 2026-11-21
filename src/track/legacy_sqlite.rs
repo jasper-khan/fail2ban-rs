@@ -5,18 +5,20 @@
 //! database continuously updated; writing it back is a later stage, so the
 //! WAL remains the daemon's live store after the upgrade seed.
 
+use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, LogBackend};
 use crate::detect::ignore::IgnoreList;
 use crate::error::{Error, Result};
+use crate::track::legacy_log_positions::{LogRow, StoredLogPosition, file_resume_offset};
 use crate::track::legacy_restore::{self, LegacyBanRow, RestoreRequest, RestoredBan};
 use crate::track::state::BanRecord;
 
@@ -136,11 +138,126 @@ fn db_error(dbfile: &Path, operation: &str, err: &rusqlite::Error) -> Error {
 }
 
 fn has_bips(connection: &Connection) -> rusqlite::Result<bool> {
+    has_table(connection, "bips")
+}
+
+fn has_table(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
     connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'bips' COLLATE NOCASE)",
-        [],
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1 COLLATE NOCASE)",
+        params![table],
         |row| row.get(0),
     )
+}
+
+/// One log checkpoint imported from the original Fail2Ban 1.1.1 `logs` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyLogCheckpoint {
+    pub(crate) jail: String,
+    pub(crate) path: PathBuf,
+    pub(crate) first_line_sha1: Option<String>,
+    pub(crate) offset: Option<u64>,
+}
+
+/// Read original Fail2Ban 1.1.1 log positions for all enabled file-backend
+/// jails from the read-only SQLite `logs` table.
+///
+/// A missing database or missing `logs` table returns an empty list without
+/// error. A `(jail, path)` pair with no row in `logs` is omitted so the daemon
+/// keeps its default tail-from-EOF behavior for untracked files; a pair with a
+/// row (even an invalid or zero-offset row) is returned so the reader applies
+/// Fail2Ban 1.1.1 fallback rules.
+pub(crate) fn restore_log_positions(
+    dbfile: &Path,
+    config: &Config,
+) -> Result<Vec<LegacyLogCheckpoint>> {
+    if !original_db_exists(dbfile)? {
+        return Ok(Vec::new());
+    }
+    let mut connection = open_readonly(dbfile)?;
+    let snapshot = connection
+        .transaction()
+        .map_err(|err| db_error(dbfile, "opening a read snapshot of", &err))?;
+    if !has_table(&snapshot, "logs")
+        .map_err(|err| db_error(dbfile, "checking logs in", &err))?
+    {
+        info!(
+            phase = "startup",
+            dbfile = %dbfile.display(),
+            "original ban database has no logs table"
+        );
+        return Ok(Vec::new());
+    }
+
+    let mut checkpoints = Vec::new();
+    for (name, jail) in config.enabled_jails() {
+        if jail.log_backend != LogBackend::File {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        for path in jail.log_paths.iter().chain([&jail.log_path]) {
+            if path.as_os_str().is_empty() || !seen.insert(path) {
+                continue;
+            }
+            let path_text = path.to_string_lossy();
+            let row = read_log_row(&snapshot, name, &path_text).map_err(|err| {
+                db_error(
+                    dbfile,
+                    &format!("reading logs for jail {name:?} path {path_text:?} from"),
+                    &err,
+                )
+            })?;
+            if let Some((first_line_sha1, pos)) = row {
+                let rows = [LogRow {
+                    jail: name,
+                    path: &path_text,
+                    first_line_md5: first_line_sha1.as_deref(),
+                    last_file_pos: pos,
+                }];
+                let offset = file_resume_offset(&rows, name, &path_text, None, false);
+                checkpoints.push(LegacyLogCheckpoint {
+                    jail: name.to_owned(),
+                    path: path.clone(),
+                    first_line_sha1,
+                    offset,
+                });
+            }
+        }
+    }
+    snapshot
+        .commit()
+        .map_err(|err| db_error(dbfile, "closing the read snapshot of", &err))?;
+    info!(
+        phase = "startup",
+        log_positions = checkpoints.len(),
+        "log positions loaded from the original Fail2Ban database"
+    );
+    Ok(checkpoints)
+}
+
+fn read_log_row(
+    connection: &Connection,
+    jail: &str,
+    path: &str,
+) -> rusqlite::Result<Option<(Option<String>, Option<StoredLogPosition>)>> {
+    let mut statement = connection.prepare(
+        "SELECT firstlinemd5, lastfilepos FROM logs WHERE jail = ?1 AND path = ?2",
+    )?;
+    let mut rows = statement.query(params![jail, path])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let first_line_sha1 = match row.get_ref(0)? {
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+        _ => None,
+    };
+    let last_file_pos = match row.get_ref(1)? {
+        ValueRef::Integer(value) => Some(StoredLogPosition::Integer(value)),
+        ValueRef::Real(value) => Some(StoredLogPosition::Real(value)),
+        _ => None,
+    };
+    Ok(Some((first_line_sha1, last_file_pos)))
 }
 
 /// Apply the original selection window before decoding a row, so another

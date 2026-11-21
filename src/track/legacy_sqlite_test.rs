@@ -403,3 +403,151 @@ with sqlite3.connect(filename) as conn:
 expected = db.getCurrentBans(jail=jail, fromtime=now, forbantime=4, correctBanTime=4)
 assert [str(t.getID()) for t in expected] == ["192.0.2.3"]
 "#;
+
+const LOGS_DDL: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS logs(",
+    "jail TEXT NOT NULL, ",
+    "path TEXT, ",
+    "firstlinemd5 TEXT, ",
+    "lastfilepos INTEGER DEFAULT 0, ",
+    "UNIQUE(jail, path)",
+    ");"
+);
+
+#[test]
+fn restore_log_positions_decodes_valid_and_invalid_rows_readonly() {
+    let dir = tempdir().expect("scratch");
+    let db = dir.path().join("fail2ban.sqlite3");
+    let valid_log = dir.path().join("valid.log");
+    let invalid_log = dir.path().join("invalid.log");
+    let untracked_log = dir.path().join("untracked.log");
+
+    let conn = Connection::open(&db).expect("create db");
+    conn.execute_batch(LOGS_DDL).expect("logs ddl");
+    conn.execute(
+        "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES(?1, ?2, ?3, ?4)",
+        params!["chain-jail", valid_log.to_string_lossy().as_ref(), "abc123", 4096_i64],
+    )
+    .expect("insert valid");
+    conn.execute(
+        "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES(?1, ?2, NULL, -5)",
+        params!["chain-jail", invalid_log.to_string_lossy().as_ref()],
+    )
+    .expect("insert invalid");
+    drop(conn);
+
+    let before = std::fs::read(&db).expect("before bytes");
+    let mut cfg = restore_config();
+    let jail = cfg.jail.get_mut("chain-jail").expect("jail");
+    jail.log_path = valid_log.clone();
+    jail.log_paths = vec![valid_log.clone(), invalid_log.clone(), untracked_log.clone()];
+
+    let checkpoints = super::restore_log_positions(&db, &cfg).expect("restore log positions");
+    assert_eq!(checkpoints.len(), 2, "untracked path must be omitted");
+    assert_eq!(checkpoints[0].path, valid_log);
+    assert_eq!(checkpoints[0].first_line_sha1.as_deref(), Some("abc123"));
+    assert_eq!(checkpoints[0].offset, Some(4096));
+    assert_eq!(checkpoints[1].path, invalid_log);
+    assert_eq!(checkpoints[1].first_line_sha1, None);
+    assert_eq!(checkpoints[1].offset, None);
+
+    assert_eq!(std::fs::read(&db).expect("after bytes"), before);
+}
+
+#[test]
+#[ignore = "requires local pinned Fail2Ban 1.1.1 via FAIL2BAN_111_SOURCE and Python 3"]
+fn restore_log_positions_written_by_pinned_fail2ban_111() {
+    let source = std::fs::canonicalize(
+        std::env::var_os("FAIL2BAN_111_SOURCE").expect("set FAIL2BAN_111_SOURCE"),
+    )
+    .expect("locate Fail2Ban 1.1.1 source");
+    let dir = tempdir().expect("scratch");
+    let db = dir.path().join("fail2ban.sqlite3");
+    let same_log = dir.path().join("same.log");
+    let rotated_log = dir.path().join("rotated.log");
+    let truncated_log = dir.path().join("truncated.log");
+
+    std::fs::write(&same_log, "line1 first\nline2 second\n").expect("same_log");
+    std::fs::write(&rotated_log, "old first\nold second\n").expect("rotated_log");
+    std::fs::write(&truncated_log, "trunc first\ntrunc second\ntrunc third\n")
+        .expect("truncated_log");
+
+    // Generate the real Fail2Ban 1.1.1 SQLite DB using upstream Fail2BanDb + FileContainer.
+    let script = r"
+import sys
+from types import SimpleNamespace
+from fail2ban.server.database import Fail2BanDb
+from fail2ban.server.filter import FileContainer
+
+db_path, same_path, rot_path, trunc_path = sys.argv[1:5]
+db = Fail2BanDb(db_path)
+jail = SimpleNamespace(name='chain-jail')
+db.addJail(jail)
+
+for path, pos in [(same_path, 12), (rot_path, 10), (trunc_path, 30)]:
+    fc = FileContainer(path, 'utf-8', tail=False)
+    fc.setPos(pos)
+    db.addLog(jail, fc)
+    db.updateLog(jail, fc)
+db.close()
+";
+    let out = Command::new("python3")
+        .args(["-S", "-c", script])
+        .arg(&db)
+        .arg(&same_log)
+        .arg(&rotated_log)
+        .arg(&truncated_log)
+        .env("PYTHONPATH", &source)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run Fail2Ban 1.1.1 oracle");
+    assert!(
+        out.status.success(),
+        "oracle failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Mutate rotated_log (new first line) and truncated_log (shorter than 30 bytes).
+    std::fs::write(&rotated_log, "new rotated first\nnew second\n").expect("rotate");
+    std::fs::write(&truncated_log, "trunc first\n").expect("truncate");
+    // Append to same_log after the recorded offset 12.
+    std::fs::write(&same_log, "line1 first\nline2 second\nline3 appended\n").expect("append");
+
+    let before_db = std::fs::read(&db).expect("db bytes before");
+    let mut cfg = restore_config();
+    let jail = cfg.jail.get_mut("chain-jail").expect("jail");
+    jail.log_path = same_log.clone();
+    jail.log_paths = vec![same_log.clone(), rotated_log.clone(), truncated_log.clone()];
+
+    let checkpoints = super::restore_log_positions(&db, &cfg).expect("read real 1.1.1 logs");
+    assert_eq!(checkpoints.len(), 3);
+
+    let check = |cp: &super::LegacyLogCheckpoint| {
+        let f = std::fs::File::open(&cp.path).expect("open log");
+        let persisted = crate::detect::resume::PersistedFilePosition {
+            path: cp.path.clone(),
+            inode: None,
+            first_line_sha1: cp.first_line_sha1.clone(),
+            offset: cp.offset,
+        };
+        crate::detect::resume::start_for_persisted(&cp.path, &persisted, &f)
+    };
+    assert_eq!(
+        check(&checkpoints[0]),
+        crate::detect::resume::StartAt::Offset(12),
+        "same file must resume at exact 1.1.1 offset"
+    );
+    assert_eq!(
+        check(&checkpoints[1]),
+        crate::detect::resume::StartAt::Start,
+        "rotated file must fall back to offset 0"
+    );
+    assert_eq!(
+        check(&checkpoints[2]),
+        crate::detect::resume::StartAt::Start,
+        "truncated file must fall back to offset 0"
+    );
+
+    // Original DB remains strictly read-only.
+    assert_eq!(std::fs::read(&db).expect("db bytes after"), before_db);
+}

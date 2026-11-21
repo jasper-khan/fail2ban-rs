@@ -8,11 +8,13 @@
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::detect::backoff::{Backoff, blocking_sleep};
 use crate::detect::identity::FileIdentity;
+use crate::detect::watcher::MAX_LINE_LEN;
 
 /// Opaque position a watcher reached when it stopped.
 ///
@@ -26,11 +28,15 @@ pub struct ResumePoint(Kind);
 
 #[derive(Debug, Clone)]
 enum Kind {
-    File(FilePosition),
+    File {
+        live: FilePosition,
+        persisted: Option<PersistedFilePosition>,
+    },
+    PersistedFile(PersistedFilePosition),
     Journal(String),
 }
 
-/// Where a file reader stopped.
+/// Where a file reader stopped (in-process handoff).
 #[derive(Debug, Clone)]
 pub(crate) struct FilePosition {
     /// Log path the reader was tailing.
@@ -40,6 +46,71 @@ pub(crate) struct FilePosition {
     pub(crate) identity: Option<FileIdentity>,
     /// Byte offset of the first unprocessed byte.
     pub(crate) offset: u64,
+}
+
+/// Serializable checkpoint for a log file, used across daemon restarts and
+/// for one-time migration from original Fail2Ban 1.1.1 SQLite `logs` rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PersistedFilePosition {
+    /// Log path the checkpoint belongs to.
+    pub(crate) path: PathBuf,
+    /// File inode recorded by Rust (absent for checkpoints migrated from
+    /// original Fail2Ban SQLite, which stores only first-line hash + offset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) inode: Option<u64>,
+    /// Fail2Ban 1.1.1 first-line SHA-1 hex fingerprint (`""` while empty or
+    /// first line is incomplete; `None` if missing/NULL in legacy DB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) first_line_sha1: Option<String>,
+    /// Byte offset of the first unprocessed byte (`None` if legacy DB held an
+    /// invalid, negative, or non-integer position).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) offset: Option<u64>,
+}
+
+impl PersistedFilePosition {
+    /// Marker for a file that did not exist when the checkpoint was captured.
+    pub(crate) fn absent(path: PathBuf) -> Self {
+        Self {
+            path,
+            inode: None,
+            first_line_sha1: None,
+            offset: Some(0),
+        }
+    }
+
+    /// Capture a durable checkpoint from an already-open file handle without
+    /// moving its seek position.
+    #[cfg(unix)]
+    pub(crate) fn from_handle(path: PathBuf, file: &std::fs::File, offset: u64) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let first_line_sha1 =
+            crate::detect::legacy_file_identity::file_first_line_sha1(file, MAX_LINE_LEN + 1).ok();
+        Some(Self {
+            path,
+            inode: Some(meta.ino()),
+            first_line_sha1,
+            offset: Some(offset),
+        })
+    }
+
+    /// Non-unix fallback: handle checkpointing is unsupported.
+    #[cfg(not(unix))]
+    pub(crate) fn from_handle(_path: PathBuf, _file: &std::fs::File, _offset: u64) -> Option<Self> {
+        None
+    }
+}
+
+/// Start instruction for a file reader: either an in-process live handoff or a
+/// persisted/migrated checkpoint.
+#[derive(Debug, Clone)]
+pub(crate) enum FileStart {
+    Live(FilePosition),
+    Persisted(PersistedFilePosition),
 }
 
 impl FilePosition {
@@ -56,8 +127,25 @@ impl FilePosition {
 
 impl ResumePoint {
     /// Wrap a file reader position.
+    #[cfg(test)]
     pub(crate) fn file(pos: FilePosition) -> Self {
-        Self(Kind::File(pos))
+        Self(Kind::File {
+            live: pos,
+            persisted: None,
+        })
+    }
+
+    /// Wrap a file reader position together with its durable persisted form.
+    pub(crate) fn file_with_persisted(
+        live: FilePosition,
+        persisted: Option<PersistedFilePosition>,
+    ) -> Self {
+        Self(Kind::File { live, persisted })
+    }
+
+    /// Wrap a persisted or migrated file checkpoint.
+    pub(crate) fn persisted_file(pos: PersistedFilePosition) -> Self {
+        Self(Kind::PersistedFile(pos))
     }
 
     /// Wrap a journal cursor.
@@ -65,10 +153,29 @@ impl ResumePoint {
         Self(Kind::Journal(cursor))
     }
 
-    /// The file position, if this is a file resume point.
+    /// The live file position, if this is an in-process file resume point.
+    #[cfg(test)]
     pub(crate) fn into_file(self) -> Option<FilePosition> {
         match self.0 {
-            Kind::File(p) => Some(p),
+            Kind::File { live, .. } => Some(live),
+            Kind::PersistedFile(_) | Kind::Journal(_) => None,
+        }
+    }
+
+    /// The file start position, whether live (reload) or persisted (restart).
+    pub(crate) fn into_file_start(self) -> Option<FileStart> {
+        match self.0 {
+            Kind::File { live, .. } => Some(FileStart::Live(live)),
+            Kind::PersistedFile(pos) => Some(FileStart::Persisted(pos)),
+            Kind::Journal(_) => None,
+        }
+    }
+
+    /// The durable file checkpoint carried by this resume point, if any.
+    pub(crate) fn persisted_file_position(&self) -> Option<&PersistedFilePosition> {
+        match &self.0 {
+            Kind::File { persisted, .. } => persisted.as_ref(),
+            Kind::PersistedFile(pos) => Some(pos),
             Kind::Journal(_) => None,
         }
     }
@@ -77,7 +184,7 @@ impl ResumePoint {
     pub(crate) fn into_journal_cursor(self) -> Option<String> {
         match self.0 {
             Kind::Journal(c) => Some(c),
-            Kind::File(_) => None,
+            Kind::File { .. } | Kind::PersistedFile(_) => None,
         }
     }
 }
@@ -87,13 +194,13 @@ impl ResumePoint {
 pub(crate) enum StartAt {
     /// Skip existing content (default, no resume point).
     End,
-    /// Read the whole file (new file, or rotated during handoff).
+    /// Read the whole file (new file, or rotated/truncated/invalid checkpoint).
     Start,
     /// Continue at a byte offset in the same file.
     Offset(u64),
 }
 
-/// Decide the start position for `file` at `path` given an optional resume.
+/// Decide the start position for `file` at `path` given an optional live resume.
 pub(crate) fn start_for(
     path: &Path,
     resume: Option<&FilePosition>,
@@ -111,14 +218,82 @@ pub(crate) fn start_for(
     }
 }
 
+/// Decide the start position for `file` at `path` given a persisted or migrated
+/// checkpoint, following Fail2Ban 1.1.1's `FileContainer` + `_addLog` rules:
+///
+/// - Same file (matching first-line SHA-1, matching inode if recorded) and
+///   `0 < offset <= file_size` → resume at `StartAt::Offset(offset)`.
+/// - Rotated, truncated (`file_size < offset`), or invalid checkpoint (`None`,
+///   `0`, empty/mismatched hash) → fall back to `StartAt::Start` (offset 0).
+pub(crate) fn start_for_persisted(
+    path: &Path,
+    pos: &PersistedFilePosition,
+    file: &std::fs::File,
+) -> StartAt {
+    if pos.path != path {
+        return StartAt::End;
+    }
+    let Some(offset) = pos.offset.filter(|&off| off > 0) else {
+        return StartAt::Start;
+    };
+    let Some(stored_hash) = pos.first_line_sha1.as_deref().filter(|h| !h.is_empty()) else {
+        return StartAt::Start;
+    };
+    let Ok(meta) = file.metadata() else {
+        return StartAt::Start;
+    };
+    if !meta.is_file() || meta.len() < offset {
+        return StartAt::Start;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(saved_ino) = pos.inode
+            && saved_ino != meta.ino()
+        {
+            return StartAt::Start;
+        }
+        match crate::detect::legacy_file_identity::file_first_line_sha1(file, MAX_LINE_LEN + 1) {
+            Ok(current_hash) if current_hash == stored_hash => StartAt::Offset(offset),
+            _ => StartAt::Start,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (offset, stored_hash);
+        StartAt::Start
+    }
+}
+
+/// Decide the start position for `file` given either a live or persisted start.
+fn start_for_any(path: &Path, start: Option<&FileStart>, file: &std::fs::File) -> StartAt {
+    match start {
+        None => StartAt::End,
+        Some(FileStart::Live(pos)) => start_for(path, Some(pos), file),
+        Some(FileStart::Persisted(pos)) => start_for_persisted(path, pos, file),
+    }
+}
+
 /// Open the log at `path`, retrying with capped backoff while it is missing.
 ///
 /// Returns `None` only if `cancel` fires first. A file that only appears
 /// after one or more retries is read from the start, since it is new.
+#[cfg(test)]
 pub(crate) fn open_log(
     jail_id: &str,
     path: &PathBuf,
     resume: Option<&FilePosition>,
+    cancel: &CancellationToken,
+) -> Option<BufReader<std::fs::File>> {
+    let start = resume.cloned().map(FileStart::Live);
+    open_log_from(jail_id, path, start.as_ref(), cancel)
+}
+
+/// Open the log at `path` using either a live or persisted resume point.
+pub(crate) fn open_log_from(
+    jail_id: &str,
+    path: &PathBuf,
+    resume: Option<&FileStart>,
     cancel: &CancellationToken,
 ) -> Option<BufReader<std::fs::File>> {
     let mut backoff = Backoff::new();
@@ -145,14 +320,14 @@ pub(crate) fn open_log(
 
 fn open_positioned(
     path: &PathBuf,
-    resume: Option<&FilePosition>,
+    resume: Option<&FileStart>,
     force_start: bool,
 ) -> std::io::Result<BufReader<std::fs::File>> {
     let mut file = std::fs::File::open(path)?;
     let start = if force_start {
         StartAt::Start
     } else {
-        start_for(path, resume, &file)
+        start_for_any(path, resume, &file)
     };
     match start {
         StartAt::End => file.seek(SeekFrom::End(0))?,

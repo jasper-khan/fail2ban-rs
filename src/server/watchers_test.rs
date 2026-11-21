@@ -130,6 +130,7 @@ async fn test_watchers_stop_omits_position_when_watcher_panics() {
         cancel,
         handles: vec![("crashed".to_string(), handle)],
         handoff: Arc::new(AtomicBool::new(false)),
+        log_positions: None,
     };
     let points = watchers.stop().await;
     assert!(
@@ -149,6 +150,7 @@ async fn test_watchers_stop_omits_position_when_watcher_returns_none() {
         cancel,
         handles: vec![("no-position".to_string(), handle)],
         handoff: Arc::new(AtomicBool::new(false)),
+        log_positions: None,
     };
     let points = watchers.stop().await;
     assert!(points.is_empty());

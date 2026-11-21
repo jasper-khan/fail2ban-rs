@@ -10,8 +10,13 @@ use std::time::Duration;
 use etchdb::{FlushPolicy, Store, WalBackend};
 use tracing::{info, warn};
 
+use crate::detect::resume::PersistedFilePosition;
+use crate::track::legacy_sqlite::LegacyLogCheckpoint;
 use crate::track::persist::{BanCount, BanState};
 use crate::track::state::BanRecord;
+
+use super::log_positions::LogPositionStore;
+use super::watchers::watcher_key;
 
 use super::startup::{handle_legacy_state, open_store_migrating};
 
@@ -49,6 +54,7 @@ pub(super) async fn open_state(state_dir: &Path) -> crate::error::Result<Restore
 // database. Keep the marker in the same transaction as its imported rows:
 // an unban may remove the row, but must not make SQLite authoritative again.
 const SQLITE_IMPORT_MARKER: &str = "original_fail2ban_sqlite_import_v1";
+const SQLITE_LOG_IMPORT_MARKER: &str = "original_fail2ban_sqlite_logs_import_v1";
 
 /// Import the original database once, durably, before any action is replayed.
 /// The caller runs this at startup with exclusive access to the state store.
@@ -86,6 +92,57 @@ pub(super) fn seed_original_once(
         "original ban migration committed"
     );
     restored.bans.extend(imported);
+    Ok(())
+}
+
+/// Import original Fail2Ban log positions once into Rust's durable store.
+///
+/// Writes `log_positions.json` durably BEFORE setting the WAL marker:
+/// - crash before saving `log_positions.json` -> retried cleanly on next start;
+/// - crash between saving `log_positions.json` and setting the marker ->
+///   `seed_missing` preserves already-saved keys and finishes idempotently;
+/// - after the marker is set -> SQLite is never consulted again.
+pub(super) fn seed_original_logs_once(
+    restored: &Restored,
+    log_positions: &LogPositionStore,
+    read_original: impl FnOnce() -> crate::error::Result<Vec<LegacyLogCheckpoint>>,
+) -> crate::error::Result<()> {
+    if restored
+        .store
+        .read()
+        .meta
+        .contains_key(SQLITE_LOG_IMPORT_MARKER)
+    {
+        return Ok(());
+    }
+    let checkpoints = read_original()?;
+    let entries = checkpoints.into_iter().map(|cp| {
+        let key = watcher_key(&cp.jail, &cp.path.display().to_string());
+        let pos = PersistedFilePosition {
+            path: cp.path,
+            inode: None,
+            first_line_sha1: cp.first_line_sha1,
+            offset: cp.offset,
+        };
+        (key, pos)
+    });
+    let added = log_positions.seed_missing(entries)?;
+    restored
+        .store
+        .write_durable(|tx| {
+            tx.meta.put(SQLITE_LOG_IMPORT_MARKER.to_owned(), 1)?;
+            Ok(())
+        })
+        .map_err(|err| {
+            crate::error::Error::persistence(format!(
+                "committing original log-position migration marker: {err}"
+            ))
+        })?;
+    info!(
+        phase = "startup",
+        log_positions = added,
+        "original log-position migration committed"
+    );
     Ok(())
 }
 
