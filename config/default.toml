@@ -18,10 +18,19 @@ socket_path = "/var/run/fail2ban-rs/fail2ban-rs.sock"
 enabled = true
 log_path = "/var/log/auth.log"
 date_format = "syslog"
+# Keep in sync with the built-in sshd template (gen-config sshd).
 filter = [
-    'sshd\[\d+\]: Failed password for .* from <HOST>',
-    'sshd\[\d+\]: Invalid user .* from <HOST>',
-    'sshd\[\d+\]: Connection closed by authenticating user .* <HOST>',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?[aA]uthentication (?:failure|error|failed) for .*? (?:from )?(?:<HOST>)(?: via \S+)?(?: (?:port \d+|on \S+|\[preauth\])){0,3}\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?User not known to the underlying authentication module for .*? (?:from )?(?:<HOST>)(?: (?:port \d+|on \S+|\[preauth\])){0,3}\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?Failed (?:\S{1,8}|\S{10,}|[^p\s]\S{8}|p[^u\s]\S{7}|pu[^b\s]\S{6}|pub[^l\s]\S{5}|publ[^i\s]\S{4}|publi[^c\s]\S{3}|public[^k\s]\S{2}|publick[^e\s]\S|publicke[^y\s]) for (?:invalid user )?[^:\r\n]+? from (?:<HOST>)(?: (?:port \d+|on \S+)){0,2}(?: ssh\d*)?(?:: [^\r\n]*|(?: \[preauth\])?)\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?Failed publickey for invalid user [^:\r\n]+? from (?:<HOST>)(?: (?:port \d+|on \S+)){0,2}(?: ssh\d*)?(?:: [^\r\n]*|(?: \[preauth\])?)\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?ROOT LOGIN REFUSED FROM (?:<HOST>)(?:\s|$)',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?[iI](?:llegal|nvalid) user .*? (?:from )?(?:<HOST>)(?: (?:port \d+|on \S+|\[preauth\])){0,3}\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?User .*? (?:from )?(?:<HOST>) not allowed because (?:not listed in AllowUsers|listed in DenyUsers|not in any group|a group is listed in DenyGroups|none of user\x27s groups are listed in AllowGroups)(?: (?:port \d+|on \S+|\[preauth\])){0,3}\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?refused connect from \S+ \((?:<HOST>)\)',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?Received disconnect from (?:<HOST>)(?: (?:port \d+|on \S+)){0,2}:\s*3: .*: Auth fail(?: (?:port \d+|on \S+|\[preauth\])){0,3}\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?maximum authentication attempts exceeded for (?:invalid user )?.*? (?:from )?(?:<HOST>)(?: (?:port \d+|on \S+)){0,2}(?: ssh\d*)?(?: (?:port \d+|on \S+|\[preauth\])){0,3}\s*$',
+    '^\s*(?:(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+)\s+)?(?:[^:\s]+\s+)?sshd(?:-session)?(?:\[\d+\])?:\s+(?:(?:error|fatal): (?:PAM: )?)?Disconnecting(?: from)?(?: (?:invalid|authenticating))? user \S+ (?:<HOST>)(?: (?:port \d+|on \S+)){0,2}:\s*Change of username or service not allowed:\s*.*\[preauth\]\s*$',
 ]
 port = ["22"]
 protocol = "tcp"

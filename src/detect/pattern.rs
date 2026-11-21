@@ -20,6 +20,13 @@ const HOST_CAPTURE: &str =
 /// The placeholder token in user patterns.
 const HOST_TAG: &str = "<HOST>";
 
+/// A standalone non-capturing group around the address makes the regex capture
+/// authoritative: the adjacent literals may also occur in other branches or
+/// as ordinary log data. The grouping does not change what the regex accepts.
+fn has_grouped_host(pattern: &str) -> bool {
+    pattern.contains("(?:<HOST>)")
+}
+
 /// Expand `<HOST>` in a user pattern into the IP capture group regex.
 ///
 /// Returns an error if the pattern contains zero or more than one `<HOST>`.
@@ -68,6 +75,9 @@ const META_CHARS: &[char] = &[
 /// extraction strategy. Falls back to `Captures` only when neither
 /// the before nor after literal is usable.
 pub fn host_extractor(pattern: &str) -> HostExtractor {
+    if has_grouped_host(pattern) {
+        return HostExtractor::Captures;
+    }
     let Some(host_pos) = pattern.find(HOST_TAG) else {
         return HostExtractor::Captures;
     };
@@ -117,6 +127,9 @@ fn leading_literal(s: &str) -> String {
 /// that contains no regex metacharacters. Returns `None` if no usable literal
 /// prefix exists (e.g. pattern starts with `<HOST>`).
 pub fn literal_prefix(pattern: &str) -> Option<String> {
+    if has_grouped_host(pattern) {
+        return None;
+    }
     let host_pos = pattern.find(HOST_TAG)?;
     let before = &pattern[..host_pos];
     if before.is_empty() {

@@ -19,6 +19,21 @@ pub mod state;
 mod commands;
 mod execute;
 mod failure;
+// The original jail decision path is verified offline before runtime wiring.
+#[allow(dead_code)]
+mod legacy_ban_manager;
+#[allow(dead_code)]
+mod legacy_fail_manager;
+#[allow(dead_code)]
+mod legacy_jail;
+#[cfg(test)]
+mod legacy_jail_parity_test;
+#[allow(dead_code)]
+mod legacy_log_positions;
+#[allow(dead_code)]
+mod legacy_restore;
+#[cfg(test)]
+mod legacy_restore_parity_test;
 mod manual;
 mod run;
 mod sweep;

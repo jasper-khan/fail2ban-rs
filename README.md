@@ -143,6 +143,12 @@ Unknown keys are rejected at load, so a typo fails fast instead of being silentl
 
 Run `fail2ban-rs list-filters` for the full list.
 
+The `sshd` template and shipped default count single-line, IP-bearing SSH
+authentication failures and exclude routine disconnects. This is checked
+against a subset of Fail2Ban 1.1.1's normal-mode filter; it does not implement
+session correlation, DNS, or other upstream modes. Existing configurations
+with inline patterns are not overwritten.
+
 ## CLI
 
 ```bash
@@ -187,10 +193,20 @@ cargo test
 
 ## Migration from fail2ban
 
-fail2ban-rs does not read fail2ban's INI files directly. Create a TOML
-`[jail.<name>]` table for each enabled fail2ban jail. `config.d/*.toml` files,
-merged alphabetically after the main configuration, are the closest equivalent
-to `jail.d/*.local` overrides.
+The daemon does not yet load original Fail2Ban INI files. The internal
+reader's file precedence, configuration merging, and selected filter
+configurations are tested separately against Fail2Ban 1.1.1. A separate
+offline replay tests the stock file-mode `nginx-http-auth` rules with
+single-line UTC fixtures. A separate SSH replay checks selected normal-mode
+session transitions in synthetic syslog. An offline jail decision test also
+checks original retry counting and ban expiry. Offline restore tests cover
+ban and log-position decisions from decoded original SQLite rows; the daemon
+does not yet open or migrate an original SQLite database. An offline action
+lifecycle test records typed operations without executing commands. These
+tests do not start jails, resolve DNS, dispatch actions, or read a journal. Continue
+to use a TOML `[jail.<name>]` table for each enabled jail.
+`config.d/*.toml` files, merged alphabetically after the main configuration,
+are the closest equivalent to `jail.d/*.local` overrides.
 
 | fail2ban | fail2ban-rs | Notes |
 |---|---|---|

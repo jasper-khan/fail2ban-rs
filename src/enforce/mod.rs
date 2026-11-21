@@ -11,6 +11,13 @@ mod executor;
 pub mod ipset;
 /// iptables firewall backend.
 pub mod iptables;
+// Independently test original action semantics with inert typed steps.
+#[allow(dead_code)]
+mod legacy_action_lifecycle;
+#[cfg(test)]
+mod legacy_action_parity_test;
+#[allow(dead_code)]
+mod legacy_action_policy;
 /// nftables firewall backend.
 pub mod nftables;
 /// Startup restore of persisted bans.

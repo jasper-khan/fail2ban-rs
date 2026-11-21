@@ -212,3 +212,20 @@ fn extractor_no_host_tag() {
         HostExtractor::Captures
     ));
 }
+
+#[test]
+fn grouped_host_disables_heuristics_for_optional_or_alternative_text() {
+    let pattern = r"^audit (?:failure|enforcement notice)(?: noted from \S+)? from (?:<HOST>)$";
+    assert!(literal_prefix(pattern).is_none());
+    assert!(matches!(host_extractor(pattern), HostExtractor::Captures));
+    let matcher = crate::detect::matcher::JailMatcher::new(&[pattern.into()]).unwrap();
+    for (line, expected) in [
+        ("audit failure from 192.0.2.10", "192.0.2.10"),
+        (
+            "audit enforcement notice noted from 192.0.2.11 from 192.0.2.12",
+            "192.0.2.12",
+        ),
+    ] {
+        assert_eq!(matcher.try_match(line).unwrap().ip.to_string(), expected);
+    }
+}

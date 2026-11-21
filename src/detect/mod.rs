@@ -30,6 +30,23 @@ mod journal_entry;
 mod journal_line;
 /// `journalctl` stderr/exit-status capture (internal to the journal watcher).
 mod journal_proc;
+// Original-filter replay is intentionally separate from the deployed matcher.
+#[allow(dead_code)]
+mod legacy_date;
+#[allow(dead_code)]
+mod legacy_matcher;
+#[cfg(test)]
+mod legacy_matcher_parity_test;
+#[allow(dead_code)]
+mod legacy_regex;
+#[allow(dead_code)]
+mod legacy_ssh_events;
+#[allow(dead_code)]
+mod legacy_ssh_log;
+#[cfg(test)]
+mod legacy_ssh_session_parity_test;
+#[allow(dead_code)]
+mod legacy_ssh_sessions;
 /// Blocking log-file read loop (internal to the watcher).
 mod reader;
 /// Watcher resume points for gap-free reload handoff.

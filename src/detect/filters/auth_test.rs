@@ -80,13 +80,82 @@ const MATCH_CASES: &[(&str, &str, &str)] = &[
     ),
     (
         "sshd",
-        "Sep 29 16:28:05 spaceman sshd[16700]: Disconnected from authenticating user root 127.0.0.1 port 45416",
-        "127.0.0.1",
+        "Nov 21 00:00:01 example sshd-session[17]: Illegal user demo from 192.0.2.10",
+        "192.0.2.10",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:02 example sshd[17]: Failed publickey for invalid user demo from 2001:db8::10 port 22 ssh2: ED25519 SHA256:example",
+        "2001:db8::10",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:03 example sshd[17]: Failed keyboard-interactive/pam for demo from 192.0.2.12 ssh2",
+        "192.0.2.12",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:04 example sshd[17]: error: maximum authentication attempts exceeded for demo from 192.0.2.13 port 22 ssh2 [preauth]",
+        "192.0.2.13",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:05 example sshd[17]: User demo from 192.0.2.14 not allowed because not listed in AllowUsers",
+        "192.0.2.14",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:06 example sshd[17]: User demo 192.0.2.15 not allowed because none of user's groups are listed in AllowGroups",
+        "192.0.2.15",
+    ),
+    (
+        "sshd",
+        "2026-11-21T00:00:07Z example sshd[17]: error: PAM: Authentication failure for demo from 192.0.2.16",
+        "192.0.2.16",
+    ),
+    (
+        "sshd",
+        "sshd[17]: ROOT LOGIN REFUSED FROM 192.0.2.17",
+        "192.0.2.17",
+    ),
+    (
+        "sshd",
+        "sshd[17]: fatal: User not known to the underlying authentication module for demo 192.0.2.18",
+        "192.0.2.18",
+    ),
+    (
+        "sshd",
+        "sshd[17]: Failed password for demo.example from 2001:db8::19 port 22 on 192.0.2.100 ssh2",
+        "2001:db8::19",
     ),
 ];
 
 /// (filter_name, log_line) rows that must NOT match.
 const NO_MATCH_CASES: &[(&str, &str)] = &[
+    (
+        "sshd",
+        "Nov 21 00:00:08 example sshd[17]: Failed publickey for demo from 192.0.2.20 port 22 ssh2: ED25519 SHA256:example",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:09 example sshd[17]: Disconnected from authenticating user demo 192.0.2.21 port 22 [preauth]",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:10 example sshd[17]: Connection closed by authenticating user demo 192.0.2.22 port 22 [preauth]",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:11 example unexpected-sshd[17]: Failed password for demo from 192.0.2.23 port 22",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:12 example system-audit[17]: sshd[17]: Failed password for demo from 192.0.2.24 port 22",
+    ),
+    (
+        "sshd",
+        "Nov 21 00:00:13 example sshd[17]: Failed password for demo from 192.0.2.25x",
+    ),
     (
         "sshd",
         "Oct 15 19:51:35 server sshd[7592]: Address 1.2.3.4 maps to 1234.bbbbbb.com, but this does not map back to the address - POSSIBLE BREAK-IN ATTEMPT!",
