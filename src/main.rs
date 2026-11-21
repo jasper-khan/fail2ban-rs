@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use fail2ban_rs::config::Config;
+use fail2ban_rs::config::{Config, Source};
 use fail2ban_rs::control::{self, Request, Response};
 
 mod dry_run;
@@ -46,7 +46,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the fail2ban-rs daemon
-    Run,
+    Run {
+        /// Original Fail2Ban configuration tree (jail.conf + filter.d) to
+        /// load instead of the TOML configuration file
+        #[arg(long)]
+        legacy_dir: Option<PathBuf>,
+
+        /// Decision record file used with --legacy-dir: ban and unban
+        /// decisions are appended here, no firewall is touched
+        #[arg(long)]
+        record_decisions: Option<PathBuf>,
+    },
 
     /// Show daemon status
     Status,
@@ -120,7 +130,10 @@ async fn main() -> Result<()> {
     let Cli { command, config } = Cli::parse();
     let path = config.as_path();
     match command {
-        Command::Run => run_daemon(path).await?,
+        Command::Run {
+            legacy_dir,
+            record_decisions,
+        } => run_daemon(path, legacy_dir, record_decisions).await?,
         Command::Status => print_response(&send_control(path, Request::Status).await?),
         Command::ListBans { json } => list_bans(path, json).await?,
         Command::Stats => print_response(&send_control(path, Request::Stats).await?),
@@ -145,13 +158,22 @@ async fn main() -> Result<()> {
 }
 
 /// Load the config, set up tracing, and run the daemon until shutdown.
-async fn run_daemon(path: &Path) -> Result<()> {
-    let config = Config::from_file(path).context("failed to load configuration")?;
+async fn run_daemon(
+    toml_path: &Path,
+    legacy_dir: Option<PathBuf>,
+    record_decisions: Option<PathBuf>,
+) -> Result<()> {
+    let source = match (legacy_dir, record_decisions) {
+        (None, None) => Source::Toml(toml_path.to_path_buf()),
+        (Some(dir), Some(record)) => Source::Fail2BanIni { dir, record },
+        _ => anyhow::bail!("--legacy-dir and --record-decisions must be used together"),
+    };
+    let config = source.load().context("failed to load configuration")?;
     init_tracing(
         config.logging.level.as_deref(),
         config.logging.format.as_deref(),
     );
-    fail2ban_rs::server::run(config, path.to_path_buf())
+    fail2ban_rs::server::run(config, source)
         .await
         .context("daemon error")
 }

@@ -163,9 +163,10 @@ async fn test_watchers_stop_returns_file_resume_point() {
     let mut watchers = spawn_live(&config, &log, &failure_tx, &mut rx).await;
 
     let points = watchers.stop().await;
+    let key = format!("sshd\u{1}{}", log.display());
     assert!(
-        points.contains_key("sshd"),
-        "file jail must report a position"
+        points.contains_key(&key),
+        "file jail must report a position under key {key:?}: {points:?}"
     );
     assert!(watchers.stop().await.is_empty(), "handles are drained");
 }
@@ -213,7 +214,7 @@ async fn test_reload_config_failure_during_reload_observed_once() {
     let (tracker_tx, tracker_rx) = mpsc::channel(8);
     let tracker = spawn_appending_tracker(tracker_rx, log.clone(), 3);
     reload_config(
-        &config_path,
+        &crate::config::Source::Toml(config_path.clone()),
         &executor_tx,
         &tracker_tx,
         &mut config,
@@ -247,7 +248,7 @@ async fn test_reload_config_parse_error_keeps_watchers_running() {
     let (executor_tx, _executor_rx) = mpsc::channel(4);
     let (tracker_tx, _tracker_rx) = mpsc::channel(8);
     let result = reload_config(
-        &config_path,
+        &crate::config::Source::Toml(config_path.clone()),
         &executor_tx,
         &tracker_tx,
         &mut config,
@@ -260,7 +261,8 @@ async fn test_reload_config_parse_error_keeps_watchers_running() {
 
     append_failure(&log, 5);
     assert_eq!(recv_ip(&mut rx).await, "10.9.8.5");
-    assert!(watchers.stop().await.contains_key("sshd"));
+    let key = format!("sshd\u{1}{}", log.display());
+    assert!(watchers.stop().await.contains_key(&key));
 }
 
 /// Reload waits for a full downstream channel to drain, then resumes after

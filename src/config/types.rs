@@ -92,6 +92,11 @@ pub struct JailConfig {
     #[serde(default)]
     pub log_path: PathBuf,
 
+    /// Additional log files monitored by this jail, after `log_path`
+    /// (original Fail2Ban jails can watch several `logpath` entries).
+    #[serde(default)]
+    pub log_paths: Vec<PathBuf>,
+
     /// Date format preset for timestamp extraction.
     #[serde(default = "default_date_format")]
     pub date_format: DateFormat,
@@ -325,6 +330,7 @@ impl Default for JailConfig {
         Self {
             enabled: default_true(),
             log_path: PathBuf::new(),
+            log_paths: Vec::new(),
             date_format: default_date_format(),
             filter: vec![],
             max_retry: default_max_retry(),

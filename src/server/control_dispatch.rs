@@ -211,7 +211,7 @@ async fn handle_reload_request(
         "config reload starting"
     );
     let result = reload_config(
-        ctx.config_path,
+        ctx.source,
         ctx.executor_tx,
         tracker_cmd_tx,
         ctx.config,

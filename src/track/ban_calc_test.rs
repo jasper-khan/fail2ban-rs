@@ -171,6 +171,7 @@ fn test_high_count_does_not_panic() {
 fn test_jail_config() -> JailConfig {
     JailConfig {
         log_path: "/tmp/test.log".into(),
+        log_paths: Vec::new(),
         filter: vec!["from <HOST>".to_string()],
         ..JailConfig::default()
     }

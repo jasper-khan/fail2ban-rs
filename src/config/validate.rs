@@ -120,10 +120,21 @@ impl Config {
             return Ok(());
         }
 
-        if jail.log_backend == LogBackend::File && jail.log_path.as_os_str().is_empty() {
+        if jail.log_backend == LogBackend::File
+            && jail.log_path.as_os_str().is_empty()
+            && jail.log_paths.is_empty()
+        {
             return Err(Error::config(format!(
                 "jail '{name}': log_path is required when log_backend = \"file\""
             )));
+        }
+        for path in &jail.log_paths {
+            if !path.is_absolute() {
+                return Err(Error::config(format!(
+                    "jail '{name}': log_paths entries must be absolute: {}",
+                    path.display()
+                )));
+            }
         }
 
         Self::validate_jail_filters(name, jail)?;

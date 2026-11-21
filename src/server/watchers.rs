@@ -5,8 +5,14 @@
 //! (bounded by [`STOP_TIMEOUT`]) to collect the [`ResumePoint`] it reached,
 //! so a replacement watcher continues exactly where the old one stopped and
 //! no log line is skipped or read twice across a reload.
+//!
+//! One jail may watch several log files (original Fail2Ban multi-`logpath`
+//! jails). Each (jail, path) pair is its own watcher task and resume point;
+//! all of them report failures under the same jail id, so failures merge
+//! into one threshold exactly like the original.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -27,44 +33,102 @@ use crate::detect::watcher::Failure;
 /// Upper bound on waiting for all old watchers to report their position.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Handle to one running watcher task, keyed by jail name.
+/// Handle to one running watcher task, keyed by its resume key.
 pub(super) type WatcherHandle = (String, JoinHandle<Option<ResumePoint>>);
 
-/// Pre-compiled watcher plan for a single jail.
+/// Which stream one watcher plan reads.
+pub(super) enum PlanSource {
+    /// One log file of the jail.
+    File(PathBuf),
+    /// The jail's systemd journal matches.
+    Journal(Vec<String>),
+}
+
+/// Pre-compiled watcher plan for one jail log source.
 pub(super) struct WatcherPlan {
-    pub(super) name: String,
-    pub(super) jail: JailConfig,
+    /// Resume-map identity: jail plus the source it tails.
+    pub(super) key: String,
+    /// Jail id failures are reported under.
+    pub(super) jail: String,
+    pub(super) source: PlanSource,
     pub(super) matcher: JailMatcher,
     pub(super) date_parser: DateParser,
     pub(super) ignore_list: IgnoreList,
 }
 
-/// Build watcher plans for all enabled jails.
+/// Stable resume-map identity of one (jail, source) watcher.
+fn watcher_key(jail: &str, key_suffix: &str) -> String {
+    format!("{jail}\u{1}{key_suffix}")
+}
+
+/// The log files one jail watches: `log_paths` when set, else the single
+/// `log_path`, deduplicated in first-seen order.
+fn jail_paths(jail: &JailConfig) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::new();
+    for path in jail.log_paths.iter().chain([&jail.log_path]) {
+        if !path.as_os_str().is_empty() && seen.insert(path.clone()) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
+/// Build one watcher plan per enabled jail source.
 pub(super) fn build_watcher_plan(config: &Config) -> crate::error::Result<Vec<WatcherPlan>> {
-    config
-        .enabled_jails()
-        .map(|(name, jail)| {
-            let matcher = if jail.ignoreregex.is_empty() {
-                JailMatcher::new(&jail.filter)?
-            } else {
-                JailMatcher::with_ignoreregex(&jail.filter, &jail.ignoreregex)?
-            };
-            let date_parser = DateParser::new(jail.date_format)?;
-            let ignore_list = IgnoreList::new(&jail.ignoreip, jail.ignoreself)?;
-            Ok(WatcherPlan {
-                name: name.to_string(),
-                jail: jail.clone(),
-                matcher,
-                date_parser,
-                ignore_list,
-            })
-        })
-        .collect()
+    let mut plans = Vec::new();
+    for (name, jail) in config.enabled_jails() {
+        match jail.log_backend {
+            LogBackend::Systemd => {
+                plans.push(planned_source(
+                    name,
+                    PlanSource::Journal(jail.journalmatch.clone()),
+                    jail,
+                )?);
+            }
+            LogBackend::File => {
+                if jail_paths(jail).is_empty() {
+                    return Err(crate::error::Error::config(format!(
+                        "jail '{name}': no log file to watch"
+                    )));
+                }
+                for path in jail_paths(jail) {
+                    plans.push(planned_source(name, PlanSource::File(path), jail)?);
+                }
+            }
+        }
+    }
+    Ok(plans)
+}
+
+/// Compile the matcher set for one plan from the jail's patterns.
+fn planned_source(
+    name: &str,
+    source: PlanSource,
+    jail: &JailConfig,
+) -> crate::error::Result<WatcherPlan> {
+    let matcher = if jail.ignoreregex.is_empty() {
+        JailMatcher::new(&jail.filter)?
+    } else {
+        JailMatcher::with_ignoreregex(&jail.filter, &jail.ignoreregex)?
+    };
+    let key_suffix = match &source {
+        PlanSource::File(path) => path.display().to_string(),
+        PlanSource::Journal(_) => "(journal)".to_owned(),
+    };
+    Ok(WatcherPlan {
+        key: watcher_key(name, &key_suffix),
+        jail: name.to_string(),
+        source,
+        matcher,
+        date_parser: DateParser::new(jail.date_format)?,
+        ignore_list: IgnoreList::new(&jail.ignoreip, jail.ignoreself)?,
+    })
 }
 
 /// Spawn one watcher task per plan under child tokens of `cancel`.
 ///
-/// Each jail found in `resume` starts from its recorded position; the rest
+/// Each key found in `resume` starts from its recorded position; the rest
 /// start from their default (end of file / journal tail).
 pub(super) fn spawn_watchers(
     watcher_plan: Vec<WatcherPlan>,
@@ -77,8 +141,8 @@ pub(super) fn spawn_watchers(
     watcher_plan
         .into_iter()
         .map(|plan| {
-            let start = resume.remove(&plan.name);
-            let name = plan.name.clone();
+            let start = resume.remove(&plan.key);
+            let key = plan.key.clone();
             let handle = spawn_one(
                 plan,
                 failure_tx.clone(),
@@ -87,7 +151,7 @@ pub(super) fn spawn_watchers(
                 start,
                 handoff.clone(),
             );
-            (name, handle)
+            (key, handle)
         })
         .collect()
 }
@@ -101,44 +165,42 @@ fn spawn_one(
     start: Option<ResumePoint>,
     handoff: Arc<AtomicBool>,
 ) -> JoinHandle<Option<ResumePoint>> {
-    if plan.jail.log_backend == LogBackend::Systemd {
-        return spawn_journal(plan, tx, cancel, phase, start, handoff);
+    let WatcherPlan {
+        key: _,
+        jail,
+        source,
+        matcher,
+        date_parser,
+        ignore_list,
+    } = plan;
+    match source {
+        PlanSource::File(path) => tokio::spawn(crate::detect::watcher::run_supervised_from(
+            jail,
+            path,
+            matcher,
+            date_parser,
+            ignore_list,
+            tx,
+            cancel,
+            phase,
+            start,
+            handoff,
+        )),
+        PlanSource::Journal(journalmatch) => {
+            tokio::spawn(crate::detect::journal::run_supervised_from(
+                jail,
+                journalmatch,
+                matcher,
+                date_parser,
+                ignore_list,
+                tx,
+                cancel,
+                phase,
+                start,
+                handoff,
+            ))
+        }
     }
-    tokio::spawn(crate::detect::watcher::run_supervised_from(
-        plan.name,
-        plan.jail.log_path,
-        plan.matcher,
-        plan.date_parser,
-        plan.ignore_list,
-        tx,
-        cancel,
-        phase,
-        start,
-        handoff,
-    ))
-}
-
-/// Spawn a journald watcher for a systemd-backed plan.
-fn spawn_journal(
-    plan: WatcherPlan,
-    tx: mpsc::Sender<Failure>,
-    cancel: CancellationToken,
-    phase: &'static str,
-    start: Option<ResumePoint>,
-    handoff: Arc<AtomicBool>,
-) -> JoinHandle<Option<ResumePoint>> {
-    tokio::spawn(crate::detect::journal::run_supervised_from(
-        plan.name,
-        plan.jail.journalmatch,
-        plan.matcher,
-        plan.date_parser,
-        plan.ignore_list,
-        tx,
-        cancel,
-        phase,
-        start,
-        handoff,
-    ))
 }
 
 /// The running watcher set: a shared cancellation token plus every task's
@@ -174,9 +236,9 @@ impl Watchers {
         self.handoff.store(true, Ordering::Release);
         self.cancel.cancel();
         let mut points = HashMap::new();
-        for (name, handle) in self.handles.drain(..) {
-            if let Some(point) = resume_point(&name, Ok(handle.await)) {
-                points.insert(name, point);
+        for (key, handle) in self.handles.drain(..) {
+            if let Some(point) = resume_point(&key, Ok(handle.await)) {
+                points.insert(key, point);
             }
         }
         points
@@ -186,15 +248,15 @@ impl Watchers {
     ///
     /// All handles share one [`STOP_TIMEOUT`] deadline. A watcher that times
     /// out, panics, or reports no position is logged and omitted, so its
-    /// jail's replacement starts from the default position.
+    /// replacement starts from the default position.
     pub(super) async fn stop(&mut self) -> HashMap<String, ResumePoint> {
         self.cancel.cancel();
         let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
         let mut points = HashMap::new();
-        for (name, handle) in self.handles.drain(..) {
+        for (key, handle) in self.handles.drain(..) {
             let outcome = tokio::time::timeout_at(deadline, handle).await;
-            if let Some(point) = resume_point(&name, outcome) {
-                points.insert(name, point);
+            if let Some(point) = resume_point(&key, outcome) {
+                points.insert(key, point);
             }
         }
         points
@@ -203,21 +265,25 @@ impl Watchers {
 
 /// Unpack a watcher's stop outcome, logging why no position is available.
 fn resume_point(
-    name: &str,
+    key: &str,
     outcome: Result<Result<Option<ResumePoint>, JoinError>, Elapsed>,
 ) -> Option<ResumePoint> {
+    let jail = key.split('\u{1}').next().unwrap_or(key);
     match outcome {
         Ok(Ok(Some(point))) => Some(point),
         Ok(Ok(None)) => {
-            debug!(jail = %name, "watcher stopped without a resume point");
+            debug!(jail, "watcher stopped without a resume point");
             None
         }
         Ok(Err(e)) => {
-            warn!(jail = %name, error = %e, "watcher task failed; jail restarts from default position");
+            warn!(jail, error = %e, "watcher task failed; jail restarts from default position");
             None
         }
         Err(_) => {
-            warn!(jail = %name, "watcher stop timed out; jail restarts from default position");
+            warn!(
+                jail,
+                "watcher stop timed out; jail restarts from default position"
+            );
             None
         }
     }

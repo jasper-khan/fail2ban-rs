@@ -8,7 +8,6 @@ mod startup;
 mod watchers;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -18,7 +17,7 @@ use tracing::{error, info};
 use restored::{Restored, open_state};
 use startup::{DaemonSignal, Signals};
 
-use crate::config::{Config, JailConfig};
+use crate::config::{Config, JailConfig, Source};
 use crate::control::{self, ControlCmd};
 use crate::detect::watcher::Failure;
 use crate::enforce::{self, FirewallCmd};
@@ -31,14 +30,14 @@ use reload::{ReloadContext, reload_config, teardown_firewalls_full};
 use watchers::{Watchers, build_watcher_plan};
 
 /// Run the daemon with the given configuration.
-pub async fn run(config: Config, config_path: PathBuf) -> crate::error::Result<()> {
+pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
     info!(phase = "startup", "fail2ban-rs starting");
     let cancel = CancellationToken::new();
     // Initialize remote logging (no-op if not configured).
     let logger = Logger::init(&config.logging);
     let restored = open_state(&config.global.state_dir).await?;
 
-    let mut daemon = start_tasks(config, config_path, restored, logger, cancel).await?;
+    let mut daemon = start_tasks(config, source, restored, logger, cancel).await?;
     info!(phase = "startup", "fail2ban-rs started");
     let result = daemon.serve().await;
 
@@ -55,7 +54,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> crate::error::Result<(
 /// socket, returning the daemon state the main loop runs on.
 async fn start_tasks(
     config: Config,
-    config_path: PathBuf,
+    source: Source,
     restored: Restored,
     logger: Option<Logger>,
     cancel: CancellationToken,
@@ -73,7 +72,7 @@ async fn start_tasks(
     let control_rx = spawn_control(&config, &cancel);
     Ok(Daemon {
         config,
-        config_path,
+        source,
         executor_tx,
         tracker_cmd_tx,
         failure_tx,
@@ -180,7 +179,7 @@ async fn start_executor(
 /// State the daemon's main loop runs on.
 struct Daemon {
     config: Config,
-    config_path: PathBuf,
+    source: Source,
     executor_tx: mpsc::Sender<FirewallCmd>,
     tracker_cmd_tx: mpsc::Sender<TrackerCmd>,
     /// Reload-window invariant: the daemon retains this original sender for
@@ -242,7 +241,7 @@ impl Daemon {
             "config reload starting"
         );
         let result = reload_config(
-            &self.config_path,
+            &self.source,
             &self.executor_tx,
             &self.tracker_cmd_tx,
             &mut self.config,
@@ -267,7 +266,7 @@ impl Daemon {
     /// spawned task so a slow firewall never delays signal handling here.
     async fn dispatch(&mut self, ctrl: ControlCmd) {
         let mut ctx = ReloadContext {
-            config_path: &self.config_path,
+            source: &self.source,
             executor_tx: &self.executor_tx,
             config: &mut self.config,
             watchers: &mut self.watchers,

@@ -135,6 +135,7 @@ async fn test_control_request_reload_swaps_config_and_dispatches_update_to_track
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join("fail2ban-rs.toml");
     std::fs::write(&config_path, jail_config_toml(999)).expect("write reloaded config");
+    let source = crate::config::Source::Toml(config_path.clone());
 
     let (tracker_cmd_tx, tracker_cmd_rx) = mpsc::channel::<TrackerCmd>(16);
     let (log, tracker_handle) = spawn_tracker_stub(tracker_cmd_rx);
@@ -144,7 +145,7 @@ async fn test_control_request_reload_swaps_config_and_dispatches_update_to_track
     let mut watchers = Watchers::default();
 
     let mut ctx = ReloadContext {
-        config_path: &config_path,
+        source: &source,
         executor_tx: &executor_tx,
         config: &mut config,
         watchers: &mut watchers,
@@ -189,7 +190,9 @@ async fn test_control_request_reload_swaps_config_and_dispatches_update_to_track
 #[tokio::test]
 async fn test_control_request_reload_returns_error_and_leaves_config_unchanged_on_bad_file() {
     let mut config = Config::parse(&jail_config_toml(7200)).expect("initial config parses");
-    let config_path = std::path::PathBuf::from("/nonexistent/fail2ban-rs-reload-test.toml");
+    let source = crate::config::Source::Toml(std::path::PathBuf::from(
+        "/nonexistent/fail2ban-rs-reload-test.toml",
+    ));
 
     // The receiver is dropped immediately: if reload ever tried to send on
     // this channel, the send would fail loudly rather than silently
@@ -203,7 +206,7 @@ async fn test_control_request_reload_returns_error_and_leaves_config_unchanged_o
     let mut watchers = Watchers::default();
 
     let mut ctx = ReloadContext {
-        config_path: &config_path,
+        source: &source,
         executor_tx: &executor_tx,
         config: &mut config,
         watchers: &mut watchers,

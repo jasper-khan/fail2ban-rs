@@ -34,7 +34,7 @@ impl JailPlan {
 
 const FILTER: &str = "nginx-http-auth";
 
-const SUPPORTED_JAIL_KEYS: &[&str] = &[
+pub(super) const SUPPORTED_JAIL_KEYS: &[&str] = &[
     "enabled",
     "filter",
     "mode",
@@ -59,7 +59,7 @@ const SUPPORTED_JAIL_KEYS: &[&str] = &[
     "protocol",
 ];
 
-const UNSUPPORTED_MATCH_OPTIONS: &[&str] = &[
+pub(super) const UNSUPPORTED_MATCH_OPTIONS: &[&str] = &[
     "failregex",
     "ignoreregex",
     "prefregex",
@@ -68,7 +68,7 @@ const UNSUPPORTED_MATCH_OPTIONS: &[&str] = &[
     "journalmatch",
 ];
 
-const UNSUPPORTED_BANTIME_OPTIONS: &[&str] = &[
+pub(super) const UNSUPPORTED_BANTIME_OPTIONS: &[&str] = &[
     "bantime.factor",
     "bantime.formula",
     "bantime.multipliers",
@@ -294,7 +294,7 @@ pub(crate) fn read(base: &Path, jail: &str) -> Result<JailPlan> {
     })
 }
 
-fn original_bool(raw: &str) -> Option<bool> {
+pub(super) fn original_bool(raw: &str) -> Option<bool> {
     match raw.to_ascii_lowercase().as_str() {
         "1" | "on" | "true" | "yes" => Some(true),
         "0" | "off" | "false" | "no" => Some(false),
@@ -304,7 +304,7 @@ fn original_bool(raw: &str) -> Option<bool> {
 
 /// One integral amount and an original unit. No Python expressions, eval,
 /// fractions, compound strings, month/year averaging or rounding.
-fn duration(raw: &str, key: &str) -> Result<i64> {
+pub(super) fn duration(raw: &str, key: &str) -> Result<i64> {
     let bad = || {
         Error::config(format!(
             "unsupported original replay {key} duration {raw:?}"
@@ -334,7 +334,7 @@ fn duration(raw: &str, key: &str) -> Result<i64> {
     amount.checked_mul(multiplier).ok_or_else(bad)
 }
 
-fn log_paths(raw: &str) -> Result<Vec<PathBuf>> {
+pub(super) fn log_paths(raw: &str) -> Result<Vec<PathBuf>> {
     let mut seen = BTreeSet::new();
     let mut paths = Vec::new();
     for path in raw.split('\n') {

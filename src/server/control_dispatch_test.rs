@@ -161,10 +161,12 @@ async fn test_control_request_ban_and_unban_round_trip_through_real_tracker() {
     let (unused_executor_tx, _unused_executor_rx) = mpsc::channel::<FirewallCmd>(4);
     let (unused_failure_tx, _unused_failure_rx) = mpsc::channel(4);
     let mut watchers = Watchers::default();
-    let config_path = std::path::PathBuf::from("/nonexistent/fail2ban-rs-test.toml");
+    let source = crate::config::Source::Toml(std::path::PathBuf::from(
+        "/nonexistent/fail2ban-rs-test.toml",
+    ));
 
     let mut ctx = ReloadContext {
-        config_path: &config_path,
+        source: &source,
         executor_tx: &unused_executor_tx,
         config: &mut config,
         watchers: &mut watchers,
@@ -354,9 +356,11 @@ async fn test_control_request_reports_backend_ban_failure_after_tracker_rollback
     let (unused_executor_tx, _unused_executor_rx) = mpsc::channel::<FirewallCmd>(4);
     let (unused_failure_tx, _unused_failure_rx) = mpsc::channel(4);
     let mut watchers = Watchers::default();
-    let config_path = std::path::PathBuf::from("/nonexistent/fail2ban-rs-test.toml");
+    let source = crate::config::Source::Toml(std::path::PathBuf::from(
+        "/nonexistent/fail2ban-rs-test.toml",
+    ));
     let mut ctx = ReloadContext {
-        config_path: &config_path,
+        source: &source,
         executor_tx: &unused_executor_tx,
         config: &mut config,
         watchers: &mut watchers,
@@ -417,9 +421,11 @@ async fn test_control_request_reports_tracker_unavailable_once_tracker_is_gone()
     let (unused_executor_tx, _unused_executor_rx) = mpsc::channel::<FirewallCmd>(4);
     let (unused_failure_tx, _unused_failure_rx) = mpsc::channel(4);
     let mut watchers = Watchers::default();
-    let config_path = std::path::PathBuf::from("/nonexistent/fail2ban-rs-test.toml");
+    let source = crate::config::Source::Toml(std::path::PathBuf::from(
+        "/nonexistent/fail2ban-rs-test.toml",
+    ));
     let mut ctx = ReloadContext {
-        config_path: &config_path,
+        source: &source,
         executor_tx: &unused_executor_tx,
         config: &mut config,
         watchers: &mut watchers,
@@ -446,9 +452,11 @@ async fn test_dispatch_control_ban_does_not_block_main_loop() {
     let (executor_tx, _executor_rx) = mpsc::channel::<FirewallCmd>(4);
     let (failure_tx, _failure_rx) = mpsc::channel(4);
     let mut watchers = Watchers::default();
-    let config_path = std::path::PathBuf::from("/nonexistent/fail2ban-rs-test.toml");
+    let source = crate::config::Source::Toml(std::path::PathBuf::from(
+        "/nonexistent/fail2ban-rs-test.toml",
+    ));
     let mut ctx = ReloadContext {
-        config_path: &config_path,
+        source: &source,
         executor_tx: &executor_tx,
         config: &mut config,
         watchers: &mut watchers,

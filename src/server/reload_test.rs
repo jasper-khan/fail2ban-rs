@@ -114,7 +114,7 @@ async fn reload_with_replacement(succeed: bool) -> (crate::error::Result<()>, Ve
     let mut watchers = Watchers::default();
 
     let result = reload_config(
-        &path,
+        &crate::config::Source::Toml(path.clone()),
         &executor_tx,
         &tracker_tx,
         &mut config,

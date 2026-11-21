@@ -193,7 +193,21 @@ cargo test
 
 ## Migration from fail2ban
 
-The daemon does not yet load original Fail2Ban INI files. The internal
+The daemon has a stage-one compatibility mode: `fail2ban-rs run --legacy-dir
+<tree> --record-decisions <file>` loads an original Fail2Ban INI tree
+(`fail2ban.conf`, `jail.conf` with layered drop-ins, `filter.d/`) through
+the pinned-parity readers into the normal daemon pipeline. Admission
+currently covers polling-backend file jails with `usedns = no` and
+single-file filters (no prefregex/journalmatch/multiline/custom dates);
+every ban and unban is appended to the record file instead of touching a
+firewall. Jails accept multiple `logpath` entries — each file is its own
+watcher and per-file resume point, and failures merge under one jail id.
+SIGHUP reloads the tree and hands every log position to the replacement
+watchers without dropping or duplicating a line. The TOML configuration
+remains the production path until the remaining surface (journal, actions,
+database, client protocol) is covered.
+
+The internal
 reader's file precedence, configuration merging, and the whole stock
 config catalog (every jail, filter, action, and paths overlay option,
 each either expanded or error-identical) are tested separately against

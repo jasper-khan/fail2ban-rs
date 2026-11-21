@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, Source};
 use crate::detect::watcher::Failure;
 use crate::enforce::FirewallCmd;
 use crate::logging::Logger;
@@ -18,7 +18,7 @@ use super::watchers::{WatcherPlan, Watchers, build_watcher_plan};
 
 /// Shared mutable state needed during config reload.
 pub(super) struct ReloadContext<'a> {
-    pub(super) config_path: &'a std::path::Path,
+    pub(super) source: &'a Source,
     pub(super) executor_tx: &'a mpsc::Sender<FirewallCmd>,
     pub(super) config: &'a mut Config,
     pub(super) watchers: &'a mut Watchers,
@@ -40,7 +40,7 @@ pub(super) struct ReloadContext<'a> {
 /// before the old watchers are touched, so a failed reload leaves them
 /// running.
 pub(super) async fn reload_config(
-    config_path: &std::path::Path,
+    source: &Source,
     executor_tx: &mpsc::Sender<FirewallCmd>,
     tracker_cmd_tx: &mpsc::Sender<TrackerCmd>,
     current_config: &mut Config,
@@ -48,7 +48,7 @@ pub(super) async fn reload_config(
     failure_tx: &mpsc::Sender<Failure>,
     logger: Option<&Logger>,
 ) -> crate::error::Result<()> {
-    let new_config = Config::from_file(config_path)?;
+    let new_config = source.load()?;
     let new_watcher_plan = build_watcher_plan(&new_config)?;
 
     let delta = FirewallDelta::compute(current_config, &new_config);
