@@ -27,7 +27,7 @@ use crate::config::{Config, JailConfig, LogBackend};
 use crate::detect::ResumePoint;
 use crate::detect::date::DateParser;
 use crate::detect::ignore::IgnoreList;
-use crate::detect::matcher::JailMatcher;
+use crate::detect::line_matcher::LineMatcher;
 use crate::detect::watcher::Failure;
 
 /// Upper bound on waiting for all old watchers to report their position.
@@ -51,7 +51,7 @@ pub(super) struct WatcherPlan {
     /// Jail id failures are reported under.
     pub(super) jail: String,
     pub(super) source: PlanSource,
-    pub(super) matcher: JailMatcher,
+    pub(super) matcher: LineMatcher,
     pub(super) date_parser: DateParser,
     pub(super) ignore_list: IgnoreList,
 }
@@ -107,10 +107,9 @@ fn planned_source(
     source: PlanSource,
     jail: &JailConfig,
 ) -> crate::error::Result<WatcherPlan> {
-    let matcher = if jail.ignoreregex.is_empty() {
-        JailMatcher::new(&jail.filter)?
-    } else {
-        JailMatcher::with_ignoreregex(&jail.filter, &jail.ignoreregex)?
+    let matcher = match &jail.legacy_filter {
+        Some(legacy) => LineMatcher::legacy(legacy)?,
+        None => LineMatcher::modern(&jail.filter, &jail.ignoreregex)?,
     };
     let key_suffix = match &source {
         PlanSource::File(path) => path.display().to_string(),
@@ -187,6 +186,11 @@ fn spawn_one(
             handoff,
         )),
         PlanSource::Journal(journalmatch) => {
+            // The journal source speaks the native engine only; legacy
+            // filters never reach it (compat rejects journalmatch up front).
+            let LineMatcher::Modern(matcher) = matcher else {
+                unreachable!("legacy filters are not admitted on the journal backend");
+            };
             tokio::spawn(crate::detect::journal::run_supervised_from(
                 jail,
                 journalmatch,

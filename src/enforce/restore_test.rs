@@ -19,6 +19,7 @@ fn test_jail_config(restore: bool) -> JailConfig {
         enabled: true,
         log_path: "/tmp/test.log".into(),
         log_paths: Vec::new(),
+        legacy_filter: None,
         date_format: crate::detect::date::DateFormat::Syslog,
         filter: vec!["from <HOST>".to_string()],
         max_retry: 3,

@@ -35,8 +35,10 @@ pub(super) struct Parameters<'a> {
     pub(super) all: bool,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResolvedFilter {
+/// Public because compatibility [`JailConfig`](crate::config::JailConfig)s
+/// carry it in an optional field; reading and compiling stay crate-internal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedFilter {
     /// Combined strings, except maxlines. Unknown angle tags are kept literal.
     pub(crate) options: Options,
     /// Integer conversion after all config substitutions. Like upstream, an

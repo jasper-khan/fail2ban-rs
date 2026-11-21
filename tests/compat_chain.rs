@@ -163,6 +163,49 @@ fn failure(ip: &str) -> String {
     ))
 }
 
+/// Stock-format 1.1.1 nginx prefix common include (comments removed).
+const NGINX_ERROR_COMMON: &str = concat!(
+    "[DEFAULT]\n",
+    "logtype = file\n",
+    "_daemon = nginx\n",
+    "__prefix = <lt_<logtype>/__prefix>\n",
+    "__err_type = error\n",
+    "__prefix_line = %(__prefix)s\\[%(__err_type)s\\] \\d+#\\d+: \\*\\d+\\s+\n",
+    "[lt_file]\n",
+    "__prefix = \\s*\n",
+    "[lt_short]\n",
+    "__prefix = \\s*(?:(?!\\[)\\S+ %(_daemon)s\\[\\d+\\]: [^\\[]*)?\n",
+    "[lt_journal]\n",
+    "__prefix = %(lt_short/__prefix)s\n",
+);
+
+/// Stock-format 1.1.1 nginx-http-auth filter body (comments removed) to run
+/// the original prefregex class through the parity-proven legacy engine.
+const NGINX_HTTP_AUTH: &str = concat!(
+    "[INCLUDES]\n",
+    "before = nginx-error-common.conf\n",
+    "[Definition]\n",
+    "mode = normal\n",
+    "__err_type = (?:error|crit)\n",
+    "__suffix_line = , client: <ADDR>(?:, (?:server|request|host|referrer): (?:\"[^\"]*\"|\\S*)){0,4}\n",
+    "prefregex = ^%(__prefix_line)s<F-CONTENT>.*</F-CONTENT>%(__suffix_line)s\\s*$\n",
+    "mdre-auth = ^user \"<F-USER>(?:[^\"]+|.*?)</F-USER>\":? (?:password mismatch|was not found in \"[^\\\"]*\")$\n",
+    "            ^(?:PAM: )?user '<F-USER>(?:[^']+|.*?)</F-USER>' - not authenticated: Authentication failure$\n",
+    "mdre-fallback = ^SSL_(?:do_handshake|read)\\(\\) failed \\(SSL: error:\\S+(?: \\S+){1,3}[^\\)]*\\)[^,]*\n",
+    "mdre-normal = %(mdre-auth)s\n",
+    "mdre-aggressive = %(mdre-auth)s\n",
+    "                  %(mdre-fallback)s\n",
+    "failregex = <mdre-<mode>>\n",
+    "ignoreregex = \n",
+    "datepattern = {^LN-BEG}\n",
+);
+
+fn nginx_failure() -> String {
+    "2026/11/21 15:00:01 [error] 123#123: *4 user \"bob\": password mismatch, \
+     client: 192.0.2.10, server: auth.example"
+        .to_owned()
+}
+
 /// The recorded decision lines, "KIND jail ip" each.
 fn decisions(record: &Path) -> Vec<String> {
     std::fs::read_to_string(record)
@@ -185,8 +228,10 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     let record = tmp.path().join("decisions.log");
     let web1_path = tmp.path().join("web1.log");
     let web2_path = tmp.path().join("web2.log");
+    let web3_path = tmp.path().join("web3.log");
     let web1 = Tail::create(&web1_path).expect("web1");
     let web2 = Tail::create(&web2_path).expect("web2");
+    let web3 = Tail::create(&web3_path).expect("web3");
 
     std::fs::write(
         base.join("fail2ban.conf"),
@@ -214,9 +259,19 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
              \x20   {}\n\
              maxretry = 3\n\
              findtime = 120s\n\
+             bantime = 4s\n\
+             \n\
+             [nginx-class]\n\
+             enabled = true\n\
+             port = 443\n\
+             filter = nginx-http-auth\n\
+             logpath = {web3}\n\
+             maxretry = 3\n\
+             findtime = 120s\n\
              bantime = 4s\n",
             web1_path.display(),
             web2_path.display(),
+            web3 = web3_path.display(),
         ),
     )
     .expect("jail.conf");
@@ -227,6 +282,12 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
          ignoreregex =\n",
     )
     .expect("filter");
+    std::fs::write(
+        filter_dir.join("nginx-error-common.conf"),
+        NGINX_ERROR_COMMON,
+    )
+    .expect("nginx common");
+    std::fs::write(filter_dir.join("nginx-http-auth.conf"), NGINX_HTTP_AUTH).expect("nginx filter");
 
     // Pre-start content must be ignored: the daemon tails from EOF.
     web1.append(vec![failure("9.9.9.9")]);
@@ -240,6 +301,13 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     web1.append(vec![failure("1.2.3.4")]);
     wait_for("first ban across both logs", || {
         decisions(&record).contains(&"BAN chain-jail 1.2.3.4".to_owned())
+    });
+
+    // The stock nginx class (prefregex, {^LN-BEG}) runs through the
+    // parity-proven original engine in the same daemon.
+    web3.append(vec![nginx_failure(), nginx_failure(), nginx_failure()]);
+    wait_for("legacy-engine ban", || {
+        decisions(&record).contains(&"BAN nginx-class 192.0.2.10".to_owned())
     });
 
     // One below the threshold before the reload.
@@ -276,9 +344,11 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     // Every ban expires and unbans exactly once.
     let expected = [
         "BAN chain-jail 1.2.3.4",
+        "BAN nginx-class 192.0.2.10",
         "BAN chain-jail 5.6.7.8",
         "BAN chain-jail 7.7.7.8",
         "UNBAN chain-jail 1.2.3.4",
+        "UNBAN nginx-class 192.0.2.10",
         "UNBAN chain-jail 5.6.7.8",
         "UNBAN chain-jail 7.7.7.8",
     ];

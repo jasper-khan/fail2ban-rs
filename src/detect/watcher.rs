@@ -20,7 +20,7 @@ pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
 
 use crate::detect::date::DateParser;
 use crate::detect::ignore::IgnoreList;
-use crate::detect::matcher::JailMatcher;
+use crate::detect::line_matcher::LineMatcher;
 use crate::detect::reader::read_loop;
 use crate::detect::resume::{FilePosition, ResumePoint};
 
@@ -50,7 +50,7 @@ const LINE_CHANNEL_CAPACITY: usize = 256;
 pub async fn run(
     jail_id: String,
     log_path: PathBuf,
-    matcher: JailMatcher,
+    matcher: LineMatcher,
     date_parser: DateParser,
     ignore_list: IgnoreList,
     tx: mpsc::Sender<Failure>,
@@ -89,7 +89,7 @@ pub async fn run(
 pub async fn run_from(
     jail_id: String,
     log_path: PathBuf,
-    matcher: JailMatcher,
+    matcher: LineMatcher,
     date_parser: DateParser,
     ignore_list: IgnoreList,
     tx: mpsc::Sender<Failure>,
@@ -118,7 +118,7 @@ pub async fn run_from(
 pub(crate) async fn run_supervised_from(
     jail_id: String,
     log_path: PathBuf,
-    matcher: JailMatcher,
+    matcher: LineMatcher,
     date_parser: DateParser,
     ignore_list: IgnoreList,
     tx: mpsc::Sender<Failure>,

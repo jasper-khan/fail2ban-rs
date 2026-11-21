@@ -172,6 +172,7 @@ fn test_jail_config() -> JailConfig {
     JailConfig {
         log_path: "/tmp/test.log".into(),
         log_paths: Vec::new(),
+        legacy_filter: None,
         filter: vec!["from <HOST>".to_string()],
         ..JailConfig::default()
     }

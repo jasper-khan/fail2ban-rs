@@ -5,7 +5,8 @@ mod backend;
 // entry point is unchanged.
 #[allow(dead_code)]
 pub(crate) mod compat;
-pub(crate) mod legacy_filter;
+#[allow(dead_code)]
+pub mod legacy_filter;
 #[cfg(test)]
 mod legacy_filter_parity_test;
 #[allow(dead_code)]

@@ -7,10 +7,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::detect::date::{DateFormat, DateParser};
 use crate::detect::ignore::IgnoreList;
+use crate::detect::line_matcher::LineMatcher;
 use crate::detect::matcher::JailMatcher;
 
-fn test_matcher() -> JailMatcher {
-    JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap()
+fn test_matcher() -> LineMatcher {
+    LineMatcher::Modern(
+        JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap(),
+    )
 }
 
 #[tokio::test]

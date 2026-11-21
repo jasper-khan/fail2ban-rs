@@ -285,16 +285,34 @@ fn load_jail(
             "the original compat daemon does not yet support multi-line filters",
         ));
     }
-    for key in ["prefregex", "journalmatch", "datepattern"] {
-        if resolved
+    // journalmatch needs the journal backend (later stage); reject for both
+    // engines up front.
+    if resolved
+        .options
+        .get("journalmatch")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(Error::config(
+            "the original compat daemon does not yet support journalmatch",
+        ));
+    }
+    // Prefregex filters run through the original parity-proven engine, which
+    // enforces its own subset (file logtype, single line, {^LN-BEG} dates)
+    // at compile time with the original error messages. Pattern-list filters
+    // without prefregex stay on the native engine, which has no datepattern.
+    let has_prefregex = resolved
+        .options
+        .get("prefregex")
+        .is_some_and(|value| !value.is_empty());
+    if !has_prefregex
+        && resolved
             .options
-            .get(key)
+            .get("datepattern")
             .is_some_and(|value| !value.is_empty())
-        {
-            return Err(Error::config(format!(
-                "the original compat daemon does not yet support filter {key}"
-            )));
-        }
+    {
+        return Err(Error::config(
+            "the original compat daemon does not yet support filter datepattern",
+        ));
     }
     for key in ["logtype", "usedns"] {
         if resolved
@@ -307,18 +325,25 @@ fn load_jail(
             )));
         }
     }
-    let failregex = regex_lines(jail, resolved.options.get("failregex"))?;
-    let ignoreregex = resolved
-        .options
-        .get("ignoreregex")
-        .map(|value| {
-            value
-                .split('\n')
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| line.trim().to_owned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let (failregex, ignoreregex, legacy_filter) = if has_prefregex {
+        (Vec::new(), Vec::new(), Some(resolved.clone()))
+    } else {
+        (
+            regex_lines(jail, resolved.options.get("failregex"))?,
+            resolved
+                .options
+                .get("ignoreregex")
+                .map(|value| {
+                    value
+                        .split('\n')
+                        .filter(|line| !line.trim().is_empty())
+                        .map(|line| line.trim().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            None,
+        )
+    };
     let ignoreip = get("ignoreip")?
         .map(|value| {
             value
@@ -339,6 +364,7 @@ fn load_jail(
         date_format: DateFormat::Syslog,
         filter: failregex,
         ignoreregex,
+        legacy_filter,
         max_retry,
         find_time,
         ban_time,

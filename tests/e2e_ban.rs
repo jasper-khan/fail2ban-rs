@@ -101,7 +101,9 @@ async fn test_watcher_to_tracker_ban() {
     });
 
     // Spawn watcher.
-    let matcher = JailMatcher::new(&jail_config.filter).unwrap();
+    let matcher = fail2ban_rs::detect::line_matcher::LineMatcher::Modern(
+        JailMatcher::new(&jail_config.filter).unwrap(),
+    );
     let date_parser = DateParser::new(DateFormat::Syslog).unwrap();
     let ignore_list = IgnoreList::new(&[], false).unwrap();
     let watcher_cancel = cancel.child_token();

@@ -11,6 +11,8 @@ pub mod filters;
 pub mod ignore;
 /// Systemd journal log source.
 pub mod journal;
+/// Per-line matching engine: native patterns or parity-proven original.
+pub mod line_matcher;
 /// Two-phase log matching engine.
 pub mod matcher;
 /// Pattern compilation and `<HOST>` expansion.
@@ -42,7 +44,7 @@ pub(crate) mod legacy_file_identity;
 #[allow(dead_code)]
 pub(crate) mod legacy_file_seek;
 #[allow(dead_code)]
-pub(crate) mod legacy_matcher;
+pub mod legacy_matcher;
 #[cfg(test)]
 mod legacy_matcher_parity_test;
 #[allow(dead_code)]

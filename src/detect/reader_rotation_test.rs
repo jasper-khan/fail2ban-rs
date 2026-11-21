@@ -5,6 +5,7 @@ use std::io::Write;
 use tempfile::TempDir;
 
 use crate::detect::date::{DateFormat, DateParser};
+use crate::detect::matcher::JailMatcher;
 
 const LINE_A: &str =
     "Jan 15 10:30:00 server sshd[1]: Failed password for root from 192.168.1.1 port 22\n";
@@ -16,7 +17,9 @@ const LINE_C: &str =
 fn ctx(tx: mpsc::Sender<Failure>) -> ReadCtx {
     ReadCtx {
         jail_id: "test".to_string(),
-        matcher: JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap(),
+        matcher: crate::detect::line_matcher::LineMatcher::Modern(
+            JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap(),
+        ),
         date_parser: DateParser::new(DateFormat::Syslog).unwrap(),
         ignore_list: IgnoreList::new(&[], false).unwrap(),
         tx,

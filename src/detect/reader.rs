@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::detect::date::DateParser;
 use crate::detect::identity::FileIdentity;
 use crate::detect::ignore::IgnoreList;
-use crate::detect::matcher::JailMatcher;
+use crate::detect::line_matcher::LineMatcher;
 use crate::detect::resume::{FilePosition, open_log};
 use crate::detect::watcher::{Failure, MAX_LINE_LEN};
 use crate::text::lossy;
@@ -29,7 +29,7 @@ use crate::text::lossy;
 /// argument list.
 struct ReadCtx {
     jail_id: String,
-    matcher: JailMatcher,
+    matcher: LineMatcher,
     date_parser: DateParser,
     ignore_list: IgnoreList,
     tx: mpsc::Sender<Failure>,
@@ -41,7 +41,7 @@ impl ReadCtx {
     /// Returns `false` only when the downstream channel is closed and the
     /// loop should stop.
     fn handle_line(&self, line: &str) -> bool {
-        let Some(m) = self.matcher.try_match(line) else {
+        let Some(m) = self.matcher.try_match(line, &self.date_parser) else {
             return true;
         };
         if self.ignore_list.is_ignored(&m.ip) {
@@ -53,14 +53,10 @@ impl ReadCtx {
             );
             return true;
         }
-        let timestamp = self
-            .date_parser
-            .parse_line(line)
-            .unwrap_or_else(|| chrono::Utc::now().timestamp());
         let failure = Failure {
             ip: m.ip,
             jail_id: self.jail_id.clone(),
-            timestamp,
+            timestamp: m.timestamp,
         };
         self.tx.blocking_send(failure).is_ok()
     }
@@ -123,7 +119,7 @@ impl TailState {
 pub(crate) fn read_loop(
     jail_id: String,
     log_path: PathBuf,
-    matcher: JailMatcher,
+    matcher: LineMatcher,
     date_parser: DateParser,
     ignore_list: IgnoreList,
     tx: mpsc::Sender<Failure>,

@@ -30,7 +30,9 @@ fn spawn_watcher(
         crate::detect::watcher::run(
             "test".to_string(),
             path,
-            JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap(),
+            crate::detect::line_matcher::LineMatcher::Modern(
+                JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap(),
+            ),
             DateParser::new(DateFormat::Syslog).unwrap(),
             IgnoreList::new(&[], false).unwrap(),
             tx,
@@ -42,8 +44,10 @@ fn spawn_watcher(
     (cancel, handle, rx)
 }
 
-fn test_matcher() -> JailMatcher {
-    JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap()
+fn test_matcher() -> crate::detect::line_matcher::LineMatcher {
+    crate::detect::line_matcher::LineMatcher::Modern(
+        JailMatcher::new(&[r"Failed password for .* from <HOST>".to_string()]).unwrap(),
+    )
 }
 
 // --- UTF-8 robustness tests ---

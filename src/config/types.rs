@@ -97,6 +97,12 @@ pub struct JailConfig {
     #[serde(default)]
     pub log_paths: Vec<PathBuf>,
 
+    /// Original 1.1.1 filter definition for compatibility-tree jails: run
+    /// through the parity-proven legacy engine instead of the pattern list.
+    /// The TOML path never sets it (`serde(skip)` keeps it out of TOML).
+    #[serde(skip, default)]
+    pub legacy_filter: Option<crate::config::legacy_filter::ResolvedFilter>,
+
     /// Date format preset for timestamp extraction.
     #[serde(default = "default_date_format")]
     pub date_format: DateFormat,
@@ -331,6 +337,7 @@ impl Default for JailConfig {
             enabled: default_true(),
             log_path: PathBuf::new(),
             log_paths: Vec::new(),
+            legacy_filter: None,
             date_format: default_date_format(),
             filter: vec![],
             max_retry: default_max_retry(),

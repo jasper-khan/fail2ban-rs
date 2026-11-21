@@ -16,8 +16,10 @@ use crate::detect::legacy_regex::{self, ADDRESS, CONTENT, Role, USER};
 use crate::detect::watcher::MAX_LINE_LEN;
 use crate::error::{Error, Result};
 
+/// Public because it sits in the [`LineMatcher`](crate::detect::line_matcher::LineMatcher)
+/// public enum; compiling stays crate-internal.
 #[derive(Debug)]
-pub(crate) struct LegacyMatcher {
+pub struct LegacyMatcher {
     prefix: Option<Regex>,
     prefix_has_address: bool,
     failures: Vec<Regex>,

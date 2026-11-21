@@ -166,7 +166,13 @@ impl Config {
 
     /// Validate filter and ignoreregex patterns, compiling each through the
     /// same path the matcher uses so bad regexes fail at load, not at startup.
+    /// Legacy compatibility filters run through the parity-proven original
+    /// engine instead, whose compile checks run in the watcher plan build —
+    /// also before any task or firewall exists.
     fn validate_jail_filters(name: &str, jail: &JailConfig) -> Result<()> {
+        if jail.legacy_filter.is_some() {
+            return Ok(());
+        }
         if jail.filter.is_empty() {
             return Err(Error::config(format!("jail '{name}': no filter patterns")));
         }

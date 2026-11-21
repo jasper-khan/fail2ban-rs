@@ -20,6 +20,13 @@ fn tree(dir: &Path, jail_conf: &str, filter: &str) -> PathBuf {
     .expect("write fail2ban.conf");
     std::fs::write(dir.join("jail.conf"), jail_conf).expect("write jail.conf");
     std::fs::write(dir.join("filter.d/chain-auth.conf"), filter).expect("write filter");
+    std::fs::write(
+        dir.join("filter.d/nginx-error-common.conf"),
+        NGINX_ERROR_COMMON,
+    )
+    .expect("write nginx-error-common");
+    std::fs::write(dir.join("filter.d/nginx-http-auth.conf"), NGINX_HTTP_AUTH)
+        .expect("write nginx-http-auth");
     dir.to_path_buf()
 }
 
@@ -45,6 +52,52 @@ const FILTER: &str = concat!(
     "[Definition]\n",
     "failregex = ^chain auth failure .* from <HOST> port \\d+\n",
     "ignoreregex =\n",
+);
+
+/// Stock 1.1.1 filter pair bodies (comments removed), so the legacy-engine
+/// fixture exercises the real include and conditional-tag machinery.
+const NGINX_ERROR_COMMON: &str = concat!(
+    "[DEFAULT]\n",
+    "logtype = file\n",
+    "_daemon = nginx\n",
+    "__prefix = <lt_<logtype>/__prefix>\n",
+    "__err_type = error\n",
+    "__prefix_line = %(__prefix)s\\[%(__err_type)s\\] \\d+#\\d+: \\*\\d+\\s+\n",
+    "[lt_file]\n",
+    "__prefix = \\s*\n",
+    "[lt_short]\n",
+    "__prefix = \\s*(?:(?!\\[)\\S+ %(_daemon)s\\[\\d+\\]: [^\\[]*)?\n",
+    "[lt_journal]\n",
+    "__prefix = %(lt_short/__prefix)s\n",
+);
+
+const NGINX_HTTP_AUTH: &str = concat!(
+    "[INCLUDES]\n",
+    "before = nginx-error-common.conf\n",
+    "\n",
+    "[Definition]\n",
+    "\n",
+    "mode = normal\n",
+    "\n",
+    "__err_type = (?:error|crit)\n",
+    "\n",
+    "__suffix_line = , client: <ADDR>(?:, (?:server|request|host|referrer): (?:\"[^\"]*\"|\\S*)){0,4}\n",
+    "\n",
+    "prefregex = ^%(__prefix_line)s<F-CONTENT>.*</F-CONTENT>%(__suffix_line)s\\s*$\n",
+    "\n",
+    "mdre-auth = ^user \"<F-USER>(?:[^\"]+|.*?)</F-USER>\":? (?:password mismatch|was not found in \"[^\\\"]*\")$\n",
+    "            ^(?:PAM: )?user '<F-USER>(?:[^']+|.*?)</F-USER>' - not authenticated: Authentication failure$\n",
+    "mdre-fallback = ^SSL_(?:do_handshake|read)\\(\\) failed \\(SSL: error:\\S+(?: \\S+){1,3}[^\\)]*\\)[^,]*\n",
+    "\n",
+    "mdre-normal = %(mdre-auth)s\n",
+    "mdre-aggressive = %(mdre-auth)s\n",
+    "                  %(mdre-fallback)s\n",
+    "\n",
+    "failregex = <mdre-<mode>>\n",
+    "\n",
+    "ignoreregex = \n",
+    "\n",
+    "datepattern = {^LN-BEG}\n",
 );
 
 #[test]
@@ -176,14 +229,6 @@ fn rejects_filters_with_unsupported_features() {
         (
             concat!(
                 "[Definition]\n",
-                "prefregex = ^.*from <HOST>\n",
-                "failregex = <F-NOBEGGARING>.*\n",
-            ),
-            "prefregex",
-        ),
-        (
-            concat!(
-                "[Definition]\n",
                 "failregex = ^fail .* from <HOST>\n",
                 "datepattern = %%Y %%m %%d\n",
             ),
@@ -207,6 +252,46 @@ fn rejects_filters_with_unsupported_features() {
             "expected {needle} in {err}"
         );
     }
+}
+
+#[test]
+fn converts_prefregex_filters_onto_the_legacy_engine() {
+    let tmp = tempfile::tempdir().expect("scratch");
+    let jail_conf = concat!(
+        "[DEFAULT]\nbackend = polling\nusedns = no\nignoreself = false\naction =\n",
+        "[nginx-class]\nenabled = true\nport = 443\nfilter = nginx-http-auth\n",
+        "logpath = /tmp/web3.log\nmaxretry = 3\nfindtime = 120s\nbantime = 4s\n",
+    );
+    let base = tree(tmp.path(), jail_conf, FILTER);
+    let config = load(&base, Path::new("/tmp/decisions.log"))
+        .expect("the stock nginx class converts onto the legacy engine");
+    let jail = config
+        .jail
+        .get("nginx-class")
+        .expect("legacy jail converted");
+    assert!(jail.filter.is_empty(), "patterns run in the legacy engine");
+    assert!(jail.ignoreregex.is_empty());
+    let legacy = jail
+        .legacy_filter
+        .as_ref()
+        .expect("resolved filter definition is carried through");
+    assert!(
+        legacy
+            .options
+            .get("prefregex")
+            .expect("prefregex resolved")
+            .contains("<F-CONTENT>")
+    );
+    assert_eq!(
+        legacy.options.get("datepattern").map(String::as_str),
+        Some("{^LN-BEG}")
+    );
+    let failregex = legacy
+        .options
+        .get("failregex")
+        .expect("mode substitution applied");
+    assert!(failregex.contains("password mismatch"));
+    assert!(failregex.contains("not authenticated"));
 }
 
 #[test]
