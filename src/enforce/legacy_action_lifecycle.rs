@@ -1,14 +1,14 @@
 //! Pure, scoped model of Fail2Ban 1.1.1 CommandAction phase ordering.
 //!
 //! Steps carry no command strings, paths, addresses, or capabilities. The
-//! caller supplies only simulated operation availability/outcomes. This
-//! covers one common family or distinct family operations; it deliberately
-//! omits equality-based deduplication of rendered commands, which requires
-//! the original substitution/operation cache. No daemon or actions are wired.
+//! caller supplies only simulated operation availability/outcomes and opaque
+//! identities for equivalent phases. No daemon or actions are wired.
+
+use std::collections::HashMap;
 
 pub(super) use super::legacy_action_policy::Family;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum StepKind {
     Start,
     Check,
@@ -19,10 +19,76 @@ pub(super) enum StepKind {
     Stop,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Step {
     pub(super) kind: StepKind,
     pub(super) family: Family,
+}
+
+/// Inert equivalence identity, never interpreted as an executable operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OperationIdentity(pub(super) u64);
+
+#[derive(Debug, Default)]
+struct OperationCache {
+    identities: HashMap<Step, OperationIdentity>,
+    completed: HashMap<Step, OperationIdentity>,
+}
+
+impl OperationCache {
+    fn configure(&mut self, step: Step, identity: OperationIdentity) {
+        // Original public operation-property changes invalidate the entire
+        // substitution cache. Keep that behavior if the setup changes.
+        self.identities.insert(step, identity);
+        self.completed.clear();
+    }
+
+    fn clear_family_and_peers(&mut self, step: Step) {
+        // Peers of the previously cached identity, not peers of whatever
+        // identity is currently configured for this family.
+        if let Some(previous) = self.completed.remove(&step) {
+            self.completed
+                .retain(|peer, identity| peer.kind != step.kind || *identity != previous);
+        }
+    }
+
+    fn run(
+        &mut self,
+        record: &mut impl FnMut(Step) -> Option<bool>,
+        kind: StepKind,
+        family: Family,
+    ) -> bool {
+        let step = Step { kind, family };
+        let identity = self.identities.get(&step).copied();
+        let other_family_completed = identity.is_some_and(|configured| {
+            self.completed.iter().any(|(peer, cached)| {
+                peer.kind == kind && peer.family != family && *cached == configured
+            })
+        });
+        let outcome = if other_family_completed {
+            Some(true)
+        } else {
+            record(step)
+        };
+        let success = outcome.unwrap_or(true);
+        if success {
+            let opposite = match kind {
+                StepKind::Start => Some(StepKind::Stop),
+                StepKind::Stop => Some(StepKind::Start),
+                _ => None,
+            };
+            if let Some(kind) = opposite {
+                self.clear_family_and_peers(Step { kind, family });
+            }
+        }
+        if let (Some(true), Some(identity)) = (outcome, identity) {
+            // Record skipped operations too, just as a successful execution.
+            self.completed.insert(step, identity);
+        } else {
+            self.clear_family_and_peers(step);
+        }
+        success
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +106,7 @@ pub(super) struct Lifecycle {
     checks_enabled: bool,
     repair_on_unban: bool,
     states: Vec<(Family, State)>,
+    operations: OperationCache,
 }
 
 impl Lifecycle {
@@ -57,6 +124,19 @@ impl Lifecycle {
             checks_enabled,
             repair_on_unban,
             states: Vec::new(),
+            operations: OperationCache::default(),
+        }
+    }
+
+    /// Mark a nonempty start, flush, or stop as equivalent to another phase
+    /// of that same kind. Without an identity each configured phase runs as
+    /// before. Ticket operations, repair, and checks are never deduplicated.
+    pub(super) fn set_operation_identity(&mut self, step: Step, identity: OperationIdentity) {
+        if matches!(
+            step.kind,
+            StepKind::Start | StepKind::Flush | StepKind::Stop
+        ) {
+            self.operations.configure(step, identity);
         }
     }
 
@@ -113,7 +193,7 @@ impl Lifecycle {
         let mut success = true;
         for (family, state) in &mut self.states {
             if *state == State::HasItems {
-                let flushed = phase(record, StepKind::Flush, *family);
+                let flushed = self.operations.run(record, StepKind::Flush, *family);
                 if flushed {
                     *state = State::Started;
                 }
@@ -124,13 +204,20 @@ impl Lifecycle {
     }
 
     pub(super) fn stop(&mut self, record: &mut impl FnMut(Step) -> Option<bool>) -> bool {
+        if !self
+            .states
+            .iter()
+            .any(|(_, state)| *state != State::Inactive)
+        {
+            return true;
+        }
         // Upstream clears all state before attempting any stop. A partial
         // failure does not cause another stop attempt for the failed family.
         let previous = std::mem::take(&mut self.states);
         let mut success = true;
         for (family, state) in previous {
             if state != State::Inactive {
-                success &= phase(record, StepKind::Stop, family);
+                success &= self.operations.run(record, StepKind::Stop, family);
             }
         }
         success
@@ -147,6 +234,10 @@ impl Lifecycle {
         for (family, previous) in self.states.clone() {
             if previous != State::Inactive && !self.invariant(family, true, true, record) {
                 self.set_state(family, State::Inactive);
+                self.operations.clear_family_and_peers(Step {
+                    kind: StepKind::Start,
+                    family,
+                });
                 success = false;
             }
         }
@@ -168,7 +259,7 @@ impl Lifecycle {
     }
 
     fn start_one(&mut self, family: Family, record: &mut impl FnMut(Step) -> Option<bool>) -> bool {
-        if !phase(record, StepKind::Start, family) {
+        if !self.operations.run(record, StepKind::Start, family) {
             return false;
         }
         self.set_state(family, State::Started);
@@ -225,7 +316,7 @@ impl Lifecycle {
                 // a failed stop and still attempts to recover through start.
                 if self.state(family).is_some() {
                     self.set_state(family, State::Inactive);
-                    let _ = phase(record, StepKind::Stop, family);
+                    let _ = self.operations.run(record, StepKind::Stop, family);
                 }
                 if (force_start || !self.start_on_demand) && !self.start_one(family, record) {
                     return false;
@@ -400,5 +491,110 @@ mod tests {
             );
             assert_eq!(action.has_items(Common), !repair_on_unban);
         }
+    }
+
+    fn share(action: &mut Lifecycle, kind: StepKind, families: &[Family]) {
+        for &family in families {
+            action.set_operation_identity(Step { kind, family }, OperationIdentity(7));
+        }
+    }
+
+    #[test]
+    fn shared_lifecycle_steps_deduplicate_without_suppressing_family_state() {
+        use Family::{Common, Ipv4, Ipv6};
+        use StepKind::{Ban, Flush, Start, Stop};
+
+        let mut action = Lifecycle::new(true, vec![Common], false, false);
+        for kind in [Start, Flush, Stop, Ban] {
+            share(&mut action, kind, &[Common, Ipv4, Ipv6]);
+        }
+        assert!(verify(
+            &[(Start, Common, Some(true)), (Ban, Common, Some(true))],
+            |mut f| action.ban(Common, &mut f)
+        ));
+        assert!(verify(&[(Ban, Ipv6, Some(true))], |mut f| {
+            action.ban(Ipv6, &mut f)
+        }));
+        assert!(verify(&[(Ban, Ipv4, Some(true))], |mut f| {
+            action.ban(Ipv4, &mut f)
+        }));
+        assert!(action.has_items(Common) && action.has_items(Ipv4) && action.has_items(Ipv6));
+        assert!(verify(&[(Flush, Common, Some(true))], |mut f| {
+            action.flush(&mut f)
+        }));
+        assert!(!action.has_items(Common) && !action.has_items(Ipv4) && !action.has_items(Ipv6));
+        assert!(verify(&[(Stop, Common, Some(true))], |mut f| {
+            action.stop(&mut f)
+        }));
+
+        // Successful stop invalidates the shared start; flush's independent
+        // cache still suppresses it across the next lifetime.
+        assert!(verify(
+            &[(Start, Ipv4, Some(true)), (Ban, Ipv4, Some(true))],
+            |mut f| action.ban(Ipv4, &mut f)
+        ));
+        assert!(verify(&[(Ban, Ipv6, Some(true))], |mut f| {
+            action.ban(Ipv6, &mut f)
+        }));
+        assert!(verify(&[], |mut f| action.flush(&mut f)));
+        assert!(verify(&[(Stop, Ipv4, Some(true))], |mut f| {
+            action.stop(&mut f)
+        }));
+    }
+
+    #[test]
+    fn same_family_alone_repeats_and_failed_start_does_not_cover_peer() {
+        use Family::{Ipv4, Ipv6};
+        use StepKind::Start;
+
+        let mut single = Lifecycle::new(false, vec![Ipv4], false, false);
+        share(&mut single, Start, &[Ipv4]);
+        for _ in 0..2 {
+            assert!(verify(&[(Start, Ipv4, Some(true))], |mut f| {
+                single.start(&mut f)
+            }));
+        }
+        let mut dual = Lifecycle::new(false, vec![Ipv4, Ipv6], false, false);
+        share(&mut dual, Start, &[Ipv4, Ipv6]);
+        assert!(!verify(
+            &[(Start, Ipv4, Some(false)), (Start, Ipv6, Some(true))],
+            |mut f| dual.start(&mut f)
+        ));
+        assert!(!dual.is_started(Ipv4));
+        assert!(dual.is_started(Ipv6));
+
+        assert!(verify(&[], |mut f| dual.start(&mut f)));
+        assert!(dual.is_started(Ipv4));
+    }
+
+    #[test]
+    fn failed_consistency_clears_all_cached_start_copies_of_that_identity() {
+        use Family::{Ipv4, Ipv6};
+        use StepKind::{Ban, Check, Repair, Start};
+
+        let mut action = Lifecycle::new(true, vec![Ipv4, Ipv6], true, false);
+        share(&mut action, Start, &[Ipv4, Ipv6]);
+        assert!(verify(
+            &[(Start, Ipv4, Some(true)), (Ban, Ipv4, Some(true))],
+            |mut f| action.ban(Ipv4, &mut f)
+        ));
+        assert!(verify(&[(Ban, Ipv6, Some(true))], |mut f| {
+            action.ban(Ipv6, &mut f)
+        }));
+        assert!(!verify(
+            &[
+                (Check, Ipv4, Some(false)),
+                (Repair, Ipv4, Some(false)),
+                (Check, Ipv6, Some(true)),
+            ],
+            |mut f| action.consistency_check(&mut f)
+        ));
+        assert!(!action.is_started(Ipv4));
+        assert!(action.is_started(Ipv6));
+
+        assert!(verify(
+            &[(Start, Ipv4, Some(true)), (Ban, Ipv4, Some(true))],
+            |mut f| action.ban(Ipv4, &mut f)
+        ));
     }
 }

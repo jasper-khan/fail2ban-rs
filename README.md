@@ -202,7 +202,9 @@ session transitions in synthetic syslog. An offline jail decision test also
 checks original retry counting and ban expiry. Offline restore tests cover
 ban and log-position decisions from decoded original SQLite rows; the daemon
 does not yet open or migrate an original SQLite database. An offline action
-lifecycle test records typed operations without executing commands. These
+lifecycle test records typed operations without executing commands.
+Static action tags and shared-family deduplication are replayed separately;
+ticket values remain opaque bindings, not command text. These
 tests do not start jails, resolve DNS, dispatch actions, or read a journal. Continue
 to use a TOML `[jail.<name>]` table for each enabled jail.
 `config.d/*.toml` files, merged alphabetically after the main configuration,

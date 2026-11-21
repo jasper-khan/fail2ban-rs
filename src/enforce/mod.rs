@@ -13,11 +13,17 @@ pub mod ipset;
 pub mod iptables;
 // Independently test original action semantics with inert typed steps.
 #[allow(dead_code)]
+mod legacy_action_bindings;
+#[allow(dead_code)]
 mod legacy_action_lifecycle;
 #[cfg(test)]
 mod legacy_action_parity_test;
 #[allow(dead_code)]
 mod legacy_action_policy;
+#[allow(dead_code)]
+mod legacy_action_tags;
+#[cfg(test)]
+mod legacy_action_tags_parity_test;
 /// nftables firewall backend.
 pub mod nftables;
 /// Startup restore of persisted bans.

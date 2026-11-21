@@ -21,7 +21,7 @@ mod legacy_parity_test;
 #[cfg(test)]
 mod legacy_stock_test;
 #[allow(dead_code)]
-mod legacy_tags;
+pub(crate) mod legacy_tags;
 mod load;
 mod types;
 mod validate;

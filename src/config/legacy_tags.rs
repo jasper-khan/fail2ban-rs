@@ -16,7 +16,7 @@ const MAX_SCAN_BYTES: usize = 32 * MAX_VALUE_BYTES;
 const MAX_STEPS: usize = 4096;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum TagError {
+pub(crate) enum TagError {
     Recursive(String),
     ValueLimit,
     WorkLimit,
@@ -39,7 +39,7 @@ impl std::error::Error for TagError {}
 /// Return `None` for unknown tags and tags to preserve for the runtime. A
 /// lookup may return an empty string, which is a real replacement. Lookup
 /// precedence (e.g. conditional options and `known/`) belongs to the caller.
-pub(super) fn expand(
+pub(crate) fn expand(
     raw: &str,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<String, TagError> {
