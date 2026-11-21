@@ -24,6 +24,7 @@ pub struct LegacyMatcher {
     prefix_has_address: bool,
     failures: Vec<Regex>,
     ignores: Vec<Regex>,
+    pub(super) file_find_time: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -110,6 +111,7 @@ impl LegacyMatcher {
             prefix_has_address,
             failures,
             ignores,
+            file_find_time: None,
         })
     }
 
@@ -119,6 +121,16 @@ impl LegacyMatcher {
     /// Rust record buffer, not Python's synthetic trailing newline; original
     /// filters depending on that extra character are outside this subset.
     pub(crate) fn evaluate(&self, line: &str) -> LineResult {
+        self.evaluate_with_date(line, Some)
+    }
+
+    /// Apply timestamp admission before regex and ignore evaluation, retaining
+    /// the original supported whole-second dated record subset.
+    pub(super) fn evaluate_with_date(
+        &self,
+        line: &str,
+        admit: impl FnOnce(i64) -> Option<i64>,
+    ) -> LineResult {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.len() > MAX_LINE_LEN || line.contains(['\r', '\n']) {
@@ -127,7 +139,7 @@ impl LegacyMatcher {
         let Some(date) = split_nginx_ln_begin(line) else {
             return LineResult::Miss;
         };
-        let Some(timestamp) = date.unix_seconds else {
+        let Some(timestamp) = date.unix_seconds.and_then(admit) else {
             return LineResult::Miss;
         };
         let whole = if date.before.is_empty() {

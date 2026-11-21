@@ -166,3 +166,62 @@ fn test_capacity_returns_correct_value() {
     let buf = CircularTimestamps::new(42);
     assert_eq!(buf.capacity(), 42);
 }
+
+#[test]
+fn reverse_arrivals_measure_event_time_span() {
+    let mut buf = CircularTimestamps::new(3);
+    for ts in [160, 130, 100] {
+        buf.push(ts);
+    }
+    assert_eq!(buf.oldest(), Some(100));
+    assert_eq!(buf.newest(), Some(160));
+    assert!(!buf.threshold_reached(59));
+    assert!(buf.threshold_reached(60));
+}
+
+#[test]
+fn out_of_order_middle_event_contributes_to_window_until_evicted() {
+    let mut buf = CircularTimestamps::new(3);
+    for ts in [210, 140, 211] {
+        buf.push(ts);
+    }
+    assert_eq!(buf.oldest(), Some(140));
+    assert_eq!(buf.newest(), Some(211));
+    assert!(!buf.threshold_reached(5));
+    buf.push(212);
+    assert_eq!(buf.oldest(), Some(140));
+    assert!(!buf.threshold_reached(5));
+    buf.push(213);
+    assert_eq!(buf.oldest(), Some(211));
+    assert!(buf.threshold_reached(2));
+}
+
+#[test]
+fn extremes_use_widened_elapsed_difference() {
+    let mut buf = CircularTimestamps::new(2);
+    buf.push(i64::MAX);
+    buf.push(i64::MIN);
+    assert!(!buf.threshold_reached(i64::MAX));
+    buf.push(-1);
+    assert_eq!(buf.oldest(), Some(i64::MIN));
+    assert_eq!(buf.newest(), Some(-1));
+    assert!(buf.threshold_reached(i64::MAX));
+    assert!(!buf.threshold_reached(i64::MAX - 1));
+}
+
+#[test]
+fn retained_extrema_follow_the_arrival_fifo_at_each_capacity() {
+    for capacity in 1..=7 {
+        let mut buf = CircularTimestamps::new(capacity);
+        let mut recent = std::collections::VecDeque::new();
+        for ts in [4, 1, 1, 3, 0, 8, 7, 3, 4, 6, 6, 7, 9, -9] {
+            buf.push(ts);
+            recent.push_back(ts);
+            if recent.len() > capacity {
+                recent.pop_front();
+            }
+            assert_eq!(buf.oldest(), recent.iter().min().copied());
+            assert_eq!(buf.newest(), recent.iter().max().copied());
+        }
+    }
+}

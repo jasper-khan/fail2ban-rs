@@ -200,34 +200,43 @@ the pinned-parity readers into the normal daemon pipeline. Admission
 covers polling-backend file jails with `usedns = no` and single-line
 filters — plain pattern lists on the native engine, prefregex filters
 (the stock nginx class) on the offline-parity original matcher engine
-inside the live daemon, keeping original match and `{^LN-BEG}` timestamp
-semantics; every ban and unban is appended to the record file instead of
-touching a firewall. Jails accept multiple `logpath` entries — each file
+inside the daemon, with timestamp admission for supported dated
+`{^LN-BEG}` records. Every ban and unban is appended to the record file
+instead of touching a firewall. Jails accept multiple `logpath` entries — each file
 is its own watcher and per-file resume point, and failures merge under
-one jail id. SIGHUP reloads the tree and hands every log position to the
-replacement watchers without dropping or duplicating a line. Still
-outside the compatibility subset: journal sources, multi-line filters,
-general date patterns, DNS lookups. On compatibility startups the daemon
-also reads the original `fail2ban.sqlite3` `bips` table directly
-(read-only) through the pinned-parity restore projection, so an upgraded
-keeper inherits unexpired bans: the original search window, permanent bans
-capped at the jail's current ban time, and the WAL authoritative for
-pairs it already knows. The original database itself is not written. The
-TOML configuration remains the production path until the remaining
-surface (journal, actions, database write-back, client protocol) is
-covered.
+one jail id. SIGHUP reloads the tree and hands each log position to its
+replacement watcher. Still outside the compatibility subset: journal sources,
+multi-line filters, general date patterns, DNS lookups.
 
-The internal
-reader's file precedence, configuration merging, and the whole stock
+Recording mode creates a private sibling directory
+`<file>.fail2ban-rs` with a `control.sock` and a separate `state/` WAL;
+the record file's parent must already exist. The daemon does not bind or
+change the original service's socket. If the recording socket already
+exists, startup refuses to remove it. Verify that the old
+recording process is stopped before cleaning up a stale recording socket.
+
+On the first compatibility startup for that WAL, the original
+`fail2ban.sqlite3` `bips` table is read-only migration input. Eligible
+unexpired bans are stored durably in the Rust WAL before being re-applied
+to the recording backend. Existing Rust WAL entries win for the same
+jail and IP. The import marker and new bans commit together; subsequent
+starts use only that WAL and do not resurrect manually unbanned entries
+from the original database. An empty/missing source on the first successful
+migration also records the marker. The original database is never written
+by this migration, and full migration, including original read offsets
+and database write-back, remains out of scope. TOML remains the normal
+production configuration path.
+
+The internal reader's file precedence, configuration merging, and the whole stock
 config catalog (every jail, filter, action, and paths overlay option,
 each either expanded or error-identical) are tested separately against
 Fail2Ban 1.1.1. A separate offline replay tests the stock file-mode `nginx-http-auth` rules with
 single-line UTC fixtures. A separate SSH replay checks selected normal-mode
 session transitions in synthetic syslog. An offline jail decision test also
-checks original retry counting and ban expiry. Offline restore tests cover
-ban and log-position decisions from decoded original SQLite rows; the daemon
-does not yet open or migrate an original SQLite database. An offline action
-lifecycle test records typed operations without executing commands.
+checks original retry counting and ban expiry. Offline restore tests also
+cover log-position decisions from decoded original SQLite rows; the daemon's
+read-only migration only seeds bans. An offline action lifecycle test
+records typed operations without executing commands.
 Static action tags and shared-family deduplication are replayed separately;
 ticket values remain opaque bindings, not command text. Offline client
 tests compare basic `ping` and `status` against typed fake replies and

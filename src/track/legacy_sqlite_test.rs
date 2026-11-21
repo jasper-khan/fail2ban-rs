@@ -1,13 +1,15 @@
 //! Unit tests for the original-database ban restore slice.
 
 use std::path::Path;
+use std::process::Command;
 
-use rusqlite::Connection;
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, params};
 use tempfile::tempdir;
 
-use crate::track::legacy_restore::RestoredBan;
+use crate::track::legacy_restore::{RestoreRequest, RestoredBan};
 
-use super::{ban_record, merge_with_wal, read_bips, restore_bans};
+use super::{ban_record, read_bips, restore_bans, restore_bans_at};
 
 /// The original `bips` schema, copied from Fail2Ban 1.1.1 database.py.
 const BIPS_DDL: &str = concat!(
@@ -24,38 +26,36 @@ const BIPS_DDL: &str = concat!(
     "CREATE INDEX IF NOT EXISTS bips_ip ON bips(ip);",
 );
 
+const NOW: f64 = 1_800_000_500.0;
+
 fn write_bips(path: &Path, rows: &[(&str, f64, f64, i64, Option<&str>)]) {
     let connection = Connection::open(path).expect("create original database");
     connection.execute_batch(BIPS_DDL).expect("original DDL");
     for (ip, time_of_ban, ban_time, ban_count, data) in rows {
-        let data = data
-            .map(|text| format!("'{text}'"))
-            .unwrap_or("NULL".to_owned());
         connection
             .execute(
-                &format!(
-                    "INSERT INTO bips(ip, jail, timeofban, bantime, bancount, data) \
-                     VALUES('{ip}', 'chain-jail', {time_of_ban}, {ban_time}, {ban_count}, {data})"
-                ),
-                [],
+                "INSERT INTO bips(ip, jail, timeofban, bantime, bancount, data)
+                 VALUES(?1, 'chain-jail', ?2, ?3, ?4, ?5)",
+                params![ip, time_of_ban, ban_time, ban_count, data],
             )
             .expect("insert original row");
     }
 }
 
-/// One row of a different jail, proving per-jail selection.
-fn write_other_jail_row(path: &Path, ip: &str) {
-    let connection = Connection::open(path).expect("reopen db");
-    let now = chrono::Utc::now().timestamp() as f64;
-    connection
-        .execute(
-            &format!(
-                "INSERT INTO bips(ip, jail, timeofban, bantime, bancount, data) \
-                 VALUES('{ip}', 'other-jail', {now}, 4, 1, NULL)"
-            ),
-            [],
-        )
-        .expect("insert other-jail row");
+fn read_for_test(db: &Path) -> Vec<super::LegacyBanRow> {
+    let connection = super::open_readonly(db).expect("open original file");
+    read_bips(
+        &connection,
+        &RestoreRequest {
+            jail: "chain-jail",
+            now: NOW,
+            age_window: None,
+            base_ban_time: -1.0,
+            max_ban_time: None,
+            max_matches: 0,
+        },
+    )
+    .expect("read eligible original rows")
 }
 
 fn restore_config() -> crate::config::Config {
@@ -96,17 +96,23 @@ fn read_bips_decodes_the_original_row_shape() {
             ),
         ],
     );
-    let rows = read_bips(&db).expect("rows decode");
+    let rows = read_for_test(&db);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].jail, "chain-jail");
-    assert_eq!(rows[0].ip, "203.0.113.7");
-    assert_eq!(rows[0].time_of_ban, 1_800_000_000.25);
-    assert_eq!(rows[0].ban_time, 600.0);
-    assert_eq!(rows[0].ban_count, 3);
-    assert!(rows[0].data.is_none());
-    assert_eq!(rows[1].ip, "2001:db8::12");
+    let ipv4 = rows
+        .iter()
+        .find(|row| row.ip == "203.0.113.7")
+        .expect("IPv4 row");
+    let ipv6 = rows
+        .iter()
+        .find(|row| row.ip == "2001:db8::12")
+        .expect("IPv6 row");
+    assert_eq!(ipv4.jail, "chain-jail");
+    assert_eq!(ipv4.time_of_ban, 1_800_000_000.25);
+    assert_eq!(ipv4.ban_time, 600.0);
+    assert_eq!(ipv4.ban_count, 3);
+    assert!(ipv4.data.is_none());
     assert_eq!(
-        rows[1].data.as_ref().expect("json data")["matches"][0],
+        ipv6.data.as_ref().expect("json data")["matches"][0],
         "line one"
     );
 }
@@ -116,14 +122,18 @@ fn read_bips_accepts_an_empty_database_file_without_the_table() {
     let dir = tempdir().expect("scratch");
     let db = dir.path().join("fail2ban.sqlite3");
     Connection::open(&db).expect("create empty database");
-    assert!(read_bips(&db).expect("no table is not an error").is_empty());
+    assert!(
+        restore_bans_at(&db, &restore_config(), NOW)
+            .expect("no table is not an error")
+            .is_empty()
+    );
 }
 
 #[test]
 fn restore_bans_applies_the_original_selection_window() {
     let dir = tempdir().expect("scratch");
     let db = dir.path().join("fail2ban.sqlite3");
-    let now = chrono::Utc::now().timestamp() as f64;
+    let now = NOW;
     write_bips(
         &db,
         &[
@@ -141,9 +151,8 @@ fn restore_bans_applies_the_original_selection_window() {
             ("203.0.113.11", now - 1.0, -2.0, 1, None),
         ],
     );
-    write_other_jail_row(&db, "198.51.100.2");
     let config = restore_config();
-    let restored = restore_bans(&db, &config).expect("selection succeeds");
+    let restored = restore_bans_at(&db, &config, now).expect("selection succeeds");
     let expected: Vec<std::net::IpAddr> = [
         // The original orders bips rows by the stored IP text.
         "203.0.113.10",
@@ -205,20 +214,192 @@ fn legacy_restored(ip: &str, ban_time: f64) -> RestoredBan {
 }
 
 #[test]
-fn merge_with_wal_prefers_the_wal_for_the_same_pair() {
-    let wal = vec![record("203.0.113.7", 1_000)];
-    let extra = vec![record("203.0.113.7", 2_000), record("203.0.113.8", 3_000)];
-    let merged = merge_with_wal(wal, extra);
-    assert_eq!(merged.len(), 2);
-    assert_eq!(merged[0].banned_at, 1_000);
-    assert_eq!(merged[1].ip.to_string(), "203.0.113.8");
+fn restore_skips_ignored_ips_and_bad_optional_or_irrelevant_fields() {
+    let dir = tempdir().expect("scratch");
+    let db = dir.path().join("fail2ban.sqlite3");
+    let connection = Connection::open(&db).expect("create");
+    connection.execute_batch(BIPS_DDL).expect("schema");
+    let rows = [
+        (
+            "192.0.2.3",
+            "chain-jail",
+            NOW,
+            SqlValue::Integer(1),
+            SqlValue::Blob(br#"{"matches":["example"]}"#.to_vec()),
+        ),
+        (
+            "192.0.2.4",
+            "chain-jail",
+            NOW,
+            SqlValue::Integer(1),
+            SqlValue::Blob(b"invalid metadata".to_vec()),
+        ),
+        (
+            "192.0.2.5",
+            "chain-jail",
+            NOW,
+            SqlValue::Integer(1),
+            SqlValue::Text("[1,2]".to_owned()),
+        ),
+        (
+            "192.0.2.6",
+            "chain-jail",
+            NOW,
+            SqlValue::Integer(1),
+            SqlValue::Blob(b"{\"note\":\"invalid \xff utf8\"}".to_vec()),
+        ),
+        (
+            "192.0.2.200",
+            "chain-jail",
+            NOW,
+            SqlValue::Integer(1),
+            SqlValue::Null,
+        ),
+        (
+            "198.51.100.23",
+            "other-jail",
+            NOW,
+            SqlValue::Text("not a count".to_owned()),
+            SqlValue::Null,
+        ),
+        (
+            "198.51.100.24",
+            "chain-jail",
+            NOW - 100.0,
+            SqlValue::Text("not a count".to_owned()),
+            SqlValue::Null,
+        ),
+    ];
+    for (ip, jail, start, count, data) in rows {
+        connection
+            .execute(
+                "INSERT INTO bips(ip,jail,timeofban,bantime,bancount,data) VALUES(?1,?2,?3,4,?4,?5)",
+                params![ip, jail, start, count, data],
+            )
+            .expect("insert test ticket");
+    }
+    let mut config = restore_config();
+    config.jail.get_mut("chain-jail").expect("fixture").ignoreip =
+        vec!["192.0.2.128/25".to_owned()];
+    let restored = restore_bans_at(&db, &config, NOW)
+        .expect("irrelevant bad rows and optional invalid JSON are not fatal");
+    assert_eq!(
+        restored
+            .iter()
+            .map(|ban| ban.ip.to_string())
+            .collect::<Vec<_>>(),
+        ["192.0.2.3", "192.0.2.4", "192.0.2.5", "192.0.2.6"]
+    );
+    let decoded = read_bips(
+        &connection,
+        &RestoreRequest {
+            jail: "chain-jail",
+            now: NOW,
+            age_window: Some(4.0),
+            base_ban_time: 4.0,
+            max_ban_time: Some(4.0),
+            max_matches: 0,
+        },
+    )
+    .expect("decode selected metadata");
+    let data = |ip| {
+        decoded
+            .iter()
+            .find(|row| row.ip == ip)
+            .expect("fixture row")
+            .data
+            .as_ref()
+    };
+    assert_eq!(
+        data("192.0.2.3").expect("valid blob")["matches"][0],
+        "example"
+    );
+    assert!(data("192.0.2.4").is_none() && data("192.0.2.5").is_none());
+    assert_eq!(
+        data("192.0.2.6").expect("replacement UTF-8")["note"],
+        "invalid \u{fffd} utf8"
+    );
 }
 
-fn record(ip: &str, banned_at: i64) -> crate::track::state::BanRecord {
-    crate::track::state::BanRecord {
-        ip: ip.parse().expect("ip"),
-        jail_id: "chain-jail".to_owned(),
-        banned_at,
-        expires_at: None,
-    }
+#[test]
+fn malformed_database_and_non_regular_file_are_not_reported_as_missing() {
+    let dir = tempdir().expect("scratch");
+    let config = restore_config();
+    let error = restore_bans_at(dir.path(), &config, NOW).expect_err("directory is not a database");
+    assert!(error.to_string().contains("not a regular file"));
+    let db = dir.path().join("broken.sqlite3");
+    let bytes = b"this is a broken SQLite file";
+    std::fs::write(&db, bytes).expect("write scratch malformed database");
+    let error = restore_bans_at(&db, &config, NOW).expect_err("corruption must be surfaced");
+    assert!(error.to_string().contains("checking bips"));
+    assert_eq!(std::fs::read(&db).expect("file is untouched"), bytes);
 }
+
+#[test]
+#[ignore = "requires local pinned Fail2Ban 1.1.1 via FAIL2BAN_111_SOURCE and Python 3"]
+fn read_blob_written_by_pinned_fail2ban() {
+    let source = std::fs::canonicalize(
+        std::env::var_os("FAIL2BAN_111_SOURCE").expect("set FAIL2BAN_111_SOURCE"),
+    )
+    .expect("locate pinned Fail2Ban source");
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&source)
+        .output()
+        .expect("verify upstream revision");
+    assert!(head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "f60978618a101427b06924fc932b44350fec2b63"
+    );
+    let dir = tempdir().expect("disposable original database");
+    let db = dir.path().join("fail2ban.sqlite3");
+    let python = Command::new("python3")
+        .args(["-I", "-B", "-c", PINNED_FIXTURE])
+        .arg(source)
+        .arg(&db)
+        .arg(NOW.to_string())
+        .current_dir(dir.path())
+        .output()
+        .expect("run upstream database fixture only");
+    assert!(python.status.success(), "{python:?}");
+    let result = restore_bans_at(&db, &restore_config(), NOW).expect("real blob restores");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].ip.to_string(), "192.0.2.3");
+    assert_eq!(result[0].expires_at, Some(NOW as i64 + 3));
+    assert_eq!(
+        read_for_test(&db)[0].data.as_ref().expect("real metadata")["matches"][0],
+        "ordinary fixture line"
+    );
+}
+
+const PINNED_FIXTURE: &str = r#"
+import sqlite3
+import sys
+
+def guard(event, _args):
+    if event.startswith("socket.") or event in ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn"):
+        raise RuntimeError("fixture may not launch an action, process or socket")
+sys.addaudithook(guard)
+sys.path.insert(0, sys.argv[1])
+from fail2ban.server.database import Fail2BanDb
+from fail2ban.server.ticket import FailTicket
+from fail2ban.version import version
+assert version == "1.1.1"
+
+class Fixture:
+    name = "chain-jail"
+
+filename, now = sys.argv[2], int(float(sys.argv[3]))
+jail = Fixture()
+jail.actions = type("FixtureActions", (), {"getBanTime": lambda self: 4})()
+db = Fail2BanDb(filename)
+db.addJail(jail)
+ticket = FailTicket("192.0.2.3", now - 1, data={"matches": ["ordinary fixture line"]})
+ticket.setBanTime(4)
+db.addBan(jail, ticket)
+with sqlite3.connect(filename) as conn:
+    assert conn.execute("SELECT typeof(data) FROM bips").fetchone() == ("blob",)
+expected = db.getCurrentBans(jail=jail, fromtime=now, forbantime=4, correctBanTime=4)
+assert [str(t.getID()) for t in expected] == ["192.0.2.3"]
+"#;

@@ -18,7 +18,7 @@ use restored::{Restored, open_state};
 use startup::{DaemonSignal, Signals};
 
 use crate::config::{Config, JailConfig, Source};
-use crate::control::{self, ControlCmd};
+use crate::control::{self, BoundSocket, ControlCmd};
 use crate::detect::watcher::Failure;
 use crate::enforce::{self, FirewallCmd};
 use crate::logging::Logger;
@@ -33,25 +33,27 @@ use watchers::{Watchers, build_watcher_plan};
 pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
     info!(phase = "startup", "fail2ban-rs starting");
     let cancel = CancellationToken::new();
+    // Acquire the private compatibility socket before opening its WAL. A
+    // second recorder using the same directory must not race startup import.
+    let bound = if matches!(&source, Source::Fail2BanIni { .. }) {
+        Some(control::bind_recording(
+            &config.global.socket_path,
+            &config.global.state_dir,
+        )?)
+    } else {
+        None
+    };
     // Initialize remote logging (no-op if not configured).
     let logger = Logger::init(&config.logging);
-    let opened = open_state(&config.global.state_dir).await?;
-    // Compatibility trees also seed unexpired bans from the original
-    // Fail2Ban SQLite database; the WAL stays authoritative for any pair
-    // it already knows.
-    let restored = match &source {
-        Source::Fail2BanIni { dir, .. } => {
+    let mut restored = open_state(&config.global.state_dir).await?;
+    if let Source::Fail2BanIni { dir, .. } = &source {
+        restored::seed_original_once(&mut restored, || {
             let dbfile = crate::config::compat::dbfile_of(dir)?;
-            let extra = crate::track::legacy_sqlite::restore_bans(&dbfile, &config)?;
-            Restored {
-                bans: crate::track::legacy_sqlite::merge_with_wal(opened.bans, extra),
-                ..opened
-            }
-        }
-        Source::Toml(_) => opened,
-    };
+            crate::track::legacy_sqlite::restore_bans(&dbfile, &config)
+        })?;
+    }
 
-    let mut daemon = start_tasks(config, source, restored, logger, cancel).await?;
+    let mut daemon = start_tasks(config, source, restored, logger, cancel, bound).await?;
     info!(phase = "startup", "fail2ban-rs started");
     let result = daemon.serve().await;
 
@@ -72,6 +74,7 @@ async fn start_tasks(
     restored: Restored,
     logger: Option<Logger>,
     cancel: CancellationToken,
+    bound: Option<BoundSocket>,
 ) -> crate::error::Result<Daemon> {
     // Compile every watcher up front so a bad filter fails before any task
     // or firewall rule exists.
@@ -83,7 +86,7 @@ async fn start_tasks(
     // Watchers keep their own token and join handles, so a reload can hand
     // each jail's read position to its replacement.
     let watchers = Watchers::spawn(plan, &failure_tx, "startup", HashMap::new());
-    let control_rx = spawn_control(&config, &cancel);
+    let control_rx = spawn_control(&config, &cancel, bound);
     Ok(Daemon {
         config,
         source,
@@ -137,11 +140,21 @@ async fn start_core(
 }
 
 /// Spawn the control-socket listener; returns the request receiver.
-fn spawn_control(config: &Config, cancel: &CancellationToken) -> mpsc::Receiver<ControlCmd> {
+fn spawn_control(
+    config: &Config,
+    cancel: &CancellationToken,
+    bound: Option<BoundSocket>,
+) -> mpsc::Receiver<ControlCmd> {
     let (control_tx, control_rx) = mpsc::channel::<ControlCmd>(32);
     let socket_path = config.global.socket_path.clone();
     let control_cancel = cancel.child_token();
-    tokio::spawn(async move { control::run(&socket_path, control_tx, control_cancel).await });
+    tokio::spawn(async move {
+        if let Some(listener) = bound {
+            control::run_bound(listener, control_tx, control_cancel).await;
+        } else {
+            control::run(&socket_path, control_tx, control_cancel).await;
+        }
+    });
     control_rx
 }
 
@@ -178,7 +191,7 @@ async fn start_executor(
     info!(
         phase = "startup",
         bans = active_bans.len(),
-        "firewall bans restored"
+        "active bans restored"
     );
     let executor_cancel = cancel.child_token();
     tokio::spawn(enforce::run(

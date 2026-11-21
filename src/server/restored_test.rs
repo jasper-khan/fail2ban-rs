@@ -52,3 +52,67 @@ async fn test_open_state_purges_expired_ban_without_any_unban() {
     );
     assert!(persisted.bans.contains_key(&(LIVE_IP, "sshd".to_string())));
 }
+
+/// A non-empty WAL retains the existing key and durably inserts a different
+/// imported key before the executor can observe the combined list.
+#[tokio::test]
+async fn test_original_seed_merges_individual_keys_without_overwriting_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    write_bans(dir.path());
+    let mut state = open_state(dir.path()).await.unwrap();
+    let prior = state.bans.first().unwrap().clone();
+    let incoming_ip = "192.0.2.46".parse().unwrap();
+    let overlap = BanRecord {
+        expires_at: None,
+        ..prior.clone()
+    };
+    let incoming = BanRecord {
+        ip: incoming_ip,
+        ..prior.clone()
+    };
+
+    seed_original_once(&mut state, || Ok(vec![overlap, incoming.clone()])).unwrap();
+    assert_eq!(state.bans.len(), 2);
+    assert!(state.bans.iter().any(|ban| ban.ip == incoming_ip));
+    {
+        let persisted = state.store.read();
+        let same_key = persisted.bans.get(&(LIVE_IP, "sshd".to_owned())).unwrap();
+        assert_eq!(same_key.expires_at, prior.expires_at);
+        let new_key = persisted
+            .bans
+            .get(&(incoming_ip, "sshd".to_owned()))
+            .unwrap();
+        assert_eq!(new_key.expires_at, incoming.expires_at);
+        assert_eq!(persisted.meta.get(SQLITE_IMPORT_MARKER), Some(&1));
+    }
+
+    // Simulate the store-side result of a successful unban. The unchanged
+    // original database must no longer be consulted after reopening.
+    state
+        .store
+        .write_durable(|tx| {
+            tx.bans.delete(&(incoming_ip, "sshd".to_owned()));
+            Ok(())
+        })
+        .unwrap();
+    drop(state);
+    let mut reopened = open_state(dir.path()).await.unwrap();
+    seed_original_once(&mut reopened, || panic!("already imported")).unwrap();
+    assert!(reopened.bans.iter().all(|ban| ban.ip != incoming_ip));
+    assert!(reopened.bans.iter().any(|ban| ban.ip == LIVE_IP));
+}
+
+#[tokio::test]
+async fn test_failed_original_read_does_not_mark_migration_as_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = open_state(dir.path()).await.unwrap();
+    assert!(
+        seed_original_once(&mut state, || Err(crate::error::Error::config(
+            "invalid fixture"
+        )))
+        .is_err()
+    );
+    assert!(!state.store.read().meta.contains_key(SQLITE_IMPORT_MARKER));
+    seed_original_once(&mut state, || Ok(Vec::new())).unwrap();
+    assert_eq!(state.store.read().meta.get(SQLITE_IMPORT_MARKER), Some(&1));
+}

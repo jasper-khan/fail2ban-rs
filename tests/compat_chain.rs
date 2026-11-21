@@ -186,12 +186,15 @@ const NGINX_HTTP_AUTH: &str = concat!(
     "failregex = <mdre-<mode>>\n",
     "ignoreregex = \n",
     "datepattern = {^LN-BEG}\n",
+    "journalmatch = _SYSTEMD_UNIT=nginx.service + _COMM=nginx\n",
 );
 
 fn nginx_failure() -> String {
-    "2026/11/21 15:00:01 [error] 123#123: *4 user \"bob\": password mismatch, \
-     client: 192.0.2.10, server: auth.example"
-        .to_owned()
+    let date = chrono::Utc::now().format("%Y/%m/%d %H:%M:%S");
+    format!(
+        "{date} [error] 123#123: *4 user \"bob\": password mismatch, \
+         client: 192.0.2.10, server: auth.example"
+    )
 }
 
 /// The original `bips` schema, copied from Fail2Ban 1.1.1 database.py.
@@ -253,6 +256,9 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     std::fs::create_dir_all(&state).expect("state dir");
     let socket = tmp.path().join("f2b.sock");
     let record = tmp.path().join("decisions.log");
+    let runtime = tmp.path().join("decisions.log.fail2ban-rs");
+    let original_listener = std::os::unix::net::UnixListener::bind(&socket)
+        .expect("bind independent original socket fixture");
     let web1_path = tmp.path().join("web1.log");
     let web2_path = tmp.path().join("web2.log");
     let web3_path = tmp.path().join("web3.log");
@@ -321,18 +327,34 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
 
     // Seed an original 1.1.1 ban database: an unexpired ban from one second
     // ago must be re-applied at startup and expire three seconds in.
-    seed_original_db(
-        &state.join("fail2ban.sqlite3"),
-        "chain-jail",
-        "4.4.4.4",
-        wall_now() - 1.0,
-        4,
-    );
+    let dbfile = state.join("fail2ban.sqlite3");
+    seed_original_db(&dbfile, "chain-jail", "4.4.4.4", wall_now() - 1.0, 4);
+    let original_db = std::fs::read(&dbfile).expect("read original DB bytes");
 
     let daemon = spawn_daemon(&base, &record).expect("spawn daemon");
     wait_for("daemon startup", &daemon, || {
-        daemon.saw("fail2ban-rs started")
+        daemon.saw("fail2ban-rs started") && runtime.join("control.sock").exists()
     });
+    let assert_original_untouched = || {
+        std::os::unix::net::UnixStream::connect(&socket)
+            .expect("original listener still reachable");
+        original_listener
+            .accept()
+            .expect("accept in original fixture");
+        assert_eq!(
+            std::fs::read(&dbfile).expect("original DB bytes"),
+            original_db
+        );
+        assert_eq!(
+            std::fs::read_dir(&state)
+                .expect("original state directory")
+                .count(),
+            1,
+            "recording must not write WAL/control files beside the original database"
+        );
+    };
+    assert_original_untouched();
+    assert!(runtime.join("state").is_dir(), "missing isolated WAL");
 
     // The restored original ban re-applies before any log line is read; it
     // must be the daemon's first recorded decision.
@@ -434,4 +456,6 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
         status.success(),
         "daemon exited with {status}: {recorded:?}"
     );
+    assert!(!runtime.join("control.sock").exists());
+    assert_original_untouched();
 }

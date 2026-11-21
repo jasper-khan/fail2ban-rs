@@ -132,10 +132,9 @@ pub(super) fn prune_stale_failures(
 ) {
     failures.retain(|key, fs| {
         let keep = match jail_params.get(&key.1) {
-            Some(params) => fs
-                .timestamps
-                .newest()
-                .is_none_or(|newest| newest >= now - params.find_time),
+            Some(params) => fs.timestamps.newest().is_none_or(|newest| {
+                i128::from(newest) >= i128::from(now) - i128::from(params.find_time)
+            }),
             None => false,
         };
         if !keep {

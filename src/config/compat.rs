@@ -3,9 +3,9 @@
 //! Stage-one admission subset of the original INI surface, mirroring the
 //! offline replay rules: polling backend, `usedns = no`, no incremental ban
 //! timing, no per-jail action commands (the decision-recording backend
-//! replaces the firewall), file-log filters without prefregex/journalmatch/
-//! maxlines or custom date patterns. Anything outside that subset fails
-//! loudly instead of being silently dropped.
+//! replaces the firewall), and supported single-line file-log filters.
+//! Journal-only match metadata does not affect polling; the journal backend
+//! itself is not supported. The live state belongs to the recording run.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,8 +23,7 @@ use super::legacy_jail_plan::{
 };
 use super::legacy_layers;
 
-/// Original daemon built-in defaults for options absent from fail2ban.conf.
-const ORIGINAL_SOCKET: &str = "/var/run/fail2ban/fail2ban.sock";
+/// The original database is a read-only source for compatibility restore.
 const ORIGINAL_DBFILE: &str = "/var/lib/fail2ban/fail2ban.sqlite3";
 /// Original builtin timing defaults when neither the section nor [DEFAULT]
 /// sets them (fail2ban's own jail defaults).
@@ -45,7 +44,7 @@ pub(crate) fn load(base: &Path, record: &Path) -> Result<Config> {
             base.display()
         )));
     }
-    let global = load_global(base)?;
+    let global = recording_global(&record)?;
     let tree = legacy_layers::read(base, "jail")?
         .ok_or_else(|| Error::config("original jail configuration not found"))?;
     let mut jails = HashMap::new();
@@ -71,6 +70,12 @@ pub(crate) fn load(base: &Path, record: &Path) -> Result<Config> {
 fn safe_record_path(record: &Path) -> Result<PathBuf> {
     let text = record.to_string_lossy();
     let ok = record.is_absolute()
+        && record.file_name().is_some()
+        && !text.ends_with('/')
+        && !text.ends_with("/.")
+        && !record
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
         && text
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'));
@@ -79,7 +84,8 @@ fn safe_record_path(record: &Path) -> Result<PathBuf> {
     } else {
         Err(Error::config(format!(
             "decision record path {} must be absolute and contain only \
-             alphanumeric characters, slashes, dots, underscores, or hyphens",
+             alphanumeric characters, slashes, dots, underscores, or hyphens, \
+             with a filename and no parent-directory traversal",
             record.display()
         )))
     }
@@ -102,8 +108,8 @@ fn definition_option(base: &Path, key: &str) -> Result<Option<String>> {
 }
 
 /// The original ban database of this tree, resolved exactly like the original
-/// daemon: the layered `dbfile` option or the built-in default. A relative
-/// value is refused by [`load_global`].
+/// daemon: the layered `dbfile` option or the built-in default. This path
+/// is independent of the recording daemon's WAL and is opened read-only.
 pub(crate) fn dbfile_of(base: &Path) -> Result<PathBuf> {
     let dbfile = definition_option(base, "dbfile")?
         .filter(|value| !value.is_empty())
@@ -117,26 +123,18 @@ pub(crate) fn dbfile_of(base: &Path) -> Result<PathBuf> {
     Ok(dbfile)
 }
 
-/// Read fail2ban.conf layered overlays for the daemon socket and database
-/// location. Other original daemon options are left for later stages.
-fn load_global(base: &Path) -> Result<GlobalConfig> {
-    let socket = definition_option(base, "socket")?
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| PathBuf::from(ORIGINAL_SOCKET), PathBuf::from);
-    if !socket.is_absolute() {
-        return Err(Error::config(format!(
-            "original fail2ban.conf socket must be an absolute path: {}",
-            socket.display()
-        )));
-    }
-    let dbfile = dbfile_of(base)?;
-    let state_dir = dbfile
-        .parent()
-        .ok_or_else(|| Error::config("original fail2ban.conf dbfile has no directory"))?
-        .to_path_buf();
+/// Each recording gets a sibling runtime directory. Never derive the
+/// listener or writable WAL from the original daemon's socket or database.
+fn recording_global(record: &Path) -> Result<GlobalConfig> {
+    let mut filename = record
+        .file_name()
+        .ok_or_else(|| Error::config("decision record path must have a filename"))?
+        .to_os_string();
+    filename.push(".fail2ban-rs");
+    let runtime = record.with_file_name(filename);
     Ok(GlobalConfig {
-        state_dir,
-        socket_path: socket,
+        state_dir: runtime.join("state"),
+        socket_path: runtime.join("control.sock"),
         ..GlobalConfig::default()
     })
 }
@@ -299,17 +297,8 @@ fn load_jail(
             "the original compat daemon does not yet support multi-line filters",
         ));
     }
-    // journalmatch needs the journal backend (later stage); reject for both
-    // engines up front.
-    if resolved
-        .options
-        .get("journalmatch")
-        .is_some_and(|value| !value.is_empty())
-    {
-        return Err(Error::config(
-            "the original compat daemon does not yet support journalmatch",
-        ));
-    }
+    // Fail2Ban applies journalmatch only with the systemd backend; polling
+    // ignores this metadata in stock filters such as nginx-http-auth.
     // Prefregex filters run through the original parity-proven engine, which
     // enforces its own subset (file logtype, single line, {^LN-BEG} dates)
     // at compile time with the original error messages. Pattern-list filters

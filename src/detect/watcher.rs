@@ -31,7 +31,7 @@ pub struct Failure {
     pub ip: IpAddr,
     /// Which jail detected it.
     pub jail_id: String,
-    /// Unix timestamp from the log line.
+    /// Unix event timestamp after applicable admission and clock correction.
     pub timestamp: i64,
 }
 

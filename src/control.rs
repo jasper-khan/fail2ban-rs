@@ -3,8 +3,10 @@
 //! Protocol: `[4-byte LE length][JSON payload]`
 //! Used by the CLI to query status, ban/unban IPs, and trigger reloads.
 
+use std::io;
 use std::net::IpAddr;
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,46 +91,124 @@ pub struct ControlCmd {
     pub respond: oneshot::Sender<Response>,
 }
 
-/// Remove any stale socket and ensure the parent directory exists with
-/// owner-only+group traversal permissions (`0o750`).
-fn prepare_socket_path(socket_path: &Path) {
-    // Removing a nonexistent stale socket is expected and harmless.
-    if let Err(e) = std::fs::remove_file(socket_path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(phase = "startup", error = %e, "stale control socket remove failed");
-    }
+/// Record the filesystem identity of the listener, so shutdown only unlinks
+/// the socket this instance acquired, never a replacement at the same path.
+pub(crate) struct BoundSocket {
+    listener: UnixListener,
+    path: PathBuf,
+    identity: (u64, u64),
+}
 
-    let Some(parent) = socket_path.parent() else {
-        return;
-    };
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        warn!(phase = "startup", error = %e, "control socket parent dir create failed");
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750)) {
-            warn!(phase = "startup", error = %e, "control socket parent dir permissions failed");
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        if socket_identity(&self.path).ok() == Some(self.identity)
+            && let Err(e) = std::fs::remove_file(&self.path)
+        {
+            debug!(error = %e, "control socket remove failed");
         }
     }
 }
 
-/// Bind the control socket. The bind→chmod gap is not closed with `umask`
-/// because umask is process-global and racing tasks (WAL/state file creation)
-/// would inherit it; instead the parent directory's `0o750` mode — applied
-/// before bind in `prepare_socket_path` — gates access during the window,
-/// and the explicit `set_permissions` below tightens the socket itself.
-fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
-    UnixListener::bind(socket_path)
+fn socket_identity(path: &Path) -> io::Result<(u64, u64)> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "control path is not a socket owned by the effective user",
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
 }
 
-/// Run the control socket listener.
+fn bind_socket(path: &Path) -> io::Result<BoundSocket> {
+    let listener = UnixListener::bind(path)?;
+    let socket = BoundSocket {
+        listener,
+        path: path.to_path_buf(),
+        identity: socket_identity(path)?,
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(socket)
+}
+
+fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    // Don't follow a symlink at the runtime or WAL path, or chmod or
+    // migrate an unexpected file out of our way.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recording runtime and WAL paths must be owner-only (0700) directories",
+        ));
+    }
+    Ok(())
+}
+
+/// Compatibility mode acquires the isolated socket before opening the WAL.
+/// Binding refuses any existing entry, including stale sockets: an operator
+/// must first verify that a previous recording instance is stopped.
+pub(crate) fn bind_recording(socket_path: &Path, state_dir: &Path) -> Result<BoundSocket> {
+    let parent = socket_path
+        .parent()
+        .filter(|path| state_dir.parent() == Some(*path))
+        .ok_or_else(|| Error::config("recording socket and WAL must share a runtime directory"))?;
+    let annotate = |e| Error::io(format!("opening recording runtime {}", parent.display()), e);
+    ensure_private_dir(parent).map_err(annotate)?;
+    let bound = bind_socket(socket_path).map_err(annotate)?;
+    ensure_private_dir(state_dir).map_err(annotate)?;
+    Ok(bound)
+}
+
+/// Prepare the classic TOML-mode parent as before. Only reclaim an owned
+/// socket if a bounded connection probe confirms the listener is gone.
+async fn prepare_modern_path(socket_path: &Path) -> io::Result<()> {
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750)) {
+            warn!(phase = "startup", error = %e, "control socket parent dir permissions failed");
+        }
+    }
+    let identity = match socket_identity(socket_path) {
+        Ok(identity) => identity,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        tokio::net::UnixStream::connect(socket_path),
+    )
+    .await;
+    if matches!(probe, Ok(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionRefused)
+        && socket_identity(socket_path)? == identity
+    {
+        return std::fs::remove_file(socket_path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "control socket already exists",
+    ))
+}
+
+/// Run the control socket listener for a classic TOML configuration.
 pub async fn run(socket_path: &Path, tx: mpsc::Sender<ControlCmd>, cancel: CancellationToken) {
-    prepare_socket_path(socket_path);
-    let listener = match bind_socket(socket_path) {
-        Ok(l) => l,
+    match prepare_modern_path(socket_path)
+        .await
+        .and_then(|()| bind_socket(socket_path))
+    {
+        Ok(bound) => run_bound(bound, tx, cancel).await,
         Err(e) => {
             error!(
                 phase = "startup",
@@ -136,38 +216,22 @@ pub async fn run(socket_path: &Path, tx: mpsc::Sender<ControlCmd>, cancel: Cance
                 error = %e,
                 "control socket bind failed"
             );
-            return;
         }
-    };
-    restrict_socket(socket_path);
-    info!(
-        phase = "startup",
-        path = %socket_path.display(),
-        "control socket listening"
-    );
-    accept_loop(&listener, &tx, &cancel).await;
-    info!(phase = "shutdown", "control socket stopping");
-    if let Err(e) = std::fs::remove_file(socket_path) {
-        debug!(error = %e, "control socket remove failed");
     }
 }
 
-/// Restrict the socket to owner+group so no other local user can connect;
-/// the parent dir's 0o750 covers the moment between bind and this chmod.
-fn restrict_socket(socket_path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
-        {
-            warn!(
-                phase = "startup",
-                error = %e,
-                "control socket permissions failed"
-            );
-        }
-    }
+pub(crate) async fn run_bound(
+    socket: BoundSocket,
+    tx: mpsc::Sender<ControlCmd>,
+    cancel: CancellationToken,
+) {
+    info!(
+        phase = "startup",
+        path = %socket.path.display(),
+        "control socket listening"
+    );
+    accept_loop(&socket.listener, &tx, &cancel).await;
+    info!(phase = "shutdown", "control socket stopping");
 }
 
 /// Accept connections until cancelled, serving each on its own task.

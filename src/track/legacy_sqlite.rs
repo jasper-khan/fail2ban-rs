@@ -5,14 +5,17 @@
 //! database continuously updated; writing it back is a later stage, so the
 //! WAL remains the daemon's live store after the upgrade seed.
 
-use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, params};
+use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::detect::ignore::IgnoreList;
 use crate::error::{Error, Result};
 use crate::track::legacy_restore::{self, LegacyBanRow, RestoreRequest, RestoredBan};
 use crate::track::state::BanRecord;
@@ -23,43 +26,57 @@ use crate::track::state::BanRecord;
 /// or modified; a missing file or missing `bips` table seeds nothing and only
 /// logs.
 pub(crate) fn restore_bans(dbfile: &Path, config: &Config) -> Result<Vec<BanRecord>> {
-    if !dbfile.is_file() {
+    restore_bans_at(dbfile, config, chrono::Utc::now().timestamp() as f64)
+}
+
+fn restore_bans_at(dbfile: &Path, config: &Config, now: f64) -> Result<Vec<BanRecord>> {
+    if !original_db_exists(dbfile)? {
+        return Ok(Vec::new());
+    }
+    let mut connection = open_readonly(dbfile)?;
+    let snapshot = connection
+        .transaction()
+        .map_err(|err| db_error(dbfile, "opening a read snapshot of", &err))?;
+    if !has_bips(&snapshot).map_err(|err| db_error(dbfile, "checking bips in", &err))? {
         info!(
             phase = "startup",
             dbfile = %dbfile.display(),
-            "no original ban database to restore"
+            "original ban database has no bips table"
         );
         return Ok(Vec::new());
     }
-    let rows = read_bips(dbfile)?;
-    if rows.is_empty() {
-        info!(
-            phase = "startup",
-            "original ban database has no current bans"
-        );
-        return Ok(Vec::new());
-    }
-    let now = chrono::Utc::now().timestamp() as f64;
+
     let mut restored = Vec::new();
     for (name, jail) in config.enabled_jails() {
         let request = RestoreRequest {
             jail: name,
             now,
             // Original restoreCurrentBans without increment uses the jail's
-            // ban time as the search window; the -1 permanent sentinel and
-            // the -2 unknown legacy sentinel disable it.
+            // ban time as the search window. A permanent jail disables it.
             age_window: (jail.ban_time >= 0).then_some(jail.ban_time as f64),
             base_ban_time: jail.ban_time as f64,
             max_ban_time: (jail.ban_time >= 0).then_some(jail.ban_time as f64),
-            // The failure-match history inside ticket data is decoded but
-            // not re-seeded into the live counters yet.
+            // Match history inside the metadata is not reseeded in live counters.
             max_matches: 0,
         };
+        let rows = read_bips(&snapshot, &request).map_err(|err| {
+            db_error(
+                dbfile,
+                &format!("reading bips for jail {name:?} from"),
+                &err,
+            )
+        })?;
+        let ignore = IgnoreList::new(&jail.ignoreip, false)?;
         for ban in legacy_restore::restore_current(&rows, &request).map_err(|err| {
-            Error::config(format!("original ban database for jail {name:?}: {err}"))
+            Error::config(format!(
+                "original ban database {} for jail {name:?}: {err}",
+                dbfile.display()
+            ))
         })? {
             if let Some(record) = ban_record(name, &ban) {
-                restored.push(record);
+                if !ignore.is_ignored(&record.ip) {
+                    restored.push(record);
+                }
             } else {
                 warn!(
                     phase = "startup",
@@ -70,84 +87,113 @@ pub(crate) fn restore_bans(dbfile: &Path, config: &Config) -> Result<Vec<BanReco
             }
         }
     }
+    snapshot
+        .commit()
+        .map_err(|err| db_error(dbfile, "closing the read snapshot of", &err))?;
     info!(
         phase = "startup",
         bans = restored.len(),
-        "bans restored from the original Fail2Ban database"
+        "bans loaded from the original Fail2Ban database"
     );
     Ok(restored)
 }
 
-/// Every `bips` row, decoded; the JSON ticket data is left as raw text here.
-fn read_bips(dbfile: &Path) -> Result<Vec<LegacyBanRow>> {
-    let connection = Connection::open_with_flags(
+fn original_db_exists(dbfile: &Path) -> Result<bool> {
+    match dbfile.metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(Error::config(format!(
+            "original ban database is not a regular file: {}",
+            dbfile.display()
+        ))),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            info!(
+                phase = "startup",
+                dbfile = %dbfile.display(),
+                "no original ban database to restore"
+            );
+            Ok(false)
+        }
+        Err(err) => Err(Error::io(
+            format!("checking original ban database {}", dbfile.display()),
+            err,
+        )),
+    }
+}
+
+fn open_readonly(dbfile: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
         dbfile,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|err| {
-        Error::config(format!(
-            "opening original ban database {}: {err}",
-            dbfile.display()
-        ))
-    })?;
-    let mut statement = match connection.prepare(
-        "SELECT ip, jail, CAST(timeofban AS REAL), CAST(bantime AS REAL), \
-         bancount, data FROM bips",
-    ) {
-        Ok(statement) => statement,
-        Err(err) if is_missing_table(&err) => {
-            info!(phase = "startup", "original ban database has no bips table");
-            return Ok(Vec::new());
-        }
-        Err(err) => {
-            return Err(Error::config(format!(
-                "reading bips from {}: {err}",
-                dbfile.display()
-            )));
-        }
-    };
-    let mut rows: Vec<(String, String, f64, f64, i64, Option<String>)> = Vec::new();
-    let queried = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })
-        .map_err(|err| Error::config(format!("reading bips from {}: {err}", dbfile.display())))?;
-    for row in queried {
-        rows.push(row.map_err(|err| {
-            Error::config(format!(
-                "decoding a bips row from {}: {err}",
-                dbfile.display()
-            ))
-        })?);
-    }
-    rows.into_iter()
-        .map(|(ip, jail, time_of_ban, ban_time, ban_count, data)| {
-            let data = data
-                .map(|text| serde_json::from_str(&text))
-                .transpose()
-                .map_err(|err| Error::config(format!("bips ticket data of {ip:?}: {err}")))?;
-            Ok(LegacyBanRow {
-                jail,
-                ip,
-                time_of_ban,
-                ban_time,
-                ban_count,
-                data,
-            })
-        })
-        .collect()
+    .map_err(|err| db_error(dbfile, "opening", &err))
 }
 
-/// The SQLite message for an absent table.
-fn is_missing_table(err: &rusqlite::Error) -> bool {
-    err.to_string().contains("no such table:") && err.to_string().contains("bips")
+fn db_error(dbfile: &Path, operation: &str, err: &rusqlite::Error) -> Error {
+    Error::config(format!(
+        "{operation} original ban database {}: {err}",
+        dbfile.display()
+    ))
+}
+
+fn has_bips(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'bips' COLLATE NOCASE)",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Apply the original selection window before decoding a row, so another
+/// jail's (or an expired row's) data does not affect this restore.
+fn read_bips(
+    connection: &Connection,
+    request: &RestoreRequest<'_>,
+) -> rusqlite::Result<Vec<LegacyBanRow>> {
+    let oldest = request
+        .age_window
+        .filter(|window| *window >= 0.0)
+        .map(|window| request.now - window);
+    let mut statement = connection.prepare(
+        "SELECT ip, timeofban, bantime, bancount, data FROM bips
+         WHERE jail = ?1 AND ip IS NOT NULL AND ip <> ''
+         AND (?2 IS NULL OR timeofban > ?2)
+         AND (timeofban + bantime > ?3 OR bantime <= -1)
+         ORDER BY ip",
+    )?;
+    let queried = statement.query_map(params![request.jail, oldest, request.now], |row| {
+        let ip: String = row.get(0)?;
+        Ok(LegacyBanRow {
+            jail: request.jail.to_owned(),
+            time_of_ban: row.get(1)?,
+            ban_time: row.get(2)?,
+            ban_count: row.get(3)?,
+            data: ticket_data(row.get_ref(4)?, request.jail, &ip),
+            ip,
+        })
+    })?;
+    queried.collect()
+}
+
+/// Fail2Ban's adapter writes UTF-8 JSON bytes (a SQLite BLOB), and its
+/// converter uses replacement decoding and falls back to empty metadata on
+/// invalid JSON. Accept TEXT and NULL as well, without logging log contents.
+fn ticket_data(value: ValueRef<'_>, jail: &str, ip: &str) -> Option<Value> {
+    let parsed = match value {
+        ValueRef::Null => return None,
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            serde_json::from_str(&String::from_utf8_lossy(bytes)).ok()
+        }
+        _ => None,
+    };
+    if matches!(parsed, Some(Value::Object(_) | Value::Null)) {
+        parsed
+    } else {
+        warn!(
+            phase = "startup",
+            jail, ip, "invalid original ban ticket data; restoring without metadata"
+        );
+        None
+    }
 }
 
 /// One restored original ban as a live [`BanRecord`]; `None` drops an
@@ -161,27 +207,6 @@ fn ban_record(jail: &str, ban: &RestoredBan) -> Option<BanRecord> {
         banned_at: ban.time_of_ban as i64,
         expires_at,
     })
-}
-
-/// Compatibility startups merge original-database bans into the WAL state.
-///
-/// The WAL is authoritative for a pair already in it (a later restart of this
-/// daemon refreshes the original row otherwise); original rows for jails the
-/// compat config does not enable are ignored upstream, exactly like the
-/// original restore pass.
-pub(crate) fn merge_with_wal(restored: Vec<BanRecord>, extra: Vec<BanRecord>) -> Vec<BanRecord> {
-    let wal_keys: HashSet<(IpAddr, String)> = restored
-        .iter()
-        .map(|record| (record.ip, record.jail_id.clone()))
-        .collect();
-    restored
-        .into_iter()
-        .chain(
-            extra
-                .into_iter()
-                .filter(|record| !wal_keys.contains(&(record.ip, record.jail_id.clone()))),
-        )
-        .collect()
 }
 
 #[cfg(test)]

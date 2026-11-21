@@ -456,7 +456,8 @@ fn test_drain_reader_flushes_complete_and_partial() {
     std::fs::write(&path, &content).unwrap();
 
     let (tx, mut rx) = mpsc::channel(16);
-    let ctx = super::ReadCtx {
+    let mut ctx = super::ReadCtx {
+        file_timing: None,
         jail_id: "test".to_string(),
         matcher: test_matcher(),
         date_parser: DateParser::new(DateFormat::Syslog).unwrap(),
@@ -473,7 +474,7 @@ fn test_drain_reader_flushes_complete_and_partial() {
         &mut reader,
         &mut carry,
         &mut line,
-        &ctx
+        &mut ctx
     ));
     drop(ctx); // close the sender so recv terminates
 
@@ -485,5 +486,61 @@ fn test_drain_reader_flushes_complete_and_partial() {
         ips,
         vec!["192.168.1.100", "10.0.0.42", "8.8.8.8"],
         "drain must yield both complete lines and the flushed partial"
+    );
+}
+
+#[test]
+fn first_eof_switches_the_compat_file_reader_to_live_timing() {
+    use crate::config::legacy_filter::ResolvedFilter;
+    use crate::detect::line_matcher::LineMatcher;
+
+    let tmp = tempfile::NamedTempFile::new().expect("private scratch file");
+    let mut reader = std::io::BufReader::new(tmp.reopen().expect("open empty scratch descriptor"));
+    let matcher = LineMatcher::legacy(
+        &ResolvedFilter {
+            options: [
+                ("datepattern".to_owned(), "{^LN-BEG}".to_owned()),
+                (
+                    "failregex".to_owned(),
+                    r"^\s*ordinary failure <ADDR>$".to_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            maxlines: Some(1),
+        },
+        60,
+    )
+    .expect("compile dated compatibility fixture");
+    let (tx, _rx) = mpsc::channel(1);
+    let mut ctx = super::ReadCtx {
+        file_timing: matcher.file_timing(),
+        jail_id: "fixture".to_owned(),
+        matcher,
+        date_parser: DateParser::new(DateFormat::Syslog).expect("create unused modern parser"),
+        ignore_list: IgnoreList::new(&[], false).expect("empty allowlist"),
+        tx,
+    };
+    let check = |ctx: &mut super::ReadCtx| {
+        ctx.matcher
+            .try_match(
+                "2024/01/02 03:04:05 ordinary failure 192.0.2.41",
+                &ctx.date_parser,
+                ctx.file_timing.as_mut(),
+                || 1_704_164_706,
+            )
+            .map(|found| found.timestamp)
+    };
+    assert_eq!(check(&mut ctx), None, "initial stale event is rejected");
+    assert!(super::read_available(
+        &mut reader,
+        &mut Vec::new(),
+        &mut String::new(),
+        &mut ctx
+    ));
+    assert_eq!(
+        check(&mut ctx),
+        Some(1_704_164_706),
+        "live skew corrected to observed time"
     );
 }

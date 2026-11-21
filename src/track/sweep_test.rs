@@ -182,6 +182,7 @@ fn test_prune_stale_failures_drops_out_of_window_entries() {
     let mut failures = HashMap::new();
     let mut fresh = CircularTimestamps::new(3);
     fresh.push(now - 100); // within window
+    fresh.push(now - 1000); // a later arrival from another source is older
     failures.insert(
         (fresh_ip, "sshd".to_string()),
         FailState { timestamps: fresh },

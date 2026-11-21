@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::load;
+use super::{dbfile_of, load};
 use crate::config::types::{Backend, LogBackend};
 use crate::detect::date::DateFormat;
 
@@ -98,6 +98,7 @@ const NGINX_HTTP_AUTH: &str = concat!(
     "ignoreregex = \n",
     "\n",
     "datepattern = {^LN-BEG}\n",
+    "journalmatch = _SYSTEMD_UNIT=nginx.service + _COMM=nginx\n",
 );
 
 #[test]
@@ -108,11 +109,15 @@ fn converts_an_original_jail_into_the_daemon_config() {
     let config = load(&base, record).expect("load");
     assert_eq!(
         config.global.socket_path,
-        PathBuf::from("/run/record-test/f2b.sock")
+        PathBuf::from("/tmp/decisions.log.fail2ban-rs/control.sock")
     );
     assert_eq!(
         config.global.state_dir,
-        PathBuf::from("/run/record-test/state")
+        PathBuf::from("/tmp/decisions.log.fail2ban-rs/state")
+    );
+    assert_eq!(
+        dbfile_of(&base).expect("read original database path"),
+        PathBuf::from("/run/record-test/state/fail2ban.sqlite3")
     );
     let jail = config.jail.get("chain-jail").expect("jail converted");
     assert_eq!(
@@ -224,34 +229,20 @@ fn rejects_options_outside_the_stage_one_subset() {
 }
 
 #[test]
-fn rejects_filters_with_unsupported_features() {
-    for (filter, needle) in [
-        (
-            concat!(
-                "[Definition]\n",
-                "failregex = ^fail .* from <HOST>\n",
-                "datepattern = %%Y %%m %%d\n",
-            ),
-            "datepattern",
+fn rejects_custom_pattern_list_date_formats() {
+    let tmp = tempfile::tempdir().expect("scratch");
+    let base = tree(
+        tmp.path(),
+        JAIL,
+        concat!(
+            "[Definition]\n",
+            "failregex = ^fail .* from <HOST>\n",
+            "datepattern = %%Y %%m %%d\n",
         ),
-        (
-            concat!(
-                "[Definition]\n",
-                "journalmatch = _SYSTEMD_UNIT=chain.service\n",
-                "failregex = ^fail .* from <HOST>\n",
-            ),
-            "journalmatch",
-        ),
-    ] {
-        let tmp = tempfile::tempdir().expect("scratch");
-        let base = tree(tmp.path(), JAIL, filter);
-        let err = load(&base, Path::new("/tmp/decisions.log"))
-            .expect_err("filter feature must be rejected");
-        assert!(
-            err.to_string().contains(needle),
-            "expected {needle} in {err}"
-        );
-    }
+    );
+    let err = load(&base, Path::new("/tmp/decisions.log"))
+        .expect_err("unsupported format must be rejected");
+    assert!(err.to_string().contains("datepattern"), "{err}");
 }
 
 #[test]
@@ -304,4 +295,49 @@ fn rejects_unsafe_record_paths() {
             "record path {bad:?} must be rejected"
         );
     }
+}
+
+#[test]
+#[ignore = "requires the original Fail2Ban 1.1.1 Git checkout (FAIL2BAN_111_SOURCE)"]
+fn stock_nginx_filter_with_journalmatch_compiles_in_polling_mode() {
+    use std::process::Command;
+
+    let original = std::env::var_os("FAIL2BAN_111_SOURCE").expect("set FAIL2BAN_111_SOURCE");
+    let tmp = tempfile::tempdir().expect("scratch");
+    let jail_conf = concat!(
+        "[DEFAULT]\nbackend = polling\nusedns = no\nignoreself = false\naction =\n",
+        "[nginx-class]\nenabled = true\nport = 443\nfilter = nginx-http-auth\n",
+        "logpath = /tmp/web3.log\nmaxretry = 3\nfindtime = 120s\nbantime = 4s\n",
+    );
+    let base = tree(tmp.path(), jail_conf, FILTER);
+    for name in ["nginx-error-common.conf", "nginx-http-auth.conf"] {
+        // Read pinned blobs rather than the operator's worktree; the latter
+        // might be a local variant missing the journal-only setting.
+        let object = format!("f60978618a101427b06924fc932b44350fec2b63:config/filter.d/{name}");
+        let blob = Command::new("git")
+            .args(["show", &object])
+            .current_dir(&original)
+            .output()
+            .expect("read pinned Git blob");
+        assert!(
+            blob.status.success(),
+            "{}",
+            String::from_utf8_lossy(&blob.stderr)
+        );
+        std::fs::write(base.join("filter.d").join(name), blob.stdout).expect("write stock filter");
+    }
+    let config = load(&base, &tmp.path().join("decisions.log")).expect("admit stock Nginx");
+    let resolved = config
+        .jail
+        .get("nginx-class")
+        .expect("converted jail")
+        .legacy_filter
+        .as_ref()
+        .expect("legacy matcher");
+    assert_eq!(
+        resolved.options.get("journalmatch").map(String::as_str),
+        Some("_SYSTEMD_UNIT=nginx.service + _COMM=nginx")
+    );
+    let _matcher = crate::detect::legacy_matcher::LegacyMatcher::compile(resolved)
+        .expect("compile stock matcher with journal-only metadata");
 }

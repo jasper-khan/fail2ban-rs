@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::detect::date::DateParser;
 use crate::detect::identity::FileIdentity;
 use crate::detect::ignore::IgnoreList;
-use crate::detect::line_matcher::LineMatcher;
+use crate::detect::line_matcher::{FileTiming, LineMatcher};
 use crate::detect::resume::{FilePosition, open_log};
 use crate::detect::watcher::{Failure, MAX_LINE_LEN};
 use crate::text::lossy;
@@ -32,6 +32,7 @@ struct ReadCtx {
     matcher: LineMatcher,
     date_parser: DateParser,
     ignore_list: IgnoreList,
+    file_timing: Option<FileTiming>,
     tx: mpsc::Sender<Failure>,
 }
 
@@ -40,8 +41,13 @@ impl ReadCtx {
     ///
     /// Returns `false` only when the downstream channel is closed and the
     /// loop should stop.
-    fn handle_line(&self, line: &str) -> bool {
-        let Some(m) = self.matcher.try_match(line, &self.date_parser) else {
+    fn handle_line(&mut self, line: &str) -> bool {
+        let Some(m) =
+            self.matcher
+                .try_match(line, &self.date_parser, self.file_timing.as_mut(), || {
+                    chrono::Utc::now().timestamp()
+                })
+        else {
             return true;
         };
         if self.ignore_list.is_ignored(&m.ip) {
@@ -135,7 +141,8 @@ pub(crate) fn read_loop(
     let Some(file) = open_log(&jail_id, &log_path, resume.as_ref(), &cancel) else {
         return Some(FilePosition::absent(log_path));
     };
-    let ctx = ReadCtx {
+    let mut ctx = ReadCtx {
+        file_timing: matcher.file_timing(),
         jail_id,
         matcher,
         date_parser,
@@ -148,12 +155,12 @@ pub(crate) fn read_loop(
         carry: Vec::new(),
         line: String::new(),
     };
-    tail(&ctx, &log_path, &mut state, &cancel);
+    tail(&mut ctx, &log_path, &mut state, &cancel);
     state.position(log_path)
 }
 
 /// Poll the open file until cancelled or the downstream channel closes.
-fn tail(ctx: &ReadCtx, log_path: &PathBuf, st: &mut TailState, cancel: &CancellationToken) {
+fn tail(ctx: &mut ReadCtx, log_path: &PathBuf, st: &mut TailState, cancel: &CancellationToken) {
     let mut last_rotation_check = std::time::Instant::now();
     loop {
         if cancel.is_cancelled() {
@@ -185,7 +192,7 @@ fn read_available(
     reader: &mut BufReader<std::fs::File>,
     carry: &mut Vec<u8>,
     line: &mut String,
-    ctx: &ReadCtx,
+    ctx: &mut ReadCtx,
 ) -> bool {
     loop {
         line.clear();
@@ -197,7 +204,12 @@ fn read_available(
             }
             // Oversized line already skipped — keep reading.
             Ok(ReadOutcome::Skipped) => {}
-            Ok(ReadOutcome::Eof) => return true,
+            Ok(ReadOutcome::Eof) => {
+                if let Some(timing) = ctx.file_timing.as_mut() {
+                    timing.reached_eof();
+                }
+                return true;
+            }
             Err(e) => {
                 warn!(jail = %ctx.jail_id, error = %e, "log read failed");
                 return true;
@@ -214,7 +226,7 @@ fn maybe_rotate(
     identity: &mut Option<FileIdentity>,
     carry: &mut Vec<u8>,
     line: &mut String,
-    ctx: &ReadCtx,
+    ctx: &mut ReadCtx,
 ) -> bool {
     let Some(new_id) = rotated_identity(log_path, file, identity) else {
         return true;
@@ -264,7 +276,7 @@ fn drain_reader(
     reader: &mut BufReader<std::fs::File>,
     carry: &mut Vec<u8>,
     line: &mut String,
-    ctx: &ReadCtx,
+    ctx: &mut ReadCtx,
 ) -> bool {
     if !read_available(reader, carry, line, ctx) {
         return false;

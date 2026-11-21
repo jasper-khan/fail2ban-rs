@@ -335,3 +335,81 @@ fn test_encode_response_over_limit_becomes_error() {
     };
     assert!(message.contains("response too large"), "got: {message}");
 }
+
+#[tokio::test]
+async fn recording_listener_refuses_preexisting_entries_and_unlinks_only_its_socket() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let runtime = dir.path().join("recording");
+    ensure_private_dir(&runtime).expect("private runtime");
+    let path = runtime.join("control.sock");
+    let wal = runtime.join("state");
+
+    std::fs::write(&path, "keep").expect("seed existing non-socket");
+    assert!(bind_recording(&path, &wal).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("existing entry"),
+        "keep"
+    );
+    assert!(!wal.exists());
+    std::fs::remove_file(&path).expect("clear fixture file");
+
+    let first = bind_recording(&path, &wal).expect("bind recording listener");
+    assert!(bind_recording(&path, &wal).is_err());
+    let moved = runtime.join("old.sock");
+    std::fs::rename(&path, &moved).expect("move bound inode");
+    let replacement = UnixListener::bind(&path).expect("replacement socket");
+    drop(first);
+    assert!(path.exists(), "old listener unlinked its replacement");
+    drop(replacement);
+    std::fs::remove_file(&path).expect("clear replacement");
+    let owned = bind_recording(&path, &wal).expect("bind owned listener");
+    drop(owned);
+    assert!(!path.exists(), "owned listener did not clean up");
+}
+
+#[tokio::test]
+async fn recording_listener_refuses_symlink_directories_without_leaving_a_socket() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let source = dir.path().join("original");
+    ensure_private_dir(&source).expect("original directory");
+    let runtime = dir.path().join("recording");
+    let path = runtime.join("control.sock");
+    let wal = runtime.join("state");
+    std::os::unix::fs::symlink(&source, &runtime).expect("runtime symlink");
+    assert!(bind_recording(&path, &wal).is_err());
+    assert!(!source.join("control.sock").exists());
+    std::fs::remove_file(&runtime).expect("unlink fixture symlink");
+
+    ensure_private_dir(&runtime).expect("new runtime");
+    std::os::unix::fs::symlink(&source, &wal).expect("WAL symlink");
+    assert!(bind_recording(&path, &wal).is_err());
+    assert!(!path.exists());
+    assert!(
+        std::fs::symlink_metadata(&wal)
+            .expect("WAL link")
+            .is_symlink()
+    );
+
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o750))
+        .expect("make runtime nonprivate");
+    assert!(bind_recording(&path, &wal).is_err());
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn modern_listener_preserves_existing_live_socket_and_reclaims_stale_own_socket() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let path = dir.path().join("modern.sock");
+    let active = UnixListener::bind(&path).expect("fixture listener");
+    let identity = socket_identity(&path).expect("original identity");
+    assert!(prepare_modern_path(&path).await.is_err());
+    assert_eq!(socket_identity(&path).expect("still listening"), identity);
+    drop(active);
+    prepare_modern_path(&path)
+        .await
+        .expect("reclaim stale local socket");
+    assert!(!path.exists());
+    let bound = bind_socket(&path).expect("restart modern listener");
+    drop(bound);
+    assert!(!path.exists());
+}

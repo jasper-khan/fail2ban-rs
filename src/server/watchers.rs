@@ -108,7 +108,7 @@ fn planned_source(
     jail: &JailConfig,
 ) -> crate::error::Result<WatcherPlan> {
     let matcher = match &jail.legacy_filter {
-        Some(legacy) => LineMatcher::legacy(legacy)?,
+        Some(legacy) => LineMatcher::legacy(legacy, jail.find_time)?,
         None => LineMatcher::modern(&jail.filter, &jail.ignoreregex)?,
     };
     let key_suffix = match &source {
@@ -190,7 +190,7 @@ fn spawn_one(
         )),
         PlanSource::Journal(journalmatch) => {
             // The journal source speaks the native engine only; legacy
-            // filters never reach it (compat rejects journalmatch up front).
+            // filters never reach it (compat admits only the polling backend).
             let LineMatcher::Modern(matcher) = matcher else {
                 unreachable!("legacy filters are not admitted on the journal backend");
             };
