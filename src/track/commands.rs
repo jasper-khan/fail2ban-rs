@@ -53,6 +53,10 @@ pub(super) async fn handle_cmd(cmd: TrackerCmd, s: &mut TrackerState) {
             reply(respond, ());
         }
         TrackerCmd::ReconcileJail { jail_id } => request_jail_reconcile(&jail_id, s),
+        TrackerCmd::DrainFailuresAndFlush { respond } => {
+            let ok = s.store.flush().is_ok();
+            let _ = respond.send(ok);
+        }
     }
 }
 

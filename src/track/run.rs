@@ -133,14 +133,18 @@ async fn event_loop(
             _ = sweep_interval.tick() => Event::Sweep,
             _ = reconcile_interval.tick() => Event::Reconcile,
         };
-        if !handle_event(event, &mut state).await {
+        if !handle_event(event, &mut state, &mut rx.failure).await {
             return state;
         }
     }
 }
 
 /// Handle one event; returns `false` when the tracker must stop.
-async fn handle_event(event: Event, s: &mut TrackerState) -> bool {
+async fn handle_event(
+    event: Event,
+    s: &mut TrackerState,
+    failure_rx: &mut mpsc::Receiver<Failure>,
+) -> bool {
     match event {
         Event::Cancelled => {
             info!(phase = "shutdown", "failure tracker stopping");
@@ -152,6 +156,19 @@ async fn handle_event(event: Event, s: &mut TrackerState) -> bool {
         Event::Failure(None) => return input_closed("failure"),
         Event::Cmd(None) => return input_closed("command"),
         Event::Failure(Some(f)) => handle_failure(f, s).await,
+        Event::Cmd(Some(TrackerCmd::DrainFailuresAndFlush { respond })) => {
+            while let Ok(f) = failure_rx.try_recv() {
+                handle_failure(f, s).await;
+            }
+            let flushed = match s.store.flush() {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = %e, "state flush failed before checkpoint commit");
+                    false
+                }
+            };
+            let _ = respond.send(flushed);
+        }
         Event::Cmd(Some(c)) => handle_cmd(c, s).await,
         // The state holds a sender, so this channel never closes.
         Event::Outcome(o) => {

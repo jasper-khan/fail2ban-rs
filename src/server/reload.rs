@@ -99,8 +99,16 @@ async fn restart_watchers(
     watchers: &mut Watchers,
 ) {
     let log_positions = watchers.log_positions();
+    let tracker_cmd_tx = watchers.tracker_cmd_tx();
     let resume = watchers.stop_for_reload().await;
-    *watchers = Watchers::spawn_with_positions(plan, failure_tx, "reload", resume, log_positions);
+    *watchers = Watchers::spawn_with_positions(
+        plan,
+        failure_tx,
+        "reload",
+        resume,
+        log_positions,
+        tracker_cmd_tx,
+    );
 }
 
 /// Send the reloaded enabled-jail configs to the tracker; returns the count.

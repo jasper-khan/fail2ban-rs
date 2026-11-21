@@ -177,9 +177,7 @@ pub(crate) fn restore_log_positions(
     let snapshot = connection
         .transaction()
         .map_err(|err| db_error(dbfile, "opening a read snapshot of", &err))?;
-    if !has_table(&snapshot, "logs")
-        .map_err(|err| db_error(dbfile, "checking logs in", &err))?
-    {
+    if !has_table(&snapshot, "logs").map_err(|err| db_error(dbfile, "checking logs in", &err))? {
         info!(
             phase = "startup",
             dbfile = %dbfile.display(),
@@ -239,9 +237,8 @@ fn read_log_row(
     jail: &str,
     path: &str,
 ) -> rusqlite::Result<Option<(Option<String>, Option<StoredLogPosition>)>> {
-    let mut statement = connection.prepare(
-        "SELECT firstlinemd5, lastfilepos FROM logs WHERE jail = ?1 AND path = ?2",
-    )?;
+    let mut statement = connection
+        .prepare("SELECT firstlinemd5, lastfilepos FROM logs WHERE jail = ?1 AND path = ?2")?;
     let mut rows = statement.query(params![jail, path])?;
     let Some(row) = rows.next()? else {
         return Ok(None);

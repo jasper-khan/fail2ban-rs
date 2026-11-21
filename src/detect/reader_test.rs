@@ -479,8 +479,10 @@ fn test_drain_reader_flushes_complete_and_partial() {
     drop(ctx); // close the sender so recv terminates
 
     let mut ips = Vec::new();
-    while let Ok(f) = rx.try_recv() {
-        ips.push(f.ip.to_string());
+    while let Ok(ev) = rx.try_recv() {
+        if let super::ReaderEvent::Failure(f) = ev {
+            ips.push(f.ip.to_string());
+        }
     }
     assert_eq!(
         ips,

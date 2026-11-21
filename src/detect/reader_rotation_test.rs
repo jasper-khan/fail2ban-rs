@@ -14,7 +14,7 @@ const LINE_B: &str =
 const LINE_C: &str =
     "Jan 15 10:30:02 server sshd[1]: Failed password for root from 192.168.1.3 port 22\n";
 
-fn ctx(tx: mpsc::Sender<Failure>) -> ReadCtx {
+fn ctx(tx: mpsc::Sender<ReaderEvent>) -> ReadCtx {
     ReadCtx {
         file_timing: None,
         jail_id: "test".to_string(),
@@ -62,10 +62,12 @@ fn start(path: &PathBuf) -> TailState {
     }
 }
 
-fn drain_ips(rx: &mut mpsc::Receiver<Failure>) -> Vec<String> {
+fn drain_ips(rx: &mut mpsc::Receiver<ReaderEvent>) -> Vec<String> {
     let mut ips = Vec::new();
-    while let Ok(f) = rx.try_recv() {
-        ips.push(f.ip.to_string());
+    while let Ok(ev) = rx.try_recv() {
+        if let ReaderEvent::Failure(f) = ev {
+            ips.push(f.ip.to_string());
+        }
     }
     ips
 }

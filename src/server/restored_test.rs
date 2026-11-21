@@ -128,12 +128,18 @@ async fn test_original_log_seed_runs_once_and_recovers_from_interrupted_migratio
 
     // 1. Failed read must not set the log-import marker.
     assert!(
-        seed_original_logs_once(&state, &log_positions, || Err(
-            crate::error::Error::config("broken sqlite")
-        ))
+        seed_original_logs_once(&state, &log_positions, || Err(crate::error::Error::config(
+            "broken sqlite"
+        )))
         .is_err()
     );
-    assert!(!state.store.read().meta.contains_key(SQLITE_LOG_IMPORT_MARKER));
+    assert!(
+        !state
+            .store
+            .read()
+            .meta
+            .contains_key(SQLITE_LOG_IMPORT_MARKER)
+    );
 
     // 2. Simulate interruption AFTER log_positions.json already has a Rust-saved
     //    position for web1.log, BEFORE SQLITE_LOG_IMPORT_MARKER is committed.
@@ -165,7 +171,10 @@ async fn test_original_log_seed_runs_once_and_recovers_from_interrupted_migratio
     })
     .unwrap();
 
-    assert_eq!(state.store.read().meta.get(SQLITE_LOG_IMPORT_MARKER), Some(&1));
+    assert_eq!(
+        state.store.read().meta.get(SQLITE_LOG_IMPORT_MARKER),
+        Some(&1)
+    );
     let snapshot = log_positions.snapshot_resume_points();
     assert_eq!(
         snapshot

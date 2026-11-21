@@ -159,7 +159,10 @@ fn test_start_for_persisted_valid_rotated_truncated_and_invalid() {
         first_line_sha1: Some(sha1.clone()),
         offset: Some(11),
     };
-    assert_eq!(start_for_persisted(&path, &valid, &file), StartAt::Offset(11));
+    assert_eq!(
+        start_for_persisted(&path, &valid, &file),
+        StartAt::Offset(11)
+    );
 
     // 2. Valid at exact EOF.
     let at_eof = PersistedFilePosition {
@@ -203,15 +206,30 @@ fn test_start_for_persisted_valid_rotated_truncated_and_invalid() {
 
     // 6. Invalid checkpoints (offset None/0, hash None/empty) -> fallback to Start (0).
     for invalid in [
-        PersistedFilePosition { offset: None, ..valid.clone() },
-        PersistedFilePosition { offset: Some(0), ..valid.clone() },
-        PersistedFilePosition { first_line_sha1: None, ..valid.clone() },
-        PersistedFilePosition { first_line_sha1: Some(String::new()), ..valid.clone() },
+        PersistedFilePosition {
+            offset: None,
+            ..valid.clone()
+        },
+        PersistedFilePosition {
+            offset: Some(0),
+            ..valid.clone()
+        },
+        PersistedFilePosition {
+            first_line_sha1: None,
+            ..valid.clone()
+        },
+        PersistedFilePosition {
+            first_line_sha1: Some(String::new()),
+            ..valid.clone()
+        },
     ] {
         assert_eq!(start_for_persisted(&path, &invalid, &file), StartAt::Start);
     }
 
     // 7. Mismatched path -> End.
     let other_path = dir.path().join("other.log");
-    assert_eq!(start_for_persisted(&other_path, &valid, &file), StartAt::End);
+    assert_eq!(
+        start_for_persisted(&other_path, &valid, &file),
+        StartAt::End
+    );
 }

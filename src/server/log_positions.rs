@@ -119,7 +119,10 @@ impl LogPositionStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn write_durable_locked(&self, positions: &BTreeMap<String, PersistedFilePosition>) -> Result<()> {
+    fn write_durable_locked(
+        &self,
+        positions: &BTreeMap<String, PersistedFilePosition>,
+    ) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir).map_err(|err| {
             Error::persistence(format!(
                 "creating state directory {} for log positions: {err}",
@@ -130,14 +133,10 @@ impl LogPositionStore {
             version: STORE_VERSION,
             positions: positions.clone(),
         };
-        let bytes = serde_json::to_vec(&payload).map_err(|err| {
-            Error::persistence(format!("serializing log positions: {err}"))
-        })?;
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|err| Error::persistence(format!("serializing log positions: {err}")))?;
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp_name = format!(
-            "{LOG_POSITIONS_FILENAME}.tmp.{}.{seq}",
-            std::process::id()
-        );
+        let tmp_name = format!("{LOG_POSITIONS_FILENAME}.tmp.{}.{seq}", std::process::id());
         let tmp_path = self.state_dir.join(tmp_name);
         let write_result = (|| -> std::io::Result<()> {
             let mut file = std::fs::OpenOptions::new()

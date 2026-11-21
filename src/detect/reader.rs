@@ -20,8 +20,15 @@ use crate::detect::ignore::IgnoreList;
 use crate::detect::line_matcher::{FileTiming, LineMatcher};
 use crate::detect::resume::{FilePosition, FileStart, PersistedFilePosition, open_log_from};
 
-/// Optional sink notified whenever a reader advances its durable checkpoint.
-pub(crate) type CheckpointSink = Box<dyn FnMut(PersistedFilePosition) + Send>;
+/// Strictly ordered events emitted by the blocking file reader to its watcher.
+///
+/// Checkpoints travel on the same FIFO channel as failures so a checkpoint can
+/// never overtake an earlier failure before the watcher forwards it to the
+/// tracker.
+pub(crate) enum ReaderEvent {
+    Failure(Failure),
+    Checkpoint(PersistedFilePosition),
+}
 use crate::detect::watcher::{Failure, MAX_LINE_LEN};
 use crate::text::lossy;
 
@@ -36,7 +43,7 @@ struct ReadCtx {
     date_parser: DateParser,
     ignore_list: IgnoreList,
     file_timing: Option<FileTiming>,
-    tx: mpsc::Sender<Failure>,
+    tx: mpsc::Sender<ReaderEvent>,
 }
 
 impl ReadCtx {
@@ -73,7 +80,7 @@ impl ReadCtx {
             timestamp = failure.timestamp,
             "failure delivered"
         );
-        self.tx.blocking_send(failure).is_ok()
+        self.tx.blocking_send(ReaderEvent::Failure(failure)).is_ok()
     }
 }
 
@@ -129,26 +136,27 @@ impl TailState {
     fn emit_checkpoint(
         &mut self,
         path: &Path,
-        sink: &mut Option<CheckpointSink>,
+        tx: &mpsc::Sender<ReaderEvent>,
+        enabled: bool,
         last_saved: &mut Option<PersistedFilePosition>,
-    ) {
-        let Some(callback) = sink.as_mut() else {
-            return;
-        };
+    ) -> bool {
+        if !enabled {
+            return true;
+        }
         let Ok(pos) = self.file.stream_position() else {
-            return;
+            return true;
         };
         let offset = pos.saturating_sub(self.carry.len() as u64);
         let Some(current) =
             PersistedFilePosition::from_handle(path.to_path_buf(), self.file.get_ref(), offset)
         else {
-            return;
+            return true;
         };
         if last_saved.as_ref() == Some(&current) {
-            return;
+            return true;
         }
         *last_saved = Some(current.clone());
-        callback(current);
+        tx.blocking_send(ReaderEvent::Checkpoint(current)).is_ok()
     }
 }
 
@@ -166,16 +174,13 @@ pub(crate) fn read_loop(
     matcher: LineMatcher,
     date_parser: DateParser,
     ignore_list: IgnoreList,
-    tx: mpsc::Sender<Failure>,
+    tx: mpsc::Sender<ReaderEvent>,
     cancel: CancellationToken,
     resume: Option<FileStart>,
-    mut checkpoint_sink: Option<CheckpointSink>,
+    emit_checkpoints: bool,
 ) -> Option<(FilePosition, Option<PersistedFilePosition>)> {
     let Some(file) = open_log_from(&jail_id, &log_path, resume.as_ref(), &cancel) else {
         let absent = PersistedFilePosition::absent(log_path.clone());
-        if let Some(callback) = checkpoint_sink.as_mut() {
-            callback(absent.clone());
-        }
         return Some((FilePosition::absent(log_path), Some(absent)));
     };
     let mut ctx = ReadCtx {
@@ -193,13 +198,15 @@ pub(crate) fn read_loop(
         line: String::new(),
     };
     let mut last_saved = None;
-    state.emit_checkpoint(&log_path, &mut checkpoint_sink, &mut last_saved);
+    if !state.emit_checkpoint(&log_path, &ctx.tx, emit_checkpoints, &mut last_saved) {
+        return state.position(log_path);
+    }
     tail(
         &mut ctx,
         &log_path,
         &mut state,
         &cancel,
-        &mut checkpoint_sink,
+        emit_checkpoints,
         &mut last_saved,
     );
     state.position(log_path)
@@ -211,7 +218,7 @@ fn tail(
     log_path: &PathBuf,
     st: &mut TailState,
     cancel: &CancellationToken,
-    checkpoint_sink: &mut Option<CheckpointSink>,
+    emit_checkpoints: bool,
     last_saved: &mut Option<PersistedFilePosition>,
 ) {
     let mut last_rotation_check = std::time::Instant::now();
@@ -221,7 +228,6 @@ fn tail(
             if !read_available(&mut st.file, &mut st.carry, &mut st.line, ctx) {
                 debug!(jail = %ctx.jail_id, "final read stopped: channel closed");
             }
-            st.emit_checkpoint(log_path, checkpoint_sink, last_saved);
             return;
         }
         if last_rotation_check.elapsed() >= ROTATION_CHECK_INTERVAL {
@@ -229,13 +235,17 @@ fn tail(
             if !maybe_rotate(log_path, file, identity, &mut st.carry, &mut st.line, ctx) {
                 return;
             }
-            st.emit_checkpoint(log_path, checkpoint_sink, last_saved);
+            if !st.emit_checkpoint(log_path, &ctx.tx, emit_checkpoints, last_saved) {
+                return;
+            }
             last_rotation_check = std::time::Instant::now();
         }
         if !read_available(&mut st.file, &mut st.carry, &mut st.line, ctx) {
             return; // downstream channel closed
         }
-        st.emit_checkpoint(log_path, checkpoint_sink, last_saved);
+        if !st.emit_checkpoint(log_path, &ctx.tx, emit_checkpoints, last_saved) {
+            return;
+        }
         std::thread::sleep(POLL_INTERVAL);
     }
 }

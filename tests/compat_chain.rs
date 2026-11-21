@@ -538,7 +538,10 @@ fn sha1_hex(input: &[u8]) -> String {
     out
 }
 
-fn send_control(socket: &Path, req: &fail2ban_rs::control::Request) -> fail2ban_rs::control::Response {
+fn send_control(
+    socket: &Path,
+    req: &fail2ban_rs::control::Request,
+) -> fail2ban_rs::control::Response {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -756,7 +759,10 @@ fn compat_chain_legacy_checkpoints_restart_unban_and_reload() {
             jail: "chain-jail".to_owned(),
         },
     );
-    assert!(matches!(unban_resp, fail2ban_rs::control::Response::Ok { .. }), "manual unban failed: {unban_resp:?}");
+    assert!(
+        matches!(unban_resp, fail2ban_rs::control::Response::Ok { .. }),
+        "manual unban failed: {unban_resp:?}"
+    );
     wait_for("manual unban recorded", &daemon1, || {
         decisions(&record).contains(&"UNBAN chain-jail 4.4.4.4".to_owned())
     });
@@ -784,7 +790,9 @@ fn compat_chain_legacy_checkpoints_restart_unban_and_reload() {
         "original SQLite DB must stay strictly read-only"
     );
     assert_eq!(
-        std::fs::read_dir(&state).expect("original state dir").count(),
+        std::fs::read_dir(&state)
+            .expect("original state dir")
+            .count(),
         1,
         "no WAL/SHM files beside original SQLite DB"
     );

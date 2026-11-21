@@ -65,8 +65,16 @@ pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
         None
     };
 
-    let mut daemon =
-        start_tasks(config, source, restored, log_positions, logger, cancel, bound).await?;
+    let mut daemon = start_tasks(
+        config,
+        source,
+        restored,
+        log_positions,
+        logger,
+        cancel,
+        bound,
+    )
+    .await?;
     info!(phase = "startup", "fail2ban-rs started");
     let result = daemon.serve().await;
 
@@ -102,8 +110,14 @@ async fn start_tasks(
     let initial_resume = log_positions
         .as_ref()
         .map_or_else(HashMap::new, |store| store.snapshot_resume_points());
-    let watchers =
-        Watchers::spawn_with_positions(plan, &failure_tx, "startup", initial_resume, log_positions);
+    let watchers = Watchers::spawn_with_positions(
+        plan,
+        &failure_tx,
+        "startup",
+        initial_resume,
+        log_positions,
+        Some(tracker_cmd_tx.clone()),
+    );
     let control_rx = spawn_control(&config, &cancel, bound);
     Ok(Daemon {
         config,

@@ -21,8 +21,16 @@ pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
 use crate::detect::date::DateParser;
 use crate::detect::ignore::IgnoreList;
 use crate::detect::line_matcher::LineMatcher;
-use crate::detect::reader::{CheckpointSink, read_loop};
+use crate::detect::reader::{ReaderEvent, read_loop};
 use crate::detect::resume::{FilePosition, PersistedFilePosition, ResumePoint};
+use crate::track::TrackerCmd;
+
+/// Persists log checkpoints only after the tracker confirms every preceding
+/// failure in `failure_rx` has been processed and the WAL flushed durably.
+pub(crate) struct CheckpointCommitter {
+    pub(crate) tracker_cmd_tx: mpsc::Sender<TrackerCmd>,
+    pub(crate) commit: Box<dyn FnMut(PersistedFilePosition) + Send>,
+}
 
 /// A detected authentication failure.
 #[derive(Debug, Clone)]
@@ -127,14 +135,15 @@ pub(crate) async fn run_supervised_from(
     phase: &'static str,
     resume: Option<ResumePoint>,
     handoff: Arc<AtomicBool>,
-    checkpoint_sink: Option<CheckpointSink>,
+    mut committer: Option<CheckpointCommitter>,
 ) -> Option<ResumePoint> {
     info!(phase, jail = %jail_id, path = %log_path.display(), "watcher started");
 
-    let (line_tx, mut line_rx) = mpsc::channel::<Failure>(LINE_CHANNEL_CAPACITY);
+    let (line_tx, mut line_rx) = mpsc::channel::<ReaderEvent>(LINE_CHANNEL_CAPACITY);
     let reader_cancel = cancel.child_token();
     let (reader_jail, rc) = (jail_id.clone(), reader_cancel.clone());
     let start = resume.and_then(ResumePoint::into_file_start);
+    let emit_checkpoints = committer.is_some();
     let reader_handle = tokio::task::spawn_blocking(move || {
         read_loop(
             reader_jail,
@@ -145,11 +154,11 @@ pub(crate) async fn run_supervised_from(
             line_tx,
             rc,
             start,
-            checkpoint_sink,
+            emit_checkpoints,
         )
     });
 
-    let stop = forward(&jail_id, &mut line_rx, &tx, &cancel).await;
+    let stop = forward(&jail_id, &mut line_rx, &tx, &cancel, committer.as_mut()).await;
     let drained = stop_reader(&jail_id, stop, line_rx, &tx, &reader_cancel, &handoff).await;
     let resume = join_reader(&jail_id, reader_handle).await;
     if resume.is_some() {
@@ -188,26 +197,52 @@ enum Stop {
 /// a full downstream channel can never stall shutdown.
 async fn forward(
     jail_id: &str,
-    line_rx: &mut mpsc::Receiver<Failure>,
+    line_rx: &mut mpsc::Receiver<ReaderEvent>,
     tx: &mpsc::Sender<Failure>,
     cancel: &CancellationToken,
+    mut committer: Option<&mut CheckpointCommitter>,
 ) -> Stop {
     loop {
-        let failure = tokio::select! {
+        let event = tokio::select! {
             () = cancel.cancelled() => return Stop::Cancelled(None),
-            f = line_rx.recv() => match f {
-                Some(f) => f,
+            ev = line_rx.recv() => match ev {
+                Some(ev) => ev,
                 None => return Stop::Done, // reader exited
             },
         };
-        tokio::select! {
-            () = cancel.cancelled() => return Stop::Cancelled(Some(failure)),
-            permit = tx.reserve() => {
-                let Ok(permit) = permit else {
-                    debug!(jail = %jail_id, reason = "channel_closed", "watcher stopping");
-                    return Stop::Done;
+        match event {
+            ReaderEvent::Failure(failure) => {
+                tokio::select! {
+                    () = cancel.cancelled() => return Stop::Cancelled(Some(failure)),
+                    permit = tx.reserve() => {
+                        let Ok(permit) = permit else {
+                            debug!(jail = %jail_id, reason = "channel_closed", "watcher stopping");
+                            return Stop::Done;
+                        };
+                        permit.send(failure);
+                    }
+                }
+            }
+            ReaderEvent::Checkpoint(pos) => {
+                let Some(committer) = committer.as_deref_mut() else {
+                    continue;
                 };
-                permit.send(failure);
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                let sent = tokio::select! {
+                    () = cancel.cancelled() => return Stop::Cancelled(None),
+                    res = committer.tracker_cmd_tx.send(TrackerCmd::DrainFailuresAndFlush { respond: ack_tx }) => res,
+                };
+                if sent.is_err() {
+                    debug!(jail = %jail_id, reason = "tracker_closed", "checkpoint skipped");
+                    continue;
+                }
+                let ack = tokio::select! {
+                    () = cancel.cancelled() => return Stop::Cancelled(None),
+                    res = ack_rx => res,
+                };
+                if matches!(ack, Ok(true)) {
+                    (committer.commit)(pos);
+                }
             }
         }
     }
@@ -225,7 +260,7 @@ async fn forward(
 async fn stop_reader(
     jail_id: &str,
     stop: Stop,
-    mut line_rx: mpsc::Receiver<Failure>,
+    mut line_rx: mpsc::Receiver<ReaderEvent>,
     tx: &mpsc::Sender<Failure>,
     reader_cancel: &CancellationToken,
     handoff: &AtomicBool,
@@ -253,7 +288,7 @@ async fn stop_reader(
 /// Forward `pending` and everything the reader sends until it exits.
 async fn drain(
     pending: Option<Failure>,
-    line_rx: &mut mpsc::Receiver<Failure>,
+    line_rx: &mut mpsc::Receiver<ReaderEvent>,
     tx: &mpsc::Sender<Failure>,
 ) {
     if let Some(f) = pending
@@ -261,8 +296,10 @@ async fn drain(
     {
         return;
     }
-    while let Some(f) = line_rx.recv().await {
-        if tx.send(f).await.is_err() {
+    while let Some(ev) = line_rx.recv().await {
+        if let ReaderEvent::Failure(f) = ev
+            && tx.send(f).await.is_err()
+        {
             return;
         }
     }

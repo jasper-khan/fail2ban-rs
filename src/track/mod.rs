@@ -125,6 +125,12 @@ pub enum TrackerCmd {
         jails: HashMap<String, JailConfig>,
         respond: oneshot::Sender<()>,
     },
+    /// Drain all failures already queued in `failure_rx`, flush the WAL store
+    /// durably, and reply `true` on `respond` if the flush succeeded.
+    ///
+    /// Used as an ordering barrier before persisting a log checkpoint so a
+    /// checkpoint can never overtake unprocessed failures or unflushed bans.
+    DrainFailuresAndFlush { respond: oneshot::Sender<bool> },
 }
 
 /// Runtime statistics snapshot.

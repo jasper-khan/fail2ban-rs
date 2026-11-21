@@ -2,7 +2,12 @@ use super::*;
 
 use std::path::PathBuf;
 
-fn sample_pos(path: &str, inode: Option<u64>, hash: Option<&str>, offset: Option<u64>) -> PersistedFilePosition {
+fn sample_pos(
+    path: &str,
+    inode: Option<u64>,
+    hash: Option<&str>,
+    offset: Option<u64>,
+) -> PersistedFilePosition {
     PersistedFilePosition {
         path: PathBuf::from(path),
         inode,
@@ -25,7 +30,10 @@ fn round_trip_and_seed_missing_preserve_existing_keys() {
     let pos_a_legacy = sample_pos("/var/log/a.log", None, Some("aaaa"), Some(100));
     let pos_b_legacy = sample_pos("/var/log/b.log", None, Some("bbbb"), Some(400));
     let added = store
-        .seed_missing([(key_a.clone(), pos_a_legacy), (key_b.clone(), pos_b_legacy.clone())])
+        .seed_missing([
+            (key_a.clone(), pos_a_legacy),
+            (key_b.clone(), pos_b_legacy.clone()),
+        ])
         .unwrap();
     assert_eq!(added, 1);
 
@@ -34,11 +42,15 @@ fn round_trip_and_seed_missing_preserve_existing_keys() {
     let points = reopened.snapshot_resume_points();
     assert_eq!(points.len(), 2);
     assert_eq!(
-        points.get(&key_a).and_then(ResumePoint::persisted_file_position),
+        points
+            .get(&key_a)
+            .and_then(ResumePoint::persisted_file_position),
         Some(&pos_a_new)
     );
     assert_eq!(
-        points.get(&key_b).and_then(ResumePoint::persisted_file_position),
+        points
+            .get(&key_b)
+            .and_then(ResumePoint::persisted_file_position),
         Some(&pos_b_legacy)
     );
 }

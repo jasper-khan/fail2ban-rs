@@ -28,8 +28,8 @@ use crate::detect::ResumePoint;
 use crate::detect::date::DateParser;
 use crate::detect::ignore::IgnoreList;
 use crate::detect::line_matcher::LineMatcher;
-use crate::detect::reader::CheckpointSink;
-use crate::detect::watcher::Failure;
+use crate::detect::watcher::{CheckpointCommitter, Failure};
+use crate::track::TrackerCmd;
 
 use super::log_positions::LogPositionStore;
 
@@ -132,6 +132,7 @@ fn planned_source(
 ///
 /// Each key found in `resume` starts from its recorded position; the rest
 /// start from their default (end of file / journal tail).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_watchers(
     watcher_plan: Vec<WatcherPlan>,
     failure_tx: &mpsc::Sender<Failure>,
@@ -140,6 +141,7 @@ pub(super) fn spawn_watchers(
     mut resume: HashMap<String, ResumePoint>,
     handoff: &Arc<AtomicBool>,
     log_positions: Option<&Arc<LogPositionStore>>,
+    tracker_cmd_tx: Option<&mpsc::Sender<TrackerCmd>>,
 ) -> Vec<WatcherHandle> {
     watcher_plan
         .into_iter()
@@ -157,6 +159,7 @@ pub(super) fn spawn_watchers(
                 start,
                 handoff.clone(),
                 log_positions.cloned(),
+                tracker_cmd_tx.cloned(),
             );
             (key, handle)
         })
@@ -164,6 +167,7 @@ pub(super) fn spawn_watchers(
 }
 
 /// Spawn the file or journal watcher for a single plan.
+#[allow(clippy::too_many_arguments)]
 fn spawn_one(
     plan: WatcherPlan,
     tx: mpsc::Sender<Failure>,
@@ -172,6 +176,7 @@ fn spawn_one(
     start: Option<ResumePoint>,
     handoff: Arc<AtomicBool>,
     log_positions: Option<Arc<LogPositionStore>>,
+    tracker_cmd_tx: Option<mpsc::Sender<TrackerCmd>>,
 ) -> JoinHandle<Option<ResumePoint>> {
     let WatcherPlan {
         key,
@@ -183,15 +188,21 @@ fn spawn_one(
     } = plan;
     match source {
         PlanSource::File(path) => {
-            let checkpoint_sink: Option<CheckpointSink> = log_positions.map(|store| {
-                let sink_key = key;
-                let sink_jail = jail.clone();
-                Box::new(move |pos| {
-                    if let Err(err) = store.update_one(&sink_key, pos) {
-                        warn!(jail = %sink_jail, error = %err, "failed to persist log position");
-                    }
-                }) as CheckpointSink
-            });
+            let committer = match (log_positions, tracker_cmd_tx) {
+                (Some(store), Some(cmd_tx)) => {
+                    let sink_key = key;
+                    let sink_jail = jail.clone();
+                    Some(CheckpointCommitter {
+                        tracker_cmd_tx: cmd_tx,
+                        commit: Box::new(move |pos| {
+                            if let Err(err) = store.update_one(&sink_key, pos) {
+                                warn!(jail = %sink_jail, error = %err, "failed to persist log position");
+                            }
+                        }),
+                    })
+                }
+                _ => None,
+            };
             tokio::spawn(crate::detect::watcher::run_supervised_from(
                 jail,
                 path,
@@ -203,7 +214,7 @@ fn spawn_one(
                 phase,
                 start,
                 handoff,
-                checkpoint_sink,
+                committer,
             ))
         }
         PlanSource::Journal(journalmatch) => {
@@ -236,6 +247,7 @@ pub(super) struct Watchers {
     handles: Vec<WatcherHandle>,
     handoff: Arc<AtomicBool>,
     log_positions: Option<Arc<LogPositionStore>>,
+    tracker_cmd_tx: Option<mpsc::Sender<TrackerCmd>>,
 }
 
 impl Watchers {
@@ -248,17 +260,18 @@ impl Watchers {
         phase: &'static str,
         resume: HashMap<String, ResumePoint>,
     ) -> Self {
-        Self::spawn_with_positions(plan, failure_tx, phase, resume, None)
+        Self::spawn_with_positions(plan, failure_tx, phase, resume, None, None)
     }
 
     /// Spawn watchers for `plan` under a fresh token, optionally persisting
-    /// file checkpoints into `log_positions`.
+    /// file checkpoints into `log_positions` once acknowledged by `tracker_cmd_tx`.
     pub(super) fn spawn_with_positions(
         plan: Vec<WatcherPlan>,
         failure_tx: &mpsc::Sender<Failure>,
         phase: &'static str,
         resume: HashMap<String, ResumePoint>,
         log_positions: Option<Arc<LogPositionStore>>,
+        tracker_cmd_tx: Option<mpsc::Sender<TrackerCmd>>,
     ) -> Self {
         let cancel = CancellationToken::new();
         let handoff = Arc::new(AtomicBool::new(false));
@@ -270,18 +283,25 @@ impl Watchers {
             resume,
             &handoff,
             log_positions.as_ref(),
+            tracker_cmd_tx.as_ref(),
         );
         Self {
             cancel,
             handles,
             handoff,
             log_positions,
+            tracker_cmd_tx,
         }
     }
 
     /// Shared handle to the persistent log-position store, if enabled.
     pub(super) fn log_positions(&self) -> Option<Arc<LogPositionStore>> {
         self.log_positions.clone()
+    }
+
+    /// Shared tracker command sender used for checkpoint ordering barriers.
+    pub(super) fn tracker_cmd_tx(&self) -> Option<mpsc::Sender<TrackerCmd>> {
+        self.tracker_cmd_tx.clone()
     }
 
     /// Reload must wait for every watcher to deliver queued failures and
@@ -295,7 +315,7 @@ impl Watchers {
                 points.insert(key, point);
             }
         }
-        self.persist_points(&points);
+        self.persist_points(&points).await;
         points
     }
 
@@ -314,15 +334,42 @@ impl Watchers {
                 points.insert(key, point);
             }
         }
-        self.persist_points(&points);
+        self.persist_points(&points).await;
         points
     }
 
-    fn persist_points(&self, points: &HashMap<String, ResumePoint>) {
-        if let Some(store) = &self.log_positions
-            && let Err(err) = store.update_batch(points)
+    /// Persist `points` only after the tracker drains all already-queued
+    /// failures and flushes the WAL durably.
+    async fn persist_points(&self, points: &HashMap<String, ResumePoint>) {
+        let (Some(store), Some(cmd_tx)) = (&self.log_positions, &self.tracker_cmd_tx) else {
+            return;
+        };
+        if points.is_empty() {
+            return;
+        }
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if cmd_tx
+            .send(TrackerCmd::DrainFailuresAndFlush { respond: ack_tx })
+            .await
+            .is_err()
         {
-            warn!(error = %err, "failed to persist final log positions");
+            warn!("tracker gone; skipping final log-position persistence");
+            return;
+        }
+        match tokio::time::timeout(STOP_TIMEOUT, ack_rx).await {
+            Ok(Ok(true)) => {
+                if let Err(err) = store.update_batch(points) {
+                    warn!(error = %err, "failed to persist final log positions");
+                }
+            }
+            Ok(Ok(false)) => {
+                warn!("tracker WAL flush failed; skipping final log-position persistence");
+            }
+            Ok(Err(_)) | Err(_) => {
+                warn!(
+                    "tracker flush barrier did not complete; skipping final log-position persistence"
+                );
+            }
         }
     }
 }

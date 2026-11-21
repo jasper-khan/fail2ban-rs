@@ -426,7 +426,12 @@ fn restore_log_positions_decodes_valid_and_invalid_rows_readonly() {
     conn.execute_batch(LOGS_DDL).expect("logs ddl");
     conn.execute(
         "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES(?1, ?2, ?3, ?4)",
-        params!["chain-jail", valid_log.to_string_lossy().as_ref(), "abc123", 4096_i64],
+        params![
+            "chain-jail",
+            valid_log.to_string_lossy().as_ref(),
+            "abc123",
+            4096_i64
+        ],
     )
     .expect("insert valid");
     conn.execute(
@@ -440,7 +445,11 @@ fn restore_log_positions_decodes_valid_and_invalid_rows_readonly() {
     let mut cfg = restore_config();
     let jail = cfg.jail.get_mut("chain-jail").expect("jail");
     jail.log_path = valid_log.clone();
-    jail.log_paths = vec![valid_log.clone(), invalid_log.clone(), untracked_log.clone()];
+    jail.log_paths = vec![
+        valid_log.clone(),
+        invalid_log.clone(),
+        untracked_log.clone(),
+    ];
 
     let checkpoints = super::restore_log_positions(&db, &cfg).expect("restore log positions");
     assert_eq!(checkpoints.len(), 2, "untracked path must be omitted");

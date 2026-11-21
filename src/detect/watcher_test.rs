@@ -343,3 +343,135 @@ async fn test_run_downstream_closed_stops_watcher() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
     assert!(result.is_ok(), "watcher must stop once downstream closes");
 }
+
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_checkpoint_not_committed_before_tracker_drains_and_flushes_failures() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.log");
+    std::fs::write(&path, "").unwrap();
+
+    let (failure_tx, mut failure_rx) = mpsc::channel::<Failure>(16);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::track::TrackerCmd>(16);
+    let cancel = CancellationToken::new();
+    let committed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let committed_sink = Arc::clone(&committed);
+
+    let matcher = LineMatcher::Modern(
+        crate::detect::matcher::JailMatcher::new(&[
+            r"sshd\[\d+\]: Failed password for .* from <HOST>".to_string(),
+        ])
+        .unwrap(),
+    );
+    let date_parser = DateParser::new(crate::detect::date::DateFormat::Syslog).unwrap();
+    let ignore_list = IgnoreList::new(&[], false).unwrap();
+
+    let committer = CheckpointCommitter {
+        tracker_cmd_tx: cmd_tx,
+        commit: Box::new(move |pos| {
+            if let Some(off) = pos.offset {
+                committed_sink.lock().unwrap().push(off);
+            }
+        }),
+    };
+
+    let handle = tokio::spawn(run_supervised_from(
+        "sshd".to_string(),
+        path.clone(),
+        matcher,
+        date_parser,
+        ignore_list,
+        failure_tx,
+        cancel.clone(),
+        "test",
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Some(committer),
+    ));
+
+    // Initial empty-file checkpoint barrier (offset 0): acknowledge it.
+    let init_cmd = tokio::time::timeout(Duration::from_secs(3), cmd_rx.recv())
+        .await
+        .expect("initial barrier timeout")
+        .expect("cmd channel closed");
+    let crate::track::TrackerCmd::DrainFailuresAndFlush { respond } = init_cmd else {
+        panic!("expected DrainFailuresAndFlush");
+    };
+    let _ = respond.send(true);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(*committed.lock().unwrap(), vec![0]);
+
+    // Append a failure line; verify failure arrives BEFORE the checkpoint barrier,
+    // and checkpoint is NOT committed while the barrier is held (or if flush returns false).
+    let line1 =
+        "Jan 15 10:30:01 srv sshd[10]: Failed password for root from 198.51.100.1 port 22\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(line1.as_bytes())
+        .unwrap();
+
+    let f1 = tokio::time::timeout(Duration::from_secs(3), failure_rx.recv())
+        .await
+        .expect("failure 1 timeout")
+        .expect("failure channel closed");
+    assert_eq!(f1.ip.to_string(), "198.51.100.1");
+
+    let cmd1 = tokio::time::timeout(Duration::from_secs(3), cmd_rx.recv())
+        .await
+        .expect("barrier 1 timeout")
+        .expect("cmd channel closed");
+    let crate::track::TrackerCmd::DrainFailuresAndFlush { respond: respond1 } = cmd1 else {
+        panic!("expected DrainFailuresAndFlush");
+    };
+    // Still unacknowledged: checkpoint MUST NOT have advanced past 0!
+    assert_eq!(*committed.lock().unwrap(), vec![0]);
+    // Flush fails -> checkpoint MUST NOT advance!
+    let _ = respond1.send(false);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(*committed.lock().unwrap(), vec![0]);
+
+    // Append a second failure line and acknowledge flush -> checkpoint advances to full file length.
+    let line2 =
+        "Jan 15 10:30:02 srv sshd[11]: Failed password for root from 198.51.100.2 port 22\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(line2.as_bytes())
+        .unwrap();
+
+    let f2 = tokio::time::timeout(Duration::from_secs(3), failure_rx.recv())
+        .await
+        .expect("failure 2 timeout")
+        .expect("failure channel closed");
+    assert_eq!(f2.ip.to_string(), "198.51.100.2");
+
+    let cmd2 = tokio::time::timeout(Duration::from_secs(3), cmd_rx.recv())
+        .await
+        .expect("barrier 2 timeout")
+        .expect("cmd channel closed");
+    let crate::track::TrackerCmd::DrainFailuresAndFlush { respond: respond2 } = cmd2 else {
+        panic!("expected DrainFailuresAndFlush");
+    };
+    let _ = respond2.send(true);
+    let expected_len = (line1.len() + line2.len()) as u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if committed.lock().unwrap().last().copied() == Some(expected_len) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkpoint did not commit"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    cancel.cancel();
+    let _ = handle.await.unwrap();
+}
