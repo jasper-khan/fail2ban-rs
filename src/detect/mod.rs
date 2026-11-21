@@ -38,12 +38,17 @@ pub(crate) mod legacy_file_cursor;
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) mod legacy_file_identity;
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) mod legacy_file_seek;
 #[allow(dead_code)]
 pub(crate) mod legacy_matcher;
 #[cfg(test)]
 mod legacy_matcher_parity_test;
 #[allow(dead_code)]
 pub(crate) mod legacy_observation_time;
+#[allow(dead_code)]
+pub(crate) mod legacy_poll_stamp;
 #[allow(dead_code)]
 mod legacy_regex;
 #[allow(dead_code)]

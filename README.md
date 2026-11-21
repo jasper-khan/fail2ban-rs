@@ -217,6 +217,20 @@ caller-supplied temporary file can also drive the queue and the first EOF
 transition. A caller-supplied replacement descriptor also exercises original
 inode and truncation checks and exact first-record checkpoint reuse. This
 fixture-only adapter does not monitor paths or persist checkpoints itself.
+An initial fixed-format UTC Nginx timestamp seek is also compared against
+the original; probing alone does not change the jail's operating phase.
+Multiple fixture cursors can feed one jail with a shared ticket queue while
+keeping their restart offsets and operating phases separate. A caller-driven
+poll selects changed descriptors and drains them in configured order; worker
+ticks are driven separately and only report simulated decisions. The
+continually active fixture replay also checks when stale failure counters
+are cleared. A temporarily missing source keeps its last observed stamp
+and byte position without blocking other sources. With continuously active
+polling, a successful stat resets that source's streak even when unchanged,
+and the 51st consecutive missing sample removes only its in-memory
+registration. An error-budget trace also checks the original filter-only
+idle transition and resume with one explicit stat pass per active
+iteration. It does not simulate repeated wait predicates or a live scheduler.
 These tests do not start jails, resolve DNS, dispatch actions, or read a
 journal. Continue to use a TOML `[jail.<name>]` table for each enabled jail.
 `config.d/*.toml` files, merged alphabetically after the main configuration,

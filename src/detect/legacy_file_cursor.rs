@@ -1,8 +1,7 @@
 //! Isolated byte cursor for an already opened regular fixture file.
 //!
 //! This implements only the plain UTF-8 LF/CRLF log subset. It does not open
-//! a configured path, watch/rotate files, infer inode/hash identity, seek by
-//! time, or implement the original lossy/other-encoding handling. Resume
+//! a configured path, watch/rotate files, infer inode/hash identity, or implement the original lossy/other-encoding handling. Resume
 //! offsets are already authorized by the caller's fixture state.
 
 use std::fs::File;
@@ -73,6 +72,30 @@ impl LegacyFileCursor {
             record: Vec::new(),
             complete_end: None,
         })
+    }
+
+    /// Perform the original one-shot starting seek before reading any record.
+    /// Return whether the scan had content *before* positioning: the original
+    /// uses that observation to decide whether a following EOF goes live.
+    #[cfg(unix)]
+    pub(crate) fn seek_initial_nginx(&mut self, cutoff: i64) -> io::Result<bool> {
+        if self.complete_end.is_some() || !self.record.is_empty() {
+            return Err(invalid_input(
+                "initial seek requires an unused fixture cursor",
+            ));
+        }
+        let file = self.reader.get_ref();
+        if file.metadata()?.len() <= self.acknowledged {
+            return Ok(false);
+        }
+        let offset = super::legacy_file_seek::seek_nginx_offset(
+            file,
+            self.acknowledged,
+            cutoff,
+            self.max_record_bytes,
+        )?;
+        self.acknowledged = self.reader.seek(SeekFrom::Start(offset))?;
+        Ok(true)
     }
 
     pub(crate) fn acknowledged_offset(&self) -> u64 {
