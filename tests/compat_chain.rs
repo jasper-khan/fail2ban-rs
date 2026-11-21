@@ -1089,3 +1089,468 @@ db.close()
     assert!(daemon2.terminate().success());
     assert_eq!(std::fs::read(&dbfile).expect("1.1.1 DB bytes"), original_db);
 }
+
+/// Format a UTC RFC3164 syslog line at `unix_ts` for SSH parity tests.
+fn ssh_syslog_at(unix_ts: i64, pid: u32, msg: &str) -> String {
+    let dt = chrono::DateTime::from_timestamp(unix_ts, 0).expect("valid utc ts");
+    format!(
+        "{} {:2} {:02}:{:02}:{:02} srv sshd[{pid}]: {msg}",
+        dt.format("%b"),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    )
+}
+
+#[test]
+fn compat_chain_legacy_failmanager_rate_and_rotation_e2e() {
+    let tmp = tempfile::tempdir().expect("scratch dir");
+    let base = tmp.path().join("f2b");
+    let filter_dir = base.join("filter.d");
+    std::fs::create_dir_all(&filter_dir).expect("tree");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let socket = tmp.path().join("f2b.sock");
+    let record = tmp.path().join("decisions.log");
+    let log_path = tmp.path().join("auth.log");
+    let log = Tail::create(&log_path).expect("auth.log");
+
+    std::fs::write(
+        base.join("fail2ban.conf"),
+        format!(
+            "[Definition]\nsocket = {}\ndbfile = {}\n",
+            socket.display(),
+            state.join("fail2ban.sqlite3").display()
+        ),
+    )
+    .expect("fail2ban.conf");
+    std::fs::write(
+        base.join("jail.conf"),
+        format!(
+            "[DEFAULT]\n\
+             backend = polling\n\
+             usedns = no\n\
+             ignoreself = false\n\
+             action =\n\
+             \n\
+             [rate-jail]\n\
+             enabled = true\n\
+             port = 22\n\
+             filter = chain-auth\n\
+             logpath = {}\n\
+             maxretry = 3\n\
+             findtime = 60s\n\
+             bantime = 600s\n",
+            log_path.display(),
+        ),
+    )
+    .expect("jail.conf");
+    std::fs::write(
+        filter_dir.join("chain-auth.conf"),
+        "[Definition]\n\
+         failregex = chain-auth\\[\\d+\\]: failed login for user \\S+ from <HOST> port \\d+\n\
+         ignoreregex =\n",
+    )
+    .expect("filter");
+
+    let daemon = spawn_daemon(&base, &record).expect("spawn daemon");
+    wait_for("daemon startup", &daemon, || {
+        daemon.saw("fail2ban-rs started")
+    });
+
+    // Helper for a local syslog line at `now - offset_secs`.
+    let line_ago = |offset_secs: i64, ip: &str| {
+        let dt = chrono::Local::now() - chrono::Duration::seconds(offset_secs);
+        format!(
+            "{} {:2} {:02}:{:02}:{:02} srv chain-auth[100]: failed login for user bob from {ip} port 22",
+            dt.format("%b"),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+        )
+    };
+
+    // 1. LegacyFailManager rate-adjusted findtime boundary (maxretry=3, findtime=60):
+    //    t = now-70, now-69, now-5 (span = 65s > 60s).
+    //    Native CircularTimestamps would NOT ban (65 > 60), whereas Fail2Ban 1.1.1's
+    //    FailManager adjusts retry = round_ties_even(2 / 65 * 60) = 2, then +1 = 3 -> BANS!
+    log.append(vec![
+        line_ago(70, "198.51.100.21"),
+        line_ago(69, "198.51.100.21"),
+        line_ago(5, "198.51.100.21"),
+    ]);
+    wait_for("LegacyFailManager rate-adjusted ban", &daemon, || {
+        decisions(&record).contains(&"BAN rate-jail 198.51.100.21".to_owned())
+    });
+
+    // 2. Live log rotation via rename (new inode + new first line): legacy_poll_reader
+    //    must detect rotation via FileIdentityState::reopen and read the new file from 0.
+    let rotated = tmp.path().join("auth.log.new");
+    std::fs::write(
+        &rotated,
+        format!(
+            "{}\n{}\n{}\n",
+            line_ago(2, "198.51.100.22"),
+            line_ago(1, "198.51.100.22"),
+            line_ago(0, "198.51.100.22"),
+        ),
+    )
+    .expect("write rotated");
+    std::fs::rename(&rotated, &log_path).expect("rotate auth.log");
+    wait_for("post-rotation ban", &daemon, || {
+        decisions(&record).contains(&"BAN rate-jail 198.51.100.22".to_owned())
+    });
+
+    assert!(daemon.terminate().success(), "clean exit");
+}
+
+#[test]
+#[ignore = "requires local pinned Fail2Ban 1.1.1 via FAIL2BAN_111_SOURCE and Python 3"]
+fn compat_chain_sshd_file_jail_matches_fail2ban_111_decisions() {
+    let source = std::fs::canonicalize(
+        std::env::var_os("FAIL2BAN_111_SOURCE").expect("set FAIL2BAN_111_SOURCE"),
+    )
+    .expect("locate Fail2Ban 1.1.1 source");
+
+    let tmp = tempfile::tempdir().expect("scratch dir");
+    let base = tmp.path().join("f2b");
+    let filter_dir = base.join("filter.d");
+    std::fs::create_dir_all(&filter_dir).expect("tree");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let socket = tmp.path().join("f2b.sock");
+    let record = tmp.path().join("decisions.log");
+    let runtime = tmp.path().join("decisions.log.fail2ban-rs");
+
+    // Copy real stock Fail2Ban 1.1.1 sshd.conf + common.conf verbatim!
+    std::fs::copy(
+        source.join("config/filter.d/common.conf"),
+        filter_dir.join("common.conf"),
+    )
+    .expect("copy common.conf");
+    std::fs::copy(
+        source.join("config/filter.d/sshd.conf"),
+        filter_dir.join("sshd.conf"),
+    )
+    .expect("copy sshd.conf");
+
+    let auth1_path = tmp.path().join("auth1.log");
+    let auth2_path = tmp.path().join("auth2.log");
+    let auth1 = Tail::create(&auth1_path).expect("auth1");
+    let auth2 = Tail::create(&auth2_path).expect("auth2");
+
+    std::fs::write(
+        base.join("fail2ban.conf"),
+        format!(
+            "[Definition]\nsocket = {}\ndbfile = {}\n",
+            socket.display(),
+            state.join("fail2ban.sqlite3").display()
+        ),
+    )
+    .expect("fail2ban.conf");
+    std::fs::write(
+        base.join("jail.conf"),
+        format!(
+            "[DEFAULT]\n\
+             backend = polling\n\
+             usedns = no\n\
+             ignoreself = false\n\
+             action =\n\
+             \n\
+             [sshd]\n\
+             enabled = true\n\
+             port = 22\n\
+             filter = sshd\n\
+             ignoreip = 192.0.2.99\n\
+             logpath = {}\n\
+             \x20   {}\n\
+             maxretry = 3\n\
+             findtime = 60s\n\
+             bantime = 600s\n",
+            auth1_path.display(),
+            auth2_path.display(),
+        ),
+    )
+    .expect("jail.conf");
+
+    let now = chrono::Utc::now().timestamp();
+
+    // Shared corpus fed identically to upstream Fail2Ban 1.1.1 AND the real Rust daemon:
+    let batch1_auth1 = vec![
+        // 198.51.100.11: multi-file failures (2 in auth1 + 1 in auth2 -> BANNED)
+        ssh_syslog_at(
+            now - 20,
+            1001,
+            "Failed password for root from 198.51.100.11 port 50001 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 19,
+            1002,
+            "Invalid user admin from 198.51.100.11 port 50002",
+        ),
+        // 198.51.100.12: LegacyFailManager rate-adjusted findtime boundary (span=65s > 60s -> BANNED)
+        ssh_syslog_at(
+            now - 70,
+            2001,
+            "Failed password for root from 198.51.100.12 port 51001 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 69,
+            2002,
+            "Failed password for root from 198.51.100.12 port 51002 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 5,
+            2003,
+            "Failed password for root from 198.51.100.12 port 51003 ssh2",
+        ),
+        // 198.51.100.13: multi-line SSH session correlation (<F-MLFID>) via shared PID 3001
+        // (addressless failure lines inherit IP from "Connection from ...") -> BANNED
+        ssh_syslog_at(
+            now - 15,
+            3001,
+            "Connection from 198.51.100.13 port 52001 on 192.0.2.1 port 22",
+        ),
+        ssh_syslog_at(
+            now - 14,
+            3001,
+            "User alice not allowed because account is locked",
+        ),
+        ssh_syslog_at(
+            now - 13,
+            3001,
+            "Disconnecting: Too many authentication failures",
+        ),
+        ssh_syslog_at(
+            now - 12,
+            3001,
+            "Disconnecting: Too many authentication failures",
+        ),
+        // 198.51.100.14: benign Accepted publickey -> NOT BANNED
+        ssh_syslog_at(
+            now - 12,
+            4001,
+            "Accepted publickey for alice from 198.51.100.14 port 53001 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 11,
+            4002,
+            "Accepted publickey for alice from 198.51.100.14 port 53002 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 10,
+            4003,
+            "Accepted publickey for alice from 198.51.100.14 port 53003 ssh2",
+        ),
+        // 192.0.2.99: in ignoreip -> NOT BANNED
+        ssh_syslog_at(
+            now - 9,
+            5001,
+            "Failed password for root from 192.0.2.99 port 54001 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 8,
+            5002,
+            "Failed password for root from 192.0.2.99 port 54002 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 7,
+            5003,
+            "Failed password for root from 192.0.2.99 port 54003 ssh2",
+        ),
+        // 198.51.100.15: only 2 failures -> NOT BANNED
+        ssh_syslog_at(
+            now - 6,
+            6001,
+            "Failed password for root from 198.51.100.15 port 55001 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 5,
+            6002,
+            "Failed password for root from 198.51.100.15 port 55002 ssh2",
+        ),
+    ];
+    let batch1_auth2 = vec![ssh_syslog_at(
+        now - 18,
+        1003,
+        "Failed password for root from 198.51.100.11 port 50003 ssh2",
+    )];
+
+    // 1. Run upstream Fail2Ban 1.1.1 (f6097861) oracle on the exact same sshd.conf + logs
+    //    in the same live tail mode (empty files attached with tail=True, then lines appended)!
+    let oracle_log1 = tmp.path().join("oracle1.log");
+    let oracle_log2 = tmp.path().join("oracle2.log");
+    std::fs::write(&oracle_log1, b"").expect("oracle1");
+    std::fs::write(&oracle_log2, b"").expect("oracle2");
+    let payload1 = format!("{}\n", batch1_auth1.join("\n"));
+    let payload2 = format!("{}\n", batch1_auth2.join("\n"));
+
+    let py_oracle = r"
+import json, sys, time
+from fail2ban.client.filterreader import FilterReader
+from fail2ban.server.jail import Jail
+from fail2ban.server.mytime import MyTime
+
+basedir, log1, log2, now_ts, p1, p2 = sys.argv[1:7]
+MyTime.setTime(float(now_ts))
+
+jail = Jail('sshd', backend='polling')
+jail.filter.setUseDns('no')
+jail.filter.setMaxRetry(3)
+jail.filter.setFindTime(60)
+jail.actions.setBanTime(600)
+jail.filter.addIgnoreIP('192.0.2.99')
+
+jail.filter.active = True
+jail.filter.setLogTimeZone('UTC')
+fr = FilterReader('sshd', 'sshd', {'mode': 'normal', 'logtype': 'file'}, basedir=basedir)
+assert fr.read(), 'failed to read stock sshd filter'
+fr.applyAutoOptions('polling')
+fr.getOptions({})
+options = fr.getCombined()
+jail.filter.prefRegex = options['prefregex']
+jail.filter.setDatePattern(options['datepattern'])
+jail.filter.setMaxLines(options['maxlines'])
+for rule in (options.get('failregex') or '').splitlines():
+    if rule:
+        jail.filter.addFailRegex(rule)
+for rule in (options.get('ignoreregex') or '').splitlines():
+    if rule:
+        jail.filter.addIgnoreRegex(rule)
+
+jail.filter.addLogPath(log1, tail=True, autoSeek=False)
+jail.filter.addLogPath(log2, tail=True, autoSeek=False)
+with open(log1, 'a', encoding='utf-8') as f:
+    f.write(p1)
+with open(log2, 'a', encoding='utf-8') as f:
+    f.write(p2)
+jail.filter.getFailures(log1)
+jail.filter.getFailures(log2)
+jail.filter.performBan()
+
+banned = []
+while True:
+    ticket = jail.getFailTicket()
+    if not ticket:
+        break
+    if jail.actions.banManager.addBanTicket(ticket):
+        banned.append(str(ticket.getIP()))
+banned.sort()
+print(json.dumps(banned))
+";
+    let oracle_out = Command::new("python3")
+        .args(["-S", "-c", py_oracle])
+        .arg(&base)
+        .arg(&oracle_log1)
+        .arg(&oracle_log2)
+        .arg(now.to_string())
+        .arg(&payload1)
+        .arg(&payload2)
+        .env("PYTHONPATH", &source)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("TZ", "UTC")
+        .output()
+        .expect("run upstream Fail2Ban 1.1.1 sshd oracle");
+    assert!(
+        oracle_out.status.success(),
+        "upstream sshd oracle failed: {}",
+        String::from_utf8_lossy(&oracle_out.stderr)
+    );
+    let expected_ips: Vec<String> =
+        serde_json::from_slice(&oracle_out.stdout).expect("parse oracle JSON");
+    assert_eq!(
+        expected_ips,
+        vec![
+            "198.51.100.11".to_owned(),
+            "198.51.100.12".to_owned(),
+            "198.51.100.13".to_owned(),
+        ],
+        "upstream Fail2Ban 1.1.1 in live mode bans .11 (multi-log), .12 (live-clamped), and .13 (session), rejecting benign .14, ignored .99, and 2-hit .15"
+    );
+
+    // 2. Now run the REAL Rust daemon on the exact same sshd.conf + log corpus!
+    let daemon1 = spawn_daemon(&base, &record).expect("spawn sshd daemon");
+    let ctrl_sock = runtime.join("control.sock");
+    wait_for("sshd daemon startup", &daemon1, || {
+        daemon1.saw("fail2ban-rs started") && ctrl_sock.exists()
+    });
+
+    auth1.append(batch1_auth1);
+    auth2.append(batch1_auth2);
+
+    wait_for("rust sshd bans match upstream 1.1.1", &daemon1, || {
+        let rec = decisions(&record);
+        expected_ips
+            .iter()
+            .all(|ip| rec.contains(&format!("BAN sshd {ip}")))
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    let mut rust_ips: Vec<String> = decisions(&record)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("BAN sshd ").map(str::to_owned))
+        .collect();
+    rust_ips.sort();
+    assert_eq!(
+        rust_ips, expected_ips,
+        "Rust daemon SSH file jail decisions MUST match upstream Fail2Ban 1.1.1 1-to-1"
+    );
+
+    // 3. Also verify reload + restart continuation on the same SSH jail!
+    auth1.append(vec![
+        ssh_syslog_at(
+            now - 2,
+            7001,
+            "Failed password for root from 198.51.100.17 port 56001 ssh2",
+        ),
+        ssh_syslog_at(
+            now - 1,
+            7002,
+            "Failed password for root from 198.51.100.17 port 56002 ssh2",
+        ),
+    ]);
+    daemon1.signal("HUP");
+    wait_for("sshd reload complete", &daemon1, || {
+        daemon1.saw("config reload complete")
+    });
+    auth2.append(vec![ssh_syslog_at(
+        now,
+        7003,
+        "Failed password for root from 198.51.100.17 port 56003 ssh2",
+    )]);
+    wait_for("post-reload sshd ban", &daemon1, || {
+        decisions(&record).contains(&"BAN sshd 198.51.100.17".to_owned())
+    });
+
+    assert!(daemon1.terminate().success(), "sshd daemon 1 clean exit");
+    std::fs::write(&record, b"").expect("clear decisions before restart");
+
+    // Append offline SSH failures while daemon is stopped, then restart.
+    let now2 = chrono::Utc::now().timestamp();
+    auth1.append(vec![
+        ssh_syslog_at(
+            now2,
+            8001,
+            "Failed password for root from 198.51.100.18 port 57001 ssh2",
+        ),
+        ssh_syslog_at(
+            now2,
+            8002,
+            "Failed password for root from 198.51.100.18 port 57002 ssh2",
+        ),
+        ssh_syslog_at(
+            now2,
+            8003,
+            "Failed password for root from 198.51.100.18 port 57003 ssh2",
+        ),
+    ]);
+    let daemon2 = spawn_daemon(&base, &record).expect("spawn sshd daemon 2");
+    wait_for("sshd daemon 2 startup", &daemon2, || {
+        daemon2.saw("fail2ban-rs started") && ctrl_sock.exists()
+    });
+    wait_for("post-restart offline sshd ban", &daemon2, || {
+        decisions(&record).contains(&"BAN sshd 198.51.100.18".to_owned())
+    });
+    assert!(daemon2.terminate().success(), "sshd daemon 2 clean exit");
+}

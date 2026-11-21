@@ -8,6 +8,9 @@ pub mod detect;
 pub mod duration;
 pub mod enforce;
 pub mod error;
+/// Upstream Fail2Ban 1.1.1 Unix socket protocol (`fail2ban-client` pickle framing).
+#[cfg(unix)]
+pub mod legacy_protocol;
 pub mod log_format;
 pub mod logging;
 pub mod regex_tool;

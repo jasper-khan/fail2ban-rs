@@ -9,13 +9,22 @@ use tracing::{debug, warn};
 use crate::detect::watcher::Failure;
 use crate::track::ban_calc::calc_ban_time;
 use crate::track::circular::CircularTimestamps;
-use crate::track::execute::execute_ban;
+use crate::track::execute::{execute_ban, execute_ban_at, prolong_ban};
+use crate::track::legacy_fail_manager::LegacyFailManager;
 use crate::track::tracker_state::{FailKey, FailState, TrackerState};
 
 /// Record a failure and, if the jail's threshold is reached, trigger a ban.
 pub(super) async fn handle_failure(failure: Failure, s: &mut TrackerState) {
     s.counters.total_failures += 1;
     incr_jail_counter(&mut s.counters.jail_failures, &failure.jail_id);
+
+    if s.jail_params
+        .get(&failure.jail_id)
+        .is_some_and(|params| params.compat_mode)
+    {
+        handle_legacy_failure(failure, s).await;
+        return;
+    }
 
     // Build the (ip, jail) key once and reuse it for the membership check and
     // the failures-map entry. The common case (not banned, below threshold)
@@ -118,4 +127,88 @@ fn incr_jail_counter(map: &mut HashMap<String, u64>, jail_id: &str) {
     } else {
         map.insert(jail_id.to_string(), 1);
     }
+}
+
+/// Handle a failure for a Fail2Ban 1.1.1 compatibility jail using the
+/// parity-proven `LegacyFailManager` (rate-adjusted sliding estimation) and
+/// `LegacyBanManager` timing (bans anchored to `ticket.time`, stale tickets
+/// rejected as expired, prolongations extended without re-banning).
+async fn handle_legacy_failure(failure: Failure, s: &mut TrackerState) {
+    let Some(params) = s.jail_params.get(&failure.jail_id) else {
+        return;
+    };
+    let max_retry = u64::from(params.max_retry);
+    let find_time = params.find_time.max(0) as u64;
+    let base_ban_time = params.ban_time;
+
+    let fm = s
+        .legacy_failures
+        .entry(failure.jail_id.clone())
+        .or_insert_with(|| LegacyFailManager::new(max_retry, find_time));
+    fm.record(failure.ip, failure.timestamp);
+    let Some(ticket) = fm.take_for_ban(Some(failure.ip)) else {
+        return;
+    };
+
+    let observed_at = chrono::Utc::now().timestamp();
+    let incoming_end = (base_ban_time >= 0).then(|| ticket.time.saturating_add(base_ban_time));
+    if let Some(end) = incoming_end
+        && i128::from(end) < i128::from(observed_at)
+    {
+        debug!(
+            ip = %ticket.ip,
+            jail = %failure.jail_id,
+            ticket_time = ticket.time,
+            ban_time = base_ban_time,
+            observed_at,
+            reason = "expired_ticket",
+            "legacy qualifying ticket already expired; not banning"
+        );
+        return;
+    }
+
+    let key: FailKey = (ticket.ip, failure.jail_id.clone());
+    if s.index.banned_keys.contains(&key) {
+        let existing = s.store.read().bans.get(&key).cloned();
+        if let Some(current) = existing {
+            let current_cmp = current.expires_at.map_or(i128::MAX, i128::from);
+            let incoming_cmp = incoming_end.map_or(i128::MAX, i128::from);
+            if incoming_cmp > current_cmp {
+                let prolonged_end = (base_ban_time >= 0).then(|| {
+                    ticket
+                        .time
+                        .max(current.banned_at)
+                        .saturating_add(base_ban_time)
+                });
+                prolong_ban(ticket.ip, &failure.jail_id, prolonged_end, s);
+            }
+        }
+        return;
+    }
+
+    let count = s
+        .store
+        .read()
+        .ban_counts
+        .get(&ticket.ip)
+        .map_or(0, |bc| bc.count);
+    let effective_ban_time = s
+        .jail_params
+        .get(&failure.jail_id)
+        .map_or(base_ban_time, |p| calc_ban_time(base_ban_time, count, p));
+    let ban_failure = Failure {
+        ip: ticket.ip,
+        jail_id: failure.jail_id,
+        timestamp: ticket.time,
+    };
+    log_threshold_ban(&ban_failure, effective_ban_time, count + 1, s);
+    execute_ban_at(
+        ticket.ip,
+        &ban_failure.jail_id,
+        ticket.time,
+        effective_ban_time,
+        Some(count + 1),
+        s,
+    )
+    .await;
 }

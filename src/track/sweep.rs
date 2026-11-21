@@ -34,16 +34,24 @@ pub(super) async fn process_unbans(s: &mut TrackerState) {
         .bans
         .iter()
         .filter_map(|(key, ban)| match ban.expires_at {
-            Some(exp)
-                if exp <= now
+            Some(exp) => {
+                let compat = s
+                    .jail_params
+                    .get(&key.1)
+                    .is_some_and(|params| params.compat_mode);
+                let due = if compat { exp < now } else { exp <= now };
+                if due
                     && !s.pending_unbans.contains(key)
                     && s.unban_retry_after
                         .get(key)
-                        .is_none_or(|retry| *retry <= now) =>
-            {
-                Some(key.clone())
+                        .is_none_or(|retry| *retry <= now)
+                {
+                    Some(key.clone())
+                } else {
+                    None
+                }
             }
-            _ => None,
+            None => None,
         })
         .collect();
 
@@ -52,6 +60,9 @@ pub(super) async fn process_unbans(s: &mut TrackerState) {
     }
 
     prune_stale_failures(&mut s.failures, &s.jail_params, now);
+    for fm in s.legacy_failures.values_mut() {
+        fm.cleanup(now);
+    }
     prune_decayed_ban_counts(&s.store, s.ban_count_decay, now);
     s.index.next_expiry = s
         .store

@@ -500,6 +500,7 @@ fn first_eof_switches_the_compat_file_reader_to_live_timing() {
     let mut reader = std::io::BufReader::new(tmp.reopen().expect("open empty scratch descriptor"));
     let matcher = LineMatcher::legacy(
         &ResolvedFilter {
+            ssh_normal: false,
             options: [
                 ("datepattern".to_owned(), "{^LN-BEG}".to_owned()),
                 (

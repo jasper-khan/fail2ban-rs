@@ -57,6 +57,9 @@ pub(super) struct WatcherPlan {
     pub(super) matcher: LineMatcher,
     pub(super) date_parser: DateParser,
     pub(super) ignore_list: IgnoreList,
+    pub(super) compat_mode: bool,
+    pub(super) max_lines: usize,
+    pub(super) log_encoding: crate::config::LogEncoding,
 }
 
 /// Stable resume-map identity of one (jail, source) watcher.
@@ -83,6 +86,11 @@ pub(super) fn build_watcher_plan(config: &Config) -> crate::error::Result<Vec<Wa
     for (name, jail) in config.enabled_jails() {
         match jail.log_backend {
             LogBackend::Systemd => {
+                if jail.legacy_filter.is_some() {
+                    return Err(crate::error::Error::config(format!(
+                        "jail '{name}': resolved legacy filters (including stock sshd normal mode) require backend=polling; the journal watcher only supports native filters"
+                    )));
+                }
                 plans.push(planned_source(
                     name,
                     PlanSource::Journal(jail.journalmatch.clone()),
@@ -125,6 +133,9 @@ fn planned_source(
         matcher,
         date_parser: DateParser::new(jail.date_format)?,
         ignore_list: IgnoreList::new(&jail.ignoreip, jail.ignoreself)?,
+        compat_mode: jail.compat_mode,
+        max_lines: jail.max_lines,
+        log_encoding: jail.log_encoding,
     })
 }
 
@@ -185,6 +196,9 @@ fn spawn_one(
         matcher,
         date_parser,
         ignore_list,
+        compat_mode,
+        max_lines,
+        log_encoding,
     } = plan;
     match source {
         PlanSource::File(path) => {
@@ -194,9 +208,11 @@ fn spawn_one(
                     let sink_jail = jail.clone();
                     Some(CheckpointCommitter {
                         tracker_cmd_tx: cmd_tx,
-                        commit: Box::new(move |pos| {
-                            if let Err(err) = store.update_one(&sink_key, pos) {
+                        commit: Box::new(move |pos| match store.update_one(&sink_key, pos) {
+                            Ok(()) => true,
+                            Err(err) => {
                                 warn!(jail = %sink_jail, error = %err, "failed to persist log position");
+                                false
                             }
                         }),
                     })
@@ -215,6 +231,9 @@ fn spawn_one(
                 start,
                 handoff,
                 committer,
+                compat_mode,
+                max_lines,
+                log_encoding,
             ))
         }
         PlanSource::Journal(journalmatch) => {
@@ -363,7 +382,9 @@ impl Watchers {
                 }
             }
             Ok(Ok(false)) => {
-                warn!("tracker WAL flush failed; skipping final log-position persistence");
+                warn!(
+                    "tracker did not approve the checkpoint; skipping final log-position persistence"
+                );
             }
             Ok(Err(_)) | Err(_) => {
                 warn!(
@@ -417,3 +438,34 @@ impl Drop for Watchers {
 )]
 #[path = "watchers_test.rs"]
 mod watchers_test;
+
+#[cfg(test)]
+mod compat_preflight_tests {
+    use super::*;
+    use crate::config::legacy_filter::ResolvedFilter;
+
+    #[test]
+    fn systemd_legacy_ssh_is_rejected_during_plan_build() {
+        let config = Config {
+            global: crate::config::GlobalConfig::default(),
+            logging: crate::config::LoggingConfig::default(),
+            jail: [(
+                "fixture-sshd".to_owned(),
+                JailConfig {
+                    enabled: true,
+                    log_backend: LogBackend::Systemd,
+                    compat_mode: true,
+                    legacy_filter: Some(ResolvedFilter {
+                        ssh_normal: true,
+                        ..ResolvedFilter::default()
+                    }),
+                    ..JailConfig::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let result = build_watcher_plan(&config);
+        assert!(matches!(result, Err(e) if e.to_string().contains("require backend=polling")));
+    }
+}

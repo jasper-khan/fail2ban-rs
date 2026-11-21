@@ -48,7 +48,25 @@ pub(super) async fn reload_config(
     failure_tx: &mpsc::Sender<Failure>,
     logger: Option<&Logger>,
 ) -> crate::error::Result<()> {
-    let new_config = source.load()?;
+    let mut new_config = source.load()?;
+    if let Some(dir) = source.legacy_dir() {
+        let old = &current_config.global;
+        let new = &new_config.global;
+        let sqlite_path_changed = match old.legacy_sqlite_rw_path.as_deref() {
+            Some(path) => crate::config::compat::dbfile_of(dir)? != path,
+            None => false,
+        };
+        if new.state_dir != old.state_dir
+            || new.socket_path != old.socket_path
+            || sqlite_path_changed
+        {
+            return Err(crate::error::Error::config(
+                "compatibility state, database and socket paths cannot be changed by reload; restart to apply changes",
+            ));
+        }
+    }
+    new_config.global.legacy_socket_path = current_config.global.legacy_socket_path.clone();
+    new_config.global.legacy_sqlite_rw_path = current_config.global.legacy_sqlite_rw_path.clone();
     let new_watcher_plan = build_watcher_plan(&new_config)?;
 
     let delta = FirewallDelta::compute(current_config, &new_config);

@@ -18,6 +18,9 @@ pub(crate) fn test_jail_config() -> JailConfig {
         log_path: "/tmp/test.log".into(),
         log_paths: Vec::new(),
         legacy_filter: None,
+        compat_mode: false,
+        max_lines: 1,
+        log_encoding: crate::config::LogEncoding::Utf8,
         date_format: crate::detect::date::DateFormat::Syslog,
         filter: vec!["from <HOST>".to_string()],
         max_retry: 3,
@@ -61,6 +64,8 @@ pub(crate) fn test_global_config() -> crate::config::GlobalConfig {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/GeoLite2-City-Test.mmdb"),
         ),
+        legacy_socket_path: None,
+        legacy_sqlite_rw_path: None,
     }
 }
 

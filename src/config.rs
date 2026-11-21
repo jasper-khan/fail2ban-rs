@@ -4,7 +4,7 @@ mod backend;
 // The original-format reader feeds the compatibility daemon entry; the TOML
 // entry point is unchanged.
 #[allow(dead_code)]
-pub(crate) mod compat;
+pub mod compat;
 #[allow(dead_code)]
 pub mod legacy_filter;
 #[cfg(test)]
@@ -33,7 +33,7 @@ mod validate;
 use std::path::PathBuf;
 
 pub use types::{
-    Backend, Config, GlobalConfig, JailConfig, LogBackend, LoggingConfig, MaxmindField,
+    Backend, Config, GlobalConfig, JailConfig, LogBackend, LogEncoding, LoggingConfig, MaxmindField,
 };
 
 use crate::error::Result;
@@ -46,6 +46,9 @@ pub enum Source {
     /// An original Fail2Ban configuration tree run with the decision
     /// recording action backend (stage-one compatibility mode).
     Fail2BanIni { dir: PathBuf, record: PathBuf },
+    /// An original Fail2Ban configuration tree executing resolved `action.d`
+    /// commands (`--legacy-execute-actions`).
+    Fail2BanIniLive { dir: PathBuf },
 }
 
 impl Source {
@@ -54,6 +57,15 @@ impl Source {
         match self {
             Self::Toml(path) => Config::from_file(path),
             Self::Fail2BanIni { dir, record } => compat::load(dir, record),
+            Self::Fail2BanIniLive { dir } => compat::load_with_actions(dir),
+        }
+    }
+
+    /// The original Fail2Ban configuration directory, if running in compat mode.
+    pub fn legacy_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Fail2BanIni { dir, .. } | Self::Fail2BanIniLive { dir } => Some(dir.as_path()),
+            Self::Toml(_) => None,
         }
     }
 }

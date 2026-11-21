@@ -281,7 +281,7 @@ fn start_for_any(path: &Path, start: Option<&FileStart>, file: &std::fs::File) -
 #[cfg(test)]
 pub(crate) fn open_log(
     jail_id: &str,
-    path: &PathBuf,
+    path: &Path,
     resume: Option<&FilePosition>,
     cancel: &CancellationToken,
 ) -> Option<BufReader<std::fs::File>> {
@@ -292,14 +292,26 @@ pub(crate) fn open_log(
 /// Open the log at `path` using either a live or persisted resume point.
 pub(crate) fn open_log_from(
     jail_id: &str,
-    path: &PathBuf,
+    path: &Path,
     resume: Option<&FileStart>,
     cancel: &CancellationToken,
+) -> Option<BufReader<std::fs::File>> {
+    open_log_from_with(jail_id, path, resume, cancel, |path| {
+        std::fs::File::open(path)
+    })
+}
+
+pub(super) fn open_log_from_with(
+    jail_id: &str,
+    path: &Path,
+    resume: Option<&FileStart>,
+    cancel: &CancellationToken,
+    open: impl Fn(&Path) -> std::io::Result<std::fs::File>,
 ) -> Option<BufReader<std::fs::File>> {
     let mut backoff = Backoff::new();
     let mut retried = false;
     loop {
-        match open_positioned(path, resume, retried) {
+        match open(path).and_then(|file| position_file(path, file, resume, retried)) {
             Ok(reader) => {
                 if retried {
                     info!(jail = %jail_id, path = %path.display(), "log file opened after retry");
@@ -318,12 +330,12 @@ pub(crate) fn open_log_from(
     }
 }
 
-fn open_positioned(
-    path: &PathBuf,
+fn position_file(
+    path: &Path,
+    mut file: std::fs::File,
     resume: Option<&FileStart>,
     force_start: bool,
 ) -> std::io::Result<BufReader<std::fs::File>> {
-    let mut file = std::fs::File::open(path)?;
     let start = if force_start {
         StartAt::Start
     } else {

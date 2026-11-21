@@ -16,6 +16,7 @@ pub(crate) struct JailParams {
     pub(crate) bantime_factor: f64,
     pub(crate) bantime_multipliers: Vec<u32>,
     pub(crate) bantime_maxtime: i64,
+    pub(crate) compat_mode: bool,
 }
 
 /// Calculate effective ban time with optional escalation.
@@ -60,6 +61,7 @@ pub(crate) fn build_jail_params(
                     bantime_factor: cfg.bantime_factor,
                     bantime_multipliers: cfg.bantime_multipliers.clone(),
                     bantime_maxtime: cfg.bantime_maxtime,
+                    compat_mode: cfg.compat_mode,
                 },
             )
         })

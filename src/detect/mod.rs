@@ -49,6 +49,8 @@ pub mod legacy_matcher;
 mod legacy_matcher_parity_test;
 #[allow(dead_code)]
 pub(crate) mod legacy_observation_time;
+#[cfg(unix)]
+pub(crate) mod legacy_poll_reader;
 #[allow(dead_code)]
 pub(crate) mod legacy_poll_stamp;
 #[allow(dead_code)]

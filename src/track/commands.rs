@@ -150,6 +150,24 @@ fn apply_config_update(
     s.failures
         .retain(|(_, jail_id), _| new_params.contains_key(jail_id));
     s.jail_params = new_params;
+    s.legacy_failures
+        .retain(|name, _| s.jail_params.get(name).is_some_and(|p| p.compat_mode));
+    for (name, params) in &s.jail_params {
+        if !params.compat_mode {
+            continue;
+        }
+        let target = (u64::from(params.max_retry), params.find_time.max(0) as u64);
+        let needs_reset = s
+            .legacy_failures
+            .get(name)
+            .is_none_or(|fm| fm.params() != target);
+        if needs_reset {
+            s.legacy_failures.insert(
+                name.clone(),
+                crate::track::legacy_fail_manager::LegacyFailManager::new(target.0, target.1),
+            );
+        }
+    }
     s.ban_count_decay = global.ban_count_decay;
     #[cfg(feature = "maxmind")]
     s.maxmind.reload(global, jails);

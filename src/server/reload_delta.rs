@@ -138,6 +138,20 @@ pub(super) fn backend_differs(a: &Backend, b: &Backend) -> bool {
                 unban_cmd: b_unban,
             },
         ) => a_ban != b_ban || a_unban != b_unban,
+        (
+            Backend::LegacyAction {
+                action_start: a_s,
+                action_ban: a_b,
+                action_unban: a_u,
+                action_stop: a_t,
+            },
+            Backend::LegacyAction {
+                action_start: b_s,
+                action_ban: b_b,
+                action_unban: b_u,
+                action_stop: b_t,
+            },
+        ) => a_s != b_s || a_b != b_b || a_u != b_u || a_t != b_t,
         _ => true,
     }
 }

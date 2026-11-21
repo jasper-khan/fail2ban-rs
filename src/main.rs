@@ -56,6 +56,20 @@ enum Command {
         /// decisions are appended here, no firewall is touched
         #[arg(long)]
         record_decisions: Option<PathBuf>,
+
+        /// Also bind an upstream Fail2Ban 1.1.1 (`fail2ban-client`) Unix socket
+        #[arg(long)]
+        legacy_socket: Option<PathBuf>,
+
+        /// Execute real action.d/*.conf commands with --legacy-dir instead of
+        /// --record-decisions
+        #[arg(long)]
+        legacy_execute_actions: bool,
+
+        /// Mirror bans, unbans, and log checkpoints directly into Fail2Ban 1.1.1's
+        /// v4 SQLite database (`dbfile` from fail2ban.conf/local)
+        #[arg(long)]
+        legacy_sqlite_rw: bool,
     },
 
     /// Show daemon status
@@ -133,7 +147,20 @@ async fn main() -> Result<()> {
         Command::Run {
             legacy_dir,
             record_decisions,
-        } => run_daemon(path, legacy_dir, record_decisions).await?,
+            legacy_socket,
+            legacy_execute_actions,
+            legacy_sqlite_rw,
+        } => {
+            run_daemon(
+                path,
+                legacy_dir,
+                record_decisions,
+                legacy_socket,
+                legacy_execute_actions,
+                legacy_sqlite_rw,
+            )
+            .await?;
+        }
         Command::Status => print_response(&send_control(path, Request::Status).await?),
         Command::ListBans { json } => list_bans(path, json).await?,
         Command::Stats => print_response(&send_control(path, Request::Stats).await?),
@@ -162,13 +189,44 @@ async fn run_daemon(
     toml_path: &Path,
     legacy_dir: Option<PathBuf>,
     record_decisions: Option<PathBuf>,
+    legacy_socket: Option<PathBuf>,
+    legacy_execute_actions: bool,
+    legacy_sqlite_rw: bool,
 ) -> Result<()> {
-    let source = match (legacy_dir, record_decisions) {
-        (None, None) => Source::Toml(toml_path.to_path_buf()),
-        (Some(dir), Some(record)) => Source::Fail2BanIni { dir, record },
-        _ => anyhow::bail!("--legacy-dir and --record-decisions must be used together"),
+    if legacy_sqlite_rw && !legacy_execute_actions {
+        anyhow::bail!(
+            "--legacy-sqlite-rw requires --legacy-execute-actions; recording must not write the upstream database"
+        );
+    }
+    let source = match (legacy_dir, record_decisions, legacy_execute_actions) {
+        (None, None, false) => Source::Toml(toml_path.to_path_buf()),
+        (Some(dir), Some(record), false) => Source::Fail2BanIni { dir, record },
+        (Some(dir), None, true) => Source::Fail2BanIniLive { dir },
+        (Some(_), Some(_), true) => {
+            anyhow::bail!("--record-decisions and --legacy-execute-actions are mutually exclusive")
+        }
+        _ => anyhow::bail!(
+            "--legacy-dir requires either --record-decisions or --legacy-execute-actions"
+        ),
     };
-    let config = source.load().context("failed to load configuration")?;
+    let mut config = source.load().context("failed to load configuration")?;
+    if legacy_sqlite_rw {
+        let Some(dir) = source.legacy_dir() else {
+            anyhow::bail!("--legacy-sqlite-rw requires --legacy-dir");
+        };
+        let dbfile = fail2ban_rs::config::compat::dbfile_of(dir)
+            .context("reading dbfile from legacy fail2ban.conf")?;
+        config.global.legacy_sqlite_rw_path = Some(dbfile);
+    }
+    #[cfg(unix)]
+    if let Some(sock) = legacy_socket {
+        config.global.legacy_socket_path = Some(
+            fail2ban_rs::legacy_protocol::validate_legacy_socket_path(&sock)
+                .context("validating --legacy-socket")?,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = legacy_socket;
     init_tracing(
         config.logging.level.as_deref(),
         config.logging.format.as_deref(),

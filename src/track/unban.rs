@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::enforce::FirewallCmd;
 use crate::error::{Error, Result};
+use crate::track::execute::{CountRollback, compensate_ban};
 use crate::track::sweep::request_jail_reconcile;
 use crate::track::tracker_state::{FailKey, TrackerState};
 
@@ -73,12 +74,13 @@ pub(super) fn handle_unban_outcome(outcome: UnbanOutcome, s: &mut TrackerState) 
     let key = outcome.key;
     s.pending_unbans.remove(&key);
     let result = outcome.result.and_then(|()| {
-        s.store
-            .write(|tx| {
-                tx.bans.delete(&key);
-                Ok(())
-            })
-            .map_err(|e| Error::persistence(format!("removing ban after firewall unban: {e}")))
+        let persisted = persist_removal(&key, s);
+        if persisted.is_err() {
+            // The action succeeded, but SQLite/WAL removal did not. Keep the
+            // ban retryable and inhibit checkpoints that would hide the gap.
+            s.automatic_persistence_failed = true;
+        }
+        persisted
     });
     match &result {
         Ok(()) => {
@@ -100,6 +102,36 @@ pub(super) fn handle_unban_outcome(outcome: UnbanOutcome, s: &mut TrackerState) 
     if let Some(respond) = outcome.respond {
         let _ = respond.send(result);
     }
+}
+
+pub(super) fn persist_removal(key: &FailKey, s: &TrackerState) -> Result<()> {
+    let previous = s.store.read().bans.get(key).cloned();
+    let mut wal_committed = false;
+    let commit_wal = || {
+        s.store
+            .write(|tx| {
+                tx.bans.delete(key);
+                Ok(())
+            })
+            .map_err(|e| Error::persistence(format!("removing ban after firewall unban: {e}")))?;
+        wal_committed = true;
+        Ok(())
+    };
+    let result = if let Some(db) = &s.sqlite_mirror {
+        db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .delete_ban_then(&key.1, key.0, commit_wal)
+    } else {
+        let mut commit_wal = commit_wal;
+        commit_wal()
+    };
+    result.map_err(|err| {
+        if wal_committed {
+            compensate_ban(s, key, previous, CountRollback::Unchanged, err)
+        } else {
+            err
+        }
+    })
 }
 
 fn schedule_retry(key: &FailKey, s: &mut TrackerState) {

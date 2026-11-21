@@ -40,6 +40,8 @@ mod legacy_restore;
 mod legacy_restore_parity_test;
 #[allow(dead_code)]
 pub(crate) mod legacy_sqlite;
+/// Direct read-write persistence to Fail2Ban 1.1.1 v4 SQLite schema.
+pub mod legacy_sqlite_rw;
 mod manual;
 mod run;
 mod sweep;
@@ -47,6 +49,7 @@ mod tracker_state;
 mod unban;
 
 pub use run::run;
+pub(crate) use run::{SqliteMirror, run_with_sqlite};
 
 use std::collections::HashMap;
 use std::net::IpAddr;

@@ -79,3 +79,27 @@ fn corrupt_file_and_leftover_temp_file_do_not_block_startup() {
     let recovered = LogPositionStore::open(dir.path());
     assert!(recovered.snapshot_resume_points().is_empty());
 }
+
+#[test]
+fn failed_checkpoint_save_leaves_memory_unchanged_and_same_offset_can_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::write(&state_dir, b"not a directory").unwrap();
+    let store = LogPositionStore::open(&state_dir);
+    let key = "sshd\u{1}/var/log/a.log";
+    let pos = sample_pos("/var/log/a.log", Some(2), Some("abcd"), Some(41));
+
+    assert!(store.update_one(key, pos.clone()).is_err());
+    assert!(store.snapshot_resume_points().is_empty());
+    std::fs::remove_file(&state_dir).unwrap();
+    store.update_one(key, pos.clone()).unwrap();
+
+    let reopened = LogPositionStore::open(&state_dir);
+    assert_eq!(
+        reopened
+            .snapshot_resume_points()
+            .get(key)
+            .and_then(ResumePoint::persisted_file_position),
+        Some(&pos),
+    );
+}

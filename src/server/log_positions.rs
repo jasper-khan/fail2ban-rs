@@ -34,6 +34,7 @@ pub(crate) struct LogPositionStore {
     state_dir: PathBuf,
     path: PathBuf,
     positions: Mutex<BTreeMap<String, PersistedFilePosition>>,
+    sqlite_mirror: Option<crate::track::SqliteMirror>,
 }
 
 impl LogPositionStore {
@@ -41,14 +42,40 @@ impl LogPositionStore {
     ///
     /// A missing file starts empty. A corrupted or unsupported file logs a
     /// warning and starts empty rather than blocking daemon startup.
+    #[cfg(test)]
     pub(crate) fn open(state_dir: &Path) -> Self {
+        Self::open_with_sqlite(state_dir, None)
+    }
+
+    pub(crate) fn open_with_sqlite(
+        state_dir: &Path,
+        sqlite_mirror: Option<crate::track::SqliteMirror>,
+    ) -> Self {
         let path = state_dir.join(LOG_POSITIONS_FILENAME);
         let positions = load_from_disk(&path);
         Self {
             state_dir: state_dir.to_path_buf(),
             path,
             positions: Mutex::new(positions),
+            sqlite_mirror,
         }
+    }
+
+    pub(super) fn sqlite_mirror(&self) -> Option<crate::track::SqliteMirror> {
+        self.sqlite_mirror.clone()
+    }
+
+    fn mirror_sqlite(&self, key: &str, pos: &PersistedFilePosition) -> Result<()> {
+        let Some(db) = &self.sqlite_mirror else {
+            return Ok(());
+        };
+        let (jail, _) = key.split_once('\u{1}').ok_or_else(|| {
+            Error::persistence("invalid watcher key for legacy SQLite checkpoint")
+        })?;
+        let hash = pos.first_line_sha1.as_deref().unwrap_or("");
+        let offset = pos.offset.unwrap_or(0);
+        let guard = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.upsert_log(jail, &pos.path.to_string_lossy(), hash, offset)
     }
 
     /// Snapshot all persisted checkpoints as `ResumePoint`s for watcher startup.
@@ -70,15 +97,17 @@ impl LogPositionStore {
         entries: impl IntoIterator<Item = (String, PersistedFilePosition)>,
     ) -> Result<usize> {
         let mut guard = self.lock_positions();
+        let mut next = guard.clone();
         let mut added = 0usize;
         for (key, pos) in entries {
-            if let std::collections::btree_map::Entry::Vacant(entry) = guard.entry(key) {
+            if let std::collections::btree_map::Entry::Vacant(entry) = next.entry(key) {
                 entry.insert(pos);
                 added += 1;
             }
         }
         if added > 0 {
-            self.write_durable_locked(&guard)?;
+            self.write_durable_locked(&next)?;
+            *guard = next;
         }
         Ok(added)
     }
@@ -89,26 +118,36 @@ impl LogPositionStore {
         if guard.get(key) == Some(&pos) {
             return Ok(());
         }
-        guard.insert(key.to_owned(), pos);
-        self.write_durable_locked(&guard)
+        // Both sinks must acknowledge before publishing the new position in
+        // memory. If the JSON write fails after SQLite commits, retry the
+        // idempotent mirror write with the same offset.
+        self.mirror_sqlite(key, &pos)?;
+        let mut next = guard.clone();
+        next.insert(key.to_owned(), pos);
+        self.write_durable_locked(&next)?;
+        *guard = next;
+        Ok(())
     }
 
     /// Update a batch of watcher checkpoints (e.g. on reload or shutdown) and
     /// flush durably if anything changed.
     pub(crate) fn update_batch(&self, points: &HashMap<String, ResumePoint>) -> Result<()> {
         let mut guard = self.lock_positions();
+        let mut next = guard.clone();
         let mut changed = false;
         for (key, point) in points {
             let Some(pos) = point.persisted_file_position() else {
                 continue;
             };
             if guard.get(key) != Some(pos) {
-                guard.insert(key.clone(), pos.clone());
+                self.mirror_sqlite(key, pos)?;
+                next.insert(key.clone(), pos.clone());
                 changed = true;
             }
         }
         if changed {
-            self.write_durable_locked(&guard)?;
+            self.write_durable_locked(&next)?;
+            *guard = next;
         }
         Ok(())
     }
@@ -147,8 +186,7 @@ impl LogPositionStore {
             file.sync_all()?;
             drop(file);
             std::fs::rename(&tmp_path, &self.path)?;
-            sync_dir(&self.state_dir);
-            Ok(())
+            sync_dir(&self.state_dir)
         })();
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
@@ -199,14 +237,14 @@ fn load_from_disk(path: &Path) -> BTreeMap<String, PersistedFilePosition> {
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path) {
-    if let Ok(handle) = std::fs::File::open(dir) {
-        let _ = handle.sync_all();
-    }
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) {}
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]

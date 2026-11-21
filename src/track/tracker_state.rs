@@ -16,6 +16,7 @@ use crate::enforce::FirewallCmd;
 use crate::logging::Logger;
 use crate::track::ban_calc::JailParams;
 use crate::track::circular::CircularTimestamps;
+use crate::track::legacy_fail_manager::LegacyFailManager;
 use crate::track::manual::ManualBanOutcome;
 #[cfg(feature = "maxmind")]
 use crate::track::maxmind::MaxmindState;
@@ -93,8 +94,16 @@ impl PendingManualBans {
 pub(super) struct TrackerState {
     /// Compiled per-jail parameters, keyed by jail id.
     pub(super) jail_params: HashMap<String, JailParams>,
-    /// Active failure buffers, keyed by (ip, jail).
+    /// Active failure buffers, keyed by (ip, jail) (native TOML jails).
     pub(super) failures: HashMap<FailKey, FailState>,
+    /// Parity-proven Fail2Ban 1.1.1 failure managers, keyed by jail id (compat jails).
+    pub(super) legacy_failures: HashMap<String, LegacyFailManager>,
+    /// Optional live mirror to Fail2Ban 1.1.1 v4 SQLite (`--legacy-sqlite-rw`).
+    pub(super) sqlite_mirror:
+        Option<Arc<std::sync::Mutex<crate::track::legacy_sqlite_rw::LegacySqliteDb>>>,
+    /// A detection could not be persisted; freeze durable log progress so
+    /// a restart can replay it instead of silently skipping that input.
+    pub(super) automatic_persistence_failed: bool,
     /// WAL-backed persistent ban state.
     pub(super) store: Arc<Store<BanState, WalBackend<BanState>>>,
     /// In-memory ban index and next-expiry hint.

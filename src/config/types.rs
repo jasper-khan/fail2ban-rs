@@ -78,6 +78,16 @@ pub struct GlobalConfig {
 
     /// Optional path to MaxMind City database
     pub maxmind_city: Option<PathBuf>,
+
+    /// Optional Unix socket speaking upstream Fail2Ban 1.1.1 `fail2ban-client`
+    /// pickle protocol (enabled via `--legacy-socket`).
+    #[serde(skip, default)]
+    pub legacy_socket_path: Option<PathBuf>,
+
+    /// When true, mirror bans, unbans, and acked log checkpoints live into
+    /// Fail2Ban 1.1.1's v4 `fail2ban.sqlite3` (`--legacy-sqlite-rw`).
+    #[serde(skip, default)]
+    pub legacy_sqlite_rw_path: Option<PathBuf>,
 }
 
 /// Per-jail configuration.
@@ -102,6 +112,20 @@ pub struct JailConfig {
     /// The TOML path never sets it (`serde(skip)` keeps it out of TOML).
     #[serde(skip, default)]
     pub legacy_filter: Option<crate::config::legacy_filter::ResolvedFilter>,
+
+    /// True for jails loaded from an original Fail2Ban 1.1.1 configuration
+    /// tree (`--legacy-dir`), routing polling, failure counting, and ban
+    /// timing through the parity-proven legacy engines.
+    #[serde(skip, default)]
+    pub compat_mode: bool,
+
+    /// Multi-line sliding window size (`maxlines` in Fail2Ban 1.1.1, default 1).
+    #[serde(skip, default = "default_max_lines")]
+    pub max_lines: usize,
+
+    /// Character encoding for decoding raw log lines in compat mode.
+    #[serde(skip, default)]
+    pub log_encoding: LogEncoding,
 
     /// Date format preset for timestamp extraction.
     #[serde(default = "default_date_format")]
@@ -228,6 +252,14 @@ pub enum Backend {
         /// Command run to unban an IP.
         unban_cmd: String,
     },
+    /// Resolved Fail2Ban 1.1.1 `action.d` lifecycle commands.
+    #[serde(skip)]
+    LegacyAction {
+        action_start: Option<String>,
+        action_ban: String,
+        action_unban: String,
+        action_stop: Option<String>,
+    },
     /// ipset — per-jail `hash:ip` sets referenced from one iptables rule
     /// per address family, giving O(1) ban lookups.
     Ipset {
@@ -247,6 +279,16 @@ pub enum LogBackend {
     File,
     /// Read from the systemd journal via `journalctl`.
     Systemd,
+}
+
+/// Character encoding used to decode raw log bytes in compatibility mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogEncoding {
+    /// UTF-8 (lossy fallback for invalid sequences, matching Fail2Ban's `replace`).
+    #[default]
+    Utf8,
+    /// ISO-8859-1 / Latin-1 (1:1 byte-to-Unicode scalar mapping).
+    Latin1,
 }
 
 // Defaults
@@ -327,6 +369,8 @@ impl Default for GlobalConfig {
             maxmind_asn: None,
             maxmind_country: None,
             maxmind_city: None,
+            legacy_socket_path: None,
+            legacy_sqlite_rw_path: None,
         }
     }
 }
@@ -338,6 +382,9 @@ impl Default for JailConfig {
             log_path: PathBuf::new(),
             log_paths: Vec::new(),
             legacy_filter: None,
+            compat_mode: false,
+            max_lines: 1,
+            log_encoding: LogEncoding::Utf8,
             date_format: default_date_format(),
             filter: vec![],
             max_retry: default_max_retry(),
@@ -371,3 +418,7 @@ impl Default for JailConfig {
     clippy::needless_pass_by_value
 )]
 mod types_test;
+
+fn default_max_lines() -> usize {
+    1
+}

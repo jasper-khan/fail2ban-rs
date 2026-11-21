@@ -23,6 +23,8 @@ use crate::config::{Config, JailConfig, Source};
 use crate::control::{self, BoundSocket, ControlCmd};
 use crate::detect::watcher::Failure;
 use crate::enforce::{self, FirewallCmd};
+#[cfg(unix)]
+use crate::legacy_protocol::BoundLegacySocket;
 use crate::logging::Logger;
 use crate::track::TrackerCmd;
 use crate::track::state::BanRecord;
@@ -37,7 +39,7 @@ pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
     let cancel = CancellationToken::new();
     // Acquire the private compatibility socket before opening its WAL. A
     // second recorder using the same directory must not race startup import.
-    let bound = if matches!(&source, Source::Fail2BanIni { .. }) {
+    let bound = if source.legacy_dir().is_some() {
         Some(control::bind_recording(
             &config.global.socket_path,
             &config.global.state_dir,
@@ -45,16 +47,31 @@ pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
     } else {
         None
     };
+    #[cfg(unix)]
+    let legacy_bound = config
+        .global
+        .legacy_socket_path
+        .as_deref()
+        .map(|path| crate::legacy_protocol::bind_legacy_socket(path, &config.global.socket_path))
+        .transpose()?;
     // Initialize remote logging (no-op if not configured).
     let logger = Logger::init(&config.logging);
     let mut restored = open_state(&config.global.state_dir).await?;
-    let log_positions = if let Source::Fail2BanIni { dir, .. } = &source {
+    let log_positions = if let Some(dir) = source.legacy_dir() {
         restored::seed_original_once(&mut restored, || {
             let dbfile = crate::config::compat::dbfile_of(dir)?;
             crate::track::legacy_sqlite::restore_bans(&dbfile, &config)
         })?;
-        let positions = Arc::new(log_positions::LogPositionStore::open(
+        let sqlite_mirror = config
+            .global
+            .legacy_sqlite_rw_path
+            .as_ref()
+            .map(|path| crate::track::legacy_sqlite_rw::LegacySqliteDb::open_or_create(path))
+            .transpose()?
+            .map(|db| Arc::new(std::sync::Mutex::new(db)));
+        let positions = Arc::new(log_positions::LogPositionStore::open_with_sqlite(
             &config.global.state_dir,
+            sqlite_mirror,
         ));
         restored::seed_original_logs_once(&restored, &positions, || {
             let dbfile = crate::config::compat::dbfile_of(dir)?;
@@ -73,6 +90,8 @@ pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
         logger,
         cancel,
         bound,
+        #[cfg(unix)]
+        legacy_bound,
     )
     .await?;
     info!(phase = "startup", "fail2ban-rs started");
@@ -89,6 +108,7 @@ pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
 
 /// Wire the channels and spawn the executor, tracker, watchers, and control
 /// socket, returning the daemon state the main loop runs on.
+#[allow(clippy::too_many_arguments)]
 async fn start_tasks(
     config: Config,
     source: Source,
@@ -97,6 +117,7 @@ async fn start_tasks(
     logger: Option<Logger>,
     cancel: CancellationToken,
     bound: Option<BoundSocket>,
+    #[cfg(unix)] legacy_bound: Option<BoundLegacySocket>,
 ) -> crate::error::Result<Daemon> {
     // Compile every watcher up front so a bad filter fails before any task
     // or firewall rule exists.
@@ -104,7 +125,18 @@ async fn start_tasks(
     let (failure_tx, failure_rx) = mpsc::channel::<Failure>(config.global.channel_size);
     let (tracker_cmd_tx, tracker_cmd_rx) = mpsc::channel::<TrackerCmd>(32);
     let tracker_io = (failure_rx, tracker_cmd_rx, tracker_cmd_tx.clone());
-    let executor_tx = start_core(&config, restored, tracker_io, logger.clone(), &cancel).await?;
+    let sqlite_mirror = log_positions
+        .as_ref()
+        .and_then(|store| store.sqlite_mirror());
+    let executor_tx = start_core(
+        &config,
+        restored,
+        tracker_io,
+        logger.clone(),
+        sqlite_mirror,
+        &cancel,
+    )
+    .await?;
     // Watchers keep their own token and join handles, so a reload can hand
     // each jail's read position to its replacement.
     let initial_resume = log_positions
@@ -118,7 +150,15 @@ async fn start_tasks(
         log_positions,
         Some(tracker_cmd_tx.clone()),
     );
-    let control_rx = spawn_control(&config, &cancel, bound);
+    let shutdown_req = CancellationToken::new();
+    let control_rx = spawn_control(
+        &config,
+        &cancel,
+        &shutdown_req,
+        bound,
+        #[cfg(unix)]
+        legacy_bound,
+    );
     Ok(Daemon {
         config,
         source,
@@ -129,6 +169,7 @@ async fn start_tasks(
         watchers,
         logger,
         cancel,
+        shutdown_req,
     })
 }
 
@@ -146,6 +187,7 @@ async fn start_core(
     restored: Restored,
     (failure_rx, cmd_rx, tracker_tx): TrackerIo,
     logger: Option<Logger>,
+    sqlite_mirror: Option<crate::track::SqliteMirror>,
     cancel: &CancellationToken,
 ) -> crate::error::Result<mpsc::Sender<FirewallCmd>> {
     let (executor_tx, executor_rx) = mpsc::channel::<FirewallCmd>(config.global.channel_size);
@@ -155,7 +197,7 @@ async fn start_core(
     if let Some(t) = logger.as_ref() {
         t.log_startup(jail_configs.len(), active_bans.len());
     }
-    tokio::spawn(crate::track::run(
+    tokio::spawn(crate::track::run_with_sqlite(
         config.global.clone(),
         jail_configs,
         failure_rx,
@@ -166,6 +208,7 @@ async fn start_core(
         restored.ban_counts,
         restored.store,
         logger,
+        sqlite_mirror,
         cancel.child_token(),
     ));
     Ok(executor_tx)
@@ -175,9 +218,28 @@ async fn start_core(
 fn spawn_control(
     config: &Config,
     cancel: &CancellationToken,
+    shutdown_req: &CancellationToken,
     bound: Option<BoundSocket>,
+    #[cfg(unix)] legacy_bound: Option<BoundLegacySocket>,
 ) -> mpsc::Receiver<ControlCmd> {
     let (control_tx, control_rx) = mpsc::channel::<ControlCmd>(32);
+    #[cfg(unix)]
+    if let Some(legacy_sock) = legacy_bound {
+        let legacy_tx = control_tx.clone();
+        let legacy_cancel = cancel.child_token();
+        let stop_token = shutdown_req.clone();
+        tokio::spawn(async move {
+            crate::legacy_protocol::run_legacy_socket(
+                legacy_sock,
+                legacy_tx,
+                legacy_cancel,
+                stop_token,
+            )
+            .await;
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = shutdown_req;
     let socket_path = config.global.socket_path.clone();
     let control_cancel = cancel.child_token();
     tokio::spawn(async move {
@@ -251,6 +313,7 @@ struct Daemon {
     watchers: Watchers,
     logger: Option<Logger>,
     cancel: CancellationToken,
+    shutdown_req: CancellationToken,
 }
 
 impl Daemon {
@@ -261,6 +324,10 @@ impl Daemon {
         let mut signals = Signals::register();
         loop {
             tokio::select! {
+                () = self.shutdown_req.cancelled() => {
+                    self.shutdown().await;
+                    return Ok(());
+                }
                 sig = signals.next() => match sig {
                     DaemonSignal::Shutdown => {
                         self.shutdown().await;

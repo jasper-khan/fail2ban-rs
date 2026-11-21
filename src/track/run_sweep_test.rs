@@ -29,6 +29,7 @@ impl LoopHarness {
         let (resolve_tx, resolve_rx) = mpsc::channel(8);
         let (unban_outcome_tx, unban_rx) = mpsc::channel(8);
         let io = StateIo {
+            sqlite_mirror: None,
             executor_tx,
             reconcile: false,
             resolve_tx,
@@ -128,4 +129,27 @@ async fn test_event_loop_stale_failure_retained_before_sweep() {
     h.send_stale_failure(1).await;
     h.wait_for_failures(1).await;
     assert_eq!(h.shutdown_failure_count().await, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn checkpoint_is_not_acknowledged_after_a_detection_write_failed() {
+    let store = crate::track::fault_support::FaultStore::open();
+    let mut rig = crate::track::fault_support::rig(store.store());
+    let (_sender, mut failure_rx) = mpsc::channel(1);
+
+    // The store itself can still flush, but a past failed write means that
+    // returning true would let the reader skip an unrecorded detection.
+    rig.state.store.flush().unwrap();
+    rig.state.automatic_persistence_failed = true;
+    let (respond, ack) = oneshot::channel();
+    assert!(
+        handle_event(
+            Event::Cmd(Some(TrackerCmd::DrainFailuresAndFlush { respond })),
+            &mut rig.state,
+            &mut failure_rx,
+        )
+        .await
+    );
+    assert!(!ack.await.unwrap());
 }

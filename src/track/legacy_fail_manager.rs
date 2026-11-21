@@ -139,6 +139,10 @@ impl LegacyFailManager {
             .map(|entry| &entry.ticket)
     }
 
+    pub(crate) fn params(&self) -> (u64, u64) {
+        (self.max_retry, self.find_time)
+    }
+
     pub(crate) fn total_failures(&self) -> u64 {
         self.total_failures
     }

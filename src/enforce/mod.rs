@@ -12,6 +12,8 @@ pub mod ipset;
 /// iptables firewall backend.
 pub mod iptables;
 // Independently test original action semantics with inert typed steps.
+/// Script-based firewall backend.
+pub mod legacy_action_backend;
 #[allow(dead_code)]
 mod legacy_action_bindings;
 #[allow(dead_code)]
@@ -28,7 +30,6 @@ mod legacy_action_tags_parity_test;
 pub mod nftables;
 /// Startup restore of persisted bans.
 mod restore;
-/// Script-based firewall backend.
 pub mod script;
 
 pub use executor::run;
@@ -285,6 +286,17 @@ pub fn create_backend(backend: &Backend) -> Result<Box<dyn FirewallBackend>> {
         Backend::Script { ban_cmd, unban_cmd } => Ok(Box::new(ScriptBackend::new(
             ban_cmd.clone(),
             unban_cmd.clone(),
+        ))),
+        Backend::LegacyAction {
+            action_start,
+            action_ban,
+            action_unban,
+            action_stop,
+        } => Ok(Box::new(legacy_action_backend::LegacyActionBackend::new(
+            action_start.clone(),
+            action_ban.clone(),
+            action_unban.clone(),
+            action_stop.clone(),
         ))),
     }
 }

@@ -14,6 +14,7 @@ fn base_params() -> JailParams {
         bantime_factor: 1.0,
         bantime_multipliers: vec![],
         bantime_maxtime: 604_800,
+        compat_mode: false,
     }
 }
 
@@ -173,6 +174,9 @@ fn test_jail_config() -> JailConfig {
         log_path: "/tmp/test.log".into(),
         log_paths: Vec::new(),
         legacy_filter: None,
+        compat_mode: false,
+        max_lines: 1,
+        log_encoding: crate::config::LogEncoding::Utf8,
         filter: vec!["from <HOST>".to_string()],
         ..JailConfig::default()
     }

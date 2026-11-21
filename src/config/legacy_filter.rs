@@ -44,6 +44,10 @@ pub struct ResolvedFilter {
     /// Integer conversion after all config substitutions. Like upstream, an
     /// absent or malformed integer is unset; outside i64 is also unset here.
     pub(crate) maxlines: Option<i64>,
+    /// True when this filter resolved to stock Fail2Ban 1.1.1 `sshd` normal
+    /// mode (file logtype, `publickey=nofail`, empty ignoreregex), routed
+    /// through the parity-proven `LegacySshSessions` engine.
+    pub(crate) ssh_normal: bool,
 }
 
 /// Load a FilterReader name, not an explicit file for fail2ban-regex.
@@ -198,6 +202,7 @@ pub(super) fn resolve(config: &LayeredConfig, params: &Parameters<'_>) -> Result
     Ok(ResolvedFilter {
         options: final_options,
         maxlines,
+        ssh_normal: false,
     })
 }
 

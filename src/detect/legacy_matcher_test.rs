@@ -20,6 +20,7 @@ fn filter(prefix: Option<&str>, failures: &str, ignores: &str) -> ResolvedFilter
     }
     ResolvedFilter {
         options,
+        ssh_normal: false,
         maxlines: Some(1),
     }
 }

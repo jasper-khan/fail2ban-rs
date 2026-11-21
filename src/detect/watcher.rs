@@ -29,7 +29,7 @@ use crate::track::TrackerCmd;
 /// failure in `failure_rx` has been processed and the WAL flushed durably.
 pub(crate) struct CheckpointCommitter {
     pub(crate) tracker_cmd_tx: mpsc::Sender<TrackerCmd>,
-    pub(crate) commit: Box<dyn FnMut(PersistedFilePosition) + Send>,
+    pub(crate) commit: Box<dyn FnMut(PersistedFilePosition) -> bool + Send>,
 }
 
 /// A detected authentication failure.
@@ -49,6 +49,7 @@ pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Capacity of the channel between the blocking reader and the async task.
 const LINE_CHANNEL_CAPACITY: usize = 256;
+const CHECKPOINT_RETRY: Duration = Duration::from_secs(1);
 
 /// Run a watcher task for a single jail, starting at the end of the log.
 ///
@@ -117,6 +118,9 @@ pub async fn run_from(
         resume,
         Arc::new(AtomicBool::new(false)),
         None,
+        false,
+        1,
+        crate::config::LogEncoding::Utf8,
     )
     .await
 }
@@ -136,6 +140,9 @@ pub(crate) async fn run_supervised_from(
     resume: Option<ResumePoint>,
     handoff: Arc<AtomicBool>,
     mut committer: Option<CheckpointCommitter>,
+    use_legacy_poller: bool,
+    max_lines: usize,
+    log_encoding: crate::config::LogEncoding,
 ) -> Option<ResumePoint> {
     info!(phase, jail = %jail_id, path = %log_path.display(), "watcher started");
 
@@ -145,6 +152,24 @@ pub(crate) async fn run_supervised_from(
     let start = resume.and_then(ResumePoint::into_file_start);
     let emit_checkpoints = committer.is_some();
     let reader_handle = tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        if use_legacy_poller {
+            return crate::detect::legacy_poll_reader::read_loop(
+                reader_jail,
+                log_path,
+                matcher,
+                date_parser,
+                ignore_list,
+                line_tx,
+                rc,
+                start,
+                emit_checkpoints,
+                max_lines,
+                log_encoding,
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = (use_legacy_poller, max_lines, log_encoding);
         read_loop(
             reader_jail,
             log_path,
@@ -202,9 +227,36 @@ async fn forward(
     cancel: &CancellationToken,
     mut committer: Option<&mut CheckpointCommitter>,
 ) -> Stop {
+    let mut pending: Option<PersistedFilePosition> = None;
+    let mut retry_at = tokio::time::Instant::now();
     loop {
         let event = tokio::select! {
             () = cancel.cancelled() => return Stop::Cancelled(None),
+            () = tokio::time::sleep_until(retry_at), if pending.is_some() => {
+                let (Some(pos), Some(committer)) = (pending.as_ref(), committer.as_deref_mut()) else {
+                    continue;
+                };
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                let sent = tokio::select! {
+                    () = cancel.cancelled() => return Stop::Cancelled(None),
+                    res = committer.tracker_cmd_tx.send(TrackerCmd::DrainFailuresAndFlush { respond: ack_tx }) => res,
+                };
+                if sent.is_err() {
+                    debug!(jail = %jail_id, reason = "tracker_closed", "checkpoint skipped");
+                    pending = None;
+                    continue;
+                }
+                let ack = tokio::select! {
+                    () = cancel.cancelled() => return Stop::Cancelled(None),
+                    res = ack_rx => res,
+                };
+                if matches!(ack, Ok(true)) && (committer.commit)(pos.clone()) {
+                    pending = None;
+                } else {
+                    retry_at = tokio::time::Instant::now() + CHECKPOINT_RETRY;
+                }
+                continue;
+            },
             ev = line_rx.recv() => match ev {
                 Some(ev) => ev,
                 None => return Stop::Done, // reader exited
@@ -224,24 +276,14 @@ async fn forward(
                 }
             }
             ReaderEvent::Checkpoint(pos) => {
-                let Some(committer) = committer.as_deref_mut() else {
-                    continue;
-                };
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                let sent = tokio::select! {
-                    () = cancel.cancelled() => return Stop::Cancelled(None),
-                    res = committer.tracker_cmd_tx.send(TrackerCmd::DrainFailuresAndFlush { respond: ack_tx }) => res,
-                };
-                if sent.is_err() {
-                    debug!(jail = %jail_id, reason = "tracker_closed", "checkpoint skipped");
-                    continue;
-                }
-                let ack = tokio::select! {
-                    () = cancel.cancelled() => return Stop::Cancelled(None),
-                    res = ack_rx => res,
-                };
-                if matches!(ack, Ok(true)) {
-                    (committer.commit)(pos);
+                if committer.is_some() {
+                    if pending.is_none() {
+                        retry_at = tokio::time::Instant::now();
+                    }
+                    // FIFO forwarding makes every later checkpoint a safe
+                    // replacement for a pending older position, including
+                    // across a rotation.
+                    pending = Some(pos);
                 }
             }
         }

@@ -359,6 +359,7 @@ async fn test_checkpoint_not_committed_before_tracker_drains_and_flushes_failure
     let cancel = CancellationToken::new();
     let committed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let committed_sink = Arc::clone(&committed);
+    let mut fail_nonzero_save_once = true;
 
     let matcher = LineMatcher::Modern(
         crate::detect::matcher::JailMatcher::new(&[
@@ -373,8 +374,12 @@ async fn test_checkpoint_not_committed_before_tracker_drains_and_flushes_failure
         tracker_cmd_tx: cmd_tx,
         commit: Box::new(move |pos| {
             if let Some(off) = pos.offset {
+                if off > 0 && std::mem::take(&mut fail_nonzero_save_once) {
+                    return false;
+                }
                 committed_sink.lock().unwrap().push(off);
             }
+            true
         }),
     };
 
@@ -390,6 +395,9 @@ async fn test_checkpoint_not_committed_before_tracker_drains_and_flushes_failure
         None,
         Arc::new(AtomicBool::new(false)),
         Some(committer),
+        false,
+        1,
+        crate::config::LogEncoding::Utf8,
     ));
 
     // Initial empty-file checkpoint barrier (offset 0): acknowledge it.
@@ -434,6 +442,31 @@ async fn test_checkpoint_not_committed_before_tracker_drains_and_flushes_failure
     let _ = respond1.send(false);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(*committed.lock().unwrap(), vec![0]);
+
+    // With no further writes, the watcher requests a fresh barrier. The
+    // first durable callback fails; a second retry commits the same offset.
+    for attempt in 0..2 {
+        let cmd = tokio::time::timeout(Duration::from_secs(3), cmd_rx.recv())
+            .await
+            .expect("retry barrier timeout")
+            .expect("retry command");
+        let crate::track::TrackerCmd::DrainFailuresAndFlush { respond } = cmd else {
+            panic!("expected retry checkpoint barrier");
+        };
+        assert_eq!(*committed.lock().unwrap(), vec![0]);
+        respond.send(true).expect("retry barrier still active");
+        if attempt == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(*committed.lock().unwrap(), vec![0]);
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while committed.lock().unwrap().last().copied() != Some(line1.len() as u64) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry saved unchanged checkpoint");
 
     // Append a second failure line and acknowledge flush -> checkpoint advances to full file length.
     let line2 =

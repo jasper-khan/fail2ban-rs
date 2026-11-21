@@ -102,6 +102,9 @@ pub(crate) fn rig(store: BanStore) -> Rig {
     let state = TrackerState {
         jail_params: build_jail_params(&jails),
         failures: HashMap::new(),
+        legacy_failures: HashMap::new(),
+        automatic_persistence_failed: false,
+        sqlite_mirror: None,
         store,
         index: BanIndex::default(),
         counters: Counters::default(),

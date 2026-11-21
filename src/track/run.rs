@@ -17,6 +17,7 @@ use crate::track::TrackerCmd;
 use crate::track::ban_calc::build_jail_params;
 use crate::track::commands::handle_cmd;
 use crate::track::failure::handle_failure;
+use crate::track::legacy_fail_manager::LegacyFailManager;
 use crate::track::manual::{ManualBanOutcome, handle_manual_ban_outcome};
 #[cfg(feature = "maxmind")]
 use crate::track::maxmind::MaxmindState;
@@ -52,12 +53,58 @@ pub async fn run(
     logger: Option<Logger>,
     cancel: CancellationToken,
 ) {
+    let sqlite_mirror = match global_config.legacy_sqlite_rw_path.as_deref() {
+        Some(path) => match crate::track::legacy_sqlite_rw::LegacySqliteDb::open_or_create(path) {
+            Ok(db) => Some(Arc::new(std::sync::Mutex::new(db))),
+            Err(error) => {
+                error!(path = %path.display(), %error, "failure tracker cannot open required SQLite mirror");
+                return;
+            }
+        },
+        None => None,
+    };
+    run_with_sqlite(
+        global_config,
+        jail_configs,
+        failure_rx,
+        cmd_rx,
+        executor_tx,
+        reconcile,
+        restored_bans,
+        restored_ban_counts,
+        store,
+        logger,
+        sqlite_mirror,
+        cancel,
+    )
+    .await;
+}
+
+pub(crate) type SqliteMirror =
+    Arc<std::sync::Mutex<crate::track::legacy_sqlite_rw::LegacySqliteDb>>;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_sqlite(
+    global_config: crate::config::GlobalConfig,
+    jail_configs: HashMap<String, JailConfig>,
+    failure_rx: mpsc::Receiver<Failure>,
+    cmd_rx: mpsc::Receiver<TrackerCmd>,
+    executor_tx: mpsc::Sender<FirewallCmd>,
+    reconcile: bool,
+    restored_bans: Vec<BanRecord>,
+    restored_ban_counts: HashMap<IpAddr, BanCount>,
+    store: Arc<Store<BanState, WalBackend<BanState>>>,
+    logger: Option<Logger>,
+    sqlite_mirror: Option<SqliteMirror>,
+    cancel: CancellationToken,
+) {
     info!(phase = "startup", "failure tracker started");
     warn_maxmind_disabled(&global_config);
 
     let (resolve_tx, resolve_rx) = mpsc::channel(RESOLVE_CHANNEL_SIZE);
     let (unban_outcome_tx, unban_outcome_rx) = mpsc::channel(RESOLVE_CHANNEL_SIZE);
     let io = StateIo {
+        sqlite_mirror,
         executor_tx,
         reconcile,
         resolve_tx,
@@ -160,6 +207,10 @@ async fn handle_event(
             while let Ok(f) = failure_rx.try_recv() {
                 handle_failure(f, s).await;
             }
+            if s.automatic_persistence_failed {
+                let _ = respond.send(false);
+                return true;
+            }
             let flushed = match s.store.flush() {
                 Ok(()) => true,
                 Err(e) => {
@@ -199,6 +250,7 @@ fn input_closed(channel: &'static str) -> bool {
 
 /// Channels and handles moved into the tracker state at startup.
 struct StateIo {
+    sqlite_mirror: Option<SqliteMirror>,
     executor_tx: mpsc::Sender<FirewallCmd>,
     reconcile: bool,
     resolve_tx: mpsc::Sender<ManualBanOutcome>,
@@ -230,9 +282,21 @@ fn init_state(
     jail_configs: &HashMap<String, JailConfig>,
     io: StateIo,
 ) -> TrackerState {
+    let legacy_failures = jail_configs
+        .iter()
+        .filter(|(_, cfg)| cfg.compat_mode)
+        .map(|(name, cfg)| {
+            (
+                name.clone(),
+                LegacyFailManager::new(u64::from(cfg.max_retry), cfg.find_time.max(0) as u64),
+            )
+        })
+        .collect();
     TrackerState {
         jail_params: build_jail_params(jail_configs),
         failures: HashMap::new(),
+        legacy_failures,
+        automatic_persistence_failed: false,
         store: io.store,
         index: BanIndex::default(),
         counters: Counters::default(),
@@ -247,6 +311,7 @@ fn init_state(
         reconcile_enabled: io.reconcile,
         reconcile_queue: VecDeque::new(),
         logger: io.logger,
+        sqlite_mirror: io.sqlite_mirror,
         #[cfg(feature = "maxmind")]
         maxmind: MaxmindState::load(global_config, jail_configs),
     }

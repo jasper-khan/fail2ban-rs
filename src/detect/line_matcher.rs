@@ -6,10 +6,14 @@
 //! and initial/live timestamp correction. File scheduling is unchanged.
 
 use std::net::IpAddr;
+use std::sync::Mutex;
+
+use chrono::Datelike;
 
 use crate::detect::date::DateParser;
 use crate::detect::legacy_matcher::{LegacyMatcher, LineResult};
 use crate::detect::legacy_observation_time::{DateObservation, FilePhase, ObservationClock};
+use crate::detect::legacy_ssh_sessions::LegacySshSessions;
 use crate::detect::matcher::JailMatcher;
 use crate::error::Result;
 
@@ -23,9 +27,26 @@ pub(crate) struct LineMatch {
 /// The per-line engine of one watcher: the native pattern pipeline or the
 /// parity-proven original 1.1.1 matcher. Public because [`crate::detect::watcher::run`]
 /// takes it in its signature.
+/// Stateful wrapper around the parity-proven Fail2Ban 1.1.1 SSH normal-mode
+/// session engine (`LegacySshSessions`).
+pub struct LegacySshMatcher {
+    sessions: Mutex<LegacySshSessions>,
+    find_time: i64,
+}
+
+impl LegacySshMatcher {
+    fn new(find_time: i64) -> Self {
+        Self {
+            sessions: Mutex::new(LegacySshSessions::new()),
+            find_time,
+        }
+    }
+}
+
 pub enum LineMatcher {
     Modern(JailMatcher),
     Legacy(LegacyMatcher),
+    LegacySsh(LegacySshMatcher),
 }
 
 impl LineMatcher {
@@ -43,16 +64,19 @@ impl LineMatcher {
         filter: &crate::config::legacy_filter::ResolvedFilter,
         find_time: i64,
     ) -> Result<Self> {
+        if filter.ssh_normal {
+            return Ok(Self::LegacySsh(LegacySshMatcher::new(find_time)));
+        }
         let mut compiled = LegacyMatcher::compile(filter)?;
         compiled.file_find_time = Some(find_time);
         Ok(Self::Legacy(compiled))
     }
 
     pub(super) fn file_timing(&self) -> Option<FileTiming> {
-        if let Self::Legacy(matcher) = self {
-            matcher.file_find_time.map(FileTiming::new)
-        } else {
-            None
+        match self {
+            Self::Legacy(matcher) => matcher.file_find_time.map(FileTiming::new),
+            Self::LegacySsh(matcher) => Some(FileTiming::new(matcher.find_time)),
+            Self::Modern(_) => None,
         }
     }
 
@@ -93,6 +117,29 @@ impl LineMatcher {
                     }),
                     LineResult::Ignored { .. } | LineResult::Miss => None,
                 }
+            }
+            Self::LegacySsh(m) => {
+                let observed_at = now();
+                let year = chrono::DateTime::from_timestamp(observed_at, 0)
+                    .map_or_else(|| chrono::Utc::now().year(), |dt| dt.year());
+                let failure = m
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .evaluate(line, year, observed_at)?;
+                let timestamp = if let Some(timing) = file_timing {
+                    timing.observation.admit(
+                        DateObservation::Parsed(failure.timestamp),
+                        observed_at,
+                        timing.phase,
+                    )?
+                } else {
+                    failure.timestamp
+                };
+                Some(LineMatch {
+                    ip: failure.ip,
+                    timestamp,
+                })
             }
         }
     }
@@ -139,6 +186,7 @@ mod tests {
         .collect();
         LineMatcher::legacy(
             &ResolvedFilter {
+                ssh_normal: false,
                 options,
                 maxlines: Some(1),
             },

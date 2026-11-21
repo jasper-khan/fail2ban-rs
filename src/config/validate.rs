@@ -246,6 +246,19 @@ impl Config {
                 Self::validate_ipset_backend(name, maxelem, chain)
             }
             Backend::Nftables | Backend::Iptables => Ok(()),
+            Backend::LegacyAction {
+                ref action_ban,
+                ref action_unban,
+                ..
+            } => {
+                if action_ban.trim().is_empty() || action_unban.trim().is_empty() {
+                    Err(Error::config(format!(
+                        "jail '{name}': legacy action requires non-empty actionban and actionunban"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -375,7 +388,7 @@ fn v6_set_suffix(backend: &Backend) -> Option<(&'static str, &'static str)> {
     match backend {
         Backend::Nftables => Some(("nftables", nftables::V6_SET_SUFFIX)),
         Backend::Ipset { .. } => Some(("ipset", ipset::V6_SET_SUFFIX)),
-        Backend::Iptables | Backend::Script { .. } => None,
+        Backend::Iptables | Backend::Script { .. } | Backend::LegacyAction { .. } => None,
     }
 }
 
