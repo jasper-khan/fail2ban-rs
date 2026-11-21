@@ -141,6 +141,9 @@ pub(super) fn spawn_watchers(
         .into_iter()
         .map(|plan| {
             let start = resume.remove(&plan.key);
+            if start.is_some() {
+                debug!(key = %plan.key, "watcher plan resuming from a recorded point");
+            }
             let key = plan.key.clone();
             let handle = spawn_one(
                 plan,

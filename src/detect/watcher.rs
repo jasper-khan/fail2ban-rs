@@ -149,6 +149,11 @@ pub(crate) async fn run_supervised_from(
     let stop = forward(&jail_id, &mut line_rx, &tx, &cancel).await;
     let drained = stop_reader(&jail_id, stop, line_rx, &tx, &reader_cancel, &handoff).await;
     let resume = join_reader(&jail_id, reader_handle).await;
+    if resume.is_some() {
+        debug!(jail = %jail_id, "watcher handing over a position");
+    } else {
+        debug!(jail = %jail_id, "watcher handing over no position");
+    }
     drained_resume(&jail_id, drained, resume)
 }
 

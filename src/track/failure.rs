@@ -52,6 +52,17 @@ fn record_failure(failure: &Failure, key: FailKey, s: &mut TrackerState) -> bool
         timestamps: CircularTimestamps::new(max_retry as usize),
     });
     fail_state.timestamps.push(failure.timestamp);
+    debug!(
+        ip = %failure.ip,
+        jail = %failure.jail_id,
+        find_time,
+        max_retry,
+        win_len = fail_state.timestamps.len(),
+        win_cap = fail_state.timestamps.capacity(),
+        oldest = ?fail_state.timestamps.oldest(),
+        newest = ?fail_state.timestamps.newest(),
+        "failure window pushed"
+    );
     fail_state.timestamps.threshold_reached(find_time)
 }
 

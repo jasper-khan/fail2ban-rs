@@ -207,9 +207,15 @@ is its own watcher and per-file resume point, and failures merge under
 one jail id. SIGHUP reloads the tree and hands every log position to the
 replacement watchers without dropping or duplicating a line. Still
 outside the compatibility subset: journal sources, multi-line filters,
-general date patterns, DNS lookups. The TOML configuration remains the
-production path until the remaining surface (journal, actions, database,
-client protocol) is covered.
+general date patterns, DNS lookups. On compatibility startups the daemon
+also reads the original `fail2ban.sqlite3` `bips` table directly
+(read-only) through the pinned-parity restore projection, so an upgraded
+keeper inherits unexpired bans: the original search window, permanent bans
+capped at the jail's current ban time, and the WAL authoritative for
+pairs it already knows. The original database itself is not written. The
+TOML configuration remains the production path until the remaining
+surface (journal, actions, database write-back, client protocol) is
+covered.
 
 The internal
 reader's file precedence, configuration merging, and the whole stock

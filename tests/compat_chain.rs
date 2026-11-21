@@ -11,7 +11,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use chrono::{Datelike, Timelike};
 
 /// Wall-clock deadline for one wait_for poll loop before the test fails.
 const WAIT: Duration = Duration::from_secs(20);
@@ -56,6 +58,7 @@ fn spawn_daemon(base: &Path, record: &Path) -> std::io::Result<Daemon> {
         .arg(base)
         .arg("--record-decisions")
         .arg(record)
+        .env("RUST_LOG", "debug")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -88,6 +91,11 @@ impl Daemon {
             .any(|line| line.contains(needle))
     }
 
+    /// Everything the daemon has printed, for failure context.
+    fn stderr(&self) -> Vec<String> {
+        self.lines.lock().expect("stderr lock").clone()
+    }
+
     /// SIGTERM, wait for exit, and check the status code.
     fn terminate(mut self) -> std::process::ExitStatus {
         self.signal("TERM");
@@ -105,55 +113,35 @@ impl Daemon {
     }
 }
 
-/// Poll `probe` until it returns true or the deadline passes.
-fn wait_for(what: &str, probe: impl Fn() -> bool) {
+/// Poll `probe` until it returns true or the deadline passes, dumping the
+/// daemon's stderr in the failure message.
+fn wait_for(what: &str, daemon: &Daemon, probe: impl Fn() -> bool) {
     let deadline = Instant::now() + WAIT;
     loop {
         if probe() {
             return;
         }
-        assert!(Instant::now() <= deadline, "timed out waiting for {what}");
+        assert!(
+            Instant::now() <= deadline,
+            "timed out waiting for {what}; daemon said: {:#?}",
+            daemon.stderr()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// A syslog-prefixed line with the current wall time. The concrete date
-/// does not matter for the test; all lines share the helper's clock.
+/// A syslog-prefixed line dated now. The daemon's date parser must land the
+/// failure inside the jail's findtime window against the wall clock, so the
+/// date is the true calendar date (chrono, not a hand-rolled %365 calendar).
 fn syslog_line(body: &str) -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("wall clock")
-        .as_secs();
-    const MONTH_DAYS: [(&str, u32); 12] = [
-        ("Jan", 31),
-        ("Feb", 28),
-        ("Mar", 31),
-        ("Apr", 30),
-        ("May", 31),
-        ("Jun", 30),
-        ("Jul", 31),
-        ("Aug", 31),
-        ("Sep", 30),
-        ("Oct", 31),
-        ("Nov", 30),
-        ("Dec", 31),
-    ];
-    let mut rest = ((secs / 86_400) % 365) as u32;
-    let secs_of_day = secs % 86_400;
-    let mut month = "Jan";
-    for (name, days) in MONTH_DAYS {
-        if rest < days {
-            month = name;
-            break;
-        }
-        rest -= days;
-    }
+    let now = chrono::Local::now();
     format!(
-        "{month} {:2} {:02}:{:02}:{:02} srv {body}",
-        rest + 1,
-        secs_of_day / 3_600,
-        (secs_of_day % 3_600) / 60,
-        secs_of_day % 60,
+        "{} {:2} {:02}:{:02}:{:02} srv {body}",
+        now.format("%b"),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
     )
 }
 
@@ -204,6 +192,45 @@ fn nginx_failure() -> String {
     "2026/11/21 15:00:01 [error] 123#123: *4 user \"bob\": password mismatch, \
      client: 192.0.2.10, server: auth.example"
         .to_owned()
+}
+
+/// The original `bips` schema, copied from Fail2Ban 1.1.1 database.py.
+const BIPS_DDL: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS bips(",
+    "ip TEXT NOT NULL, ",
+    "jail TEXT NOT NULL, ",
+    "timeofban INTEGER NOT NULL, ",
+    "bantime INTEGER NOT NULL, ",
+    "bancount INTEGER NOT NULL default 1, ",
+    "data JSON, ",
+    "PRIMARY KEY(ip, jail)",
+    ");",
+    "CREATE INDEX IF NOT EXISTS bips_timeofban ON bips(timeofban);",
+    "CREATE INDEX IF NOT EXISTS bips_ip ON bips(ip);",
+);
+
+/// Seed one unexpired original ban for the given jail.
+fn seed_original_db(path: &Path, jail: &str, ip: &str, time_of_ban: f64, ban_time: i64) {
+    use rusqlite::Connection;
+    let connection = Connection::open(path).expect("create original database");
+    connection.execute_batch(BIPS_DDL).expect("original DDL");
+    connection
+        .execute(
+            &format!(
+                "INSERT INTO bips(ip, jail, timeofban, bantime, bancount, data) \
+                 VALUES('{ip}', '{jail}', {time_of_ban}, {ban_time}, 1, NULL)"
+            ),
+            [],
+        )
+        .expect("seed original ban");
+}
+
+/// Wall-clock seconds, shared by the seeded row and the test schedule.
+fn wall_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_secs() as f64
 }
 
 /// The recorded decision lines, "KIND jail ip" each.
@@ -292,21 +319,47 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     // Pre-start content must be ignored: the daemon tails from EOF.
     web1.append(vec![failure("9.9.9.9")]);
 
+    // Seed an original 1.1.1 ban database: an unexpired ban from one second
+    // ago must be re-applied at startup and expire three seconds in.
+    seed_original_db(
+        &state.join("fail2ban.sqlite3"),
+        "chain-jail",
+        "4.4.4.4",
+        wall_now() - 1.0,
+        4,
+    );
+
     let daemon = spawn_daemon(&base, &record).expect("spawn daemon");
-    wait_for("daemon startup", || daemon.saw("fail2ban-rs started"));
+    wait_for("daemon startup", &daemon, || {
+        daemon.saw("fail2ban-rs started")
+    });
+
+    // The restored original ban re-applies before any log line is read; it
+    // must be the daemon's first recorded decision.
+    wait_for("original ban restored at startup", &daemon, || {
+        decisions(&record)
+            .first()
+            .is_some_and(|line| line == "BAN chain-jail 4.4.4.4")
+    });
+    assert_eq!(
+        decisions(&record).first().map(String::as_str),
+        Some("BAN chain-jail 4.4.4.4"),
+        "restoration is the first decision: {:?}",
+        decisions(&record)
+    );
 
     // Failures from BOTH log files merge into one jail counter.
     web1.append(vec![failure("1.2.3.4")]);
     web2.append(vec![failure("1.2.3.4")]);
     web1.append(vec![failure("1.2.3.4")]);
-    wait_for("first ban across both logs", || {
+    wait_for("first ban across both logs", &daemon, || {
         decisions(&record).contains(&"BAN chain-jail 1.2.3.4".to_owned())
     });
 
     // The stock nginx class (prefregex, {^LN-BEG}) runs through the
     // parity-proven original engine in the same daemon.
     web3.append(vec![nginx_failure(), nginx_failure(), nginx_failure()]);
-    wait_for("legacy-engine ban", || {
+    wait_for("legacy-engine ban", &daemon, || {
         decisions(&record).contains(&"BAN nginx-class 192.0.2.10".to_owned())
     });
 
@@ -316,13 +369,13 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     // Reload, and feed one failure into the handover window right away.
     daemon.signal("HUP");
     web2.append(vec![failure("7.7.7.8")]);
-    wait_for("config reload marker", || {
+    wait_for("config reload marker", &daemon, || {
         daemon.saw("config reload complete")
     });
 
     // The pre-reload counter survives the reload: one more failure bans.
     web2.append(vec![failure("5.6.7.8")]);
-    wait_for("post-reload ban", || {
+    wait_for("post-reload ban", &daemon, || {
         decisions(&record).contains(&"BAN chain-jail 5.6.7.8".to_owned())
     });
 
@@ -337,22 +390,24 @@ fn compat_chain_survives_reload_without_miss_or_duplicate() {
     );
     // ...and the third one crosses the threshold.
     web2.append(vec![failure("7.7.7.8")]);
-    wait_for("handover-counted ban", || {
+    wait_for("handover-counted ban", &daemon, || {
         decisions(&record).contains(&"BAN chain-jail 7.7.7.8".to_owned())
     });
 
     // Every ban expires and unbans exactly once.
     let expected = [
+        "BAN chain-jail 4.4.4.4",
         "BAN chain-jail 1.2.3.4",
         "BAN nginx-class 192.0.2.10",
         "BAN chain-jail 5.6.7.8",
         "BAN chain-jail 7.7.7.8",
+        "UNBAN chain-jail 4.4.4.4",
         "UNBAN chain-jail 1.2.3.4",
         "UNBAN nginx-class 192.0.2.10",
         "UNBAN chain-jail 5.6.7.8",
         "UNBAN chain-jail 7.7.7.8",
     ];
-    wait_for("all unbans", || {
+    wait_for("all unbans", &daemon, || {
         let recorded = decisions(&record);
         expected
             .iter()

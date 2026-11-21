@@ -130,12 +130,23 @@ pub(super) fn prune_stale_failures(
     jail_params: &HashMap<String, JailParams>,
     now: i64,
 ) {
-    failures.retain(|key, fs| match jail_params.get(&key.1) {
-        Some(params) => fs
-            .timestamps
-            .newest()
-            .is_none_or(|newest| newest >= now - params.find_time),
-        None => false,
+    failures.retain(|key, fs| {
+        let keep = match jail_params.get(&key.1) {
+            Some(params) => fs
+                .timestamps
+                .newest()
+                .is_none_or(|newest| newest >= now - params.find_time),
+            None => false,
+        };
+        if !keep {
+            tracing::debug!(
+                ip = %key.0,
+                jail = %key.1,
+                now,
+                "prune dropping failure window"
+            );
+        }
+        keep
     });
 }
 

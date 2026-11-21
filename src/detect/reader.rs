@@ -58,6 +58,12 @@ impl ReadCtx {
             jail_id: self.jail_id.clone(),
             timestamp: m.timestamp,
         };
+        debug!(
+            ip = %failure.ip,
+            jail = %failure.jail_id,
+            timestamp = failure.timestamp,
+            "failure delivered"
+        );
         self.tx.blocking_send(failure).is_ok()
     }
 }

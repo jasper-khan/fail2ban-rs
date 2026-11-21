@@ -38,6 +38,8 @@ mod legacy_log_positions;
 mod legacy_restore;
 #[cfg(test)]
 mod legacy_restore_parity_test;
+#[allow(dead_code)]
+pub(crate) mod legacy_sqlite;
 mod manual;
 mod run;
 mod sweep;

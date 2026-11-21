@@ -35,7 +35,21 @@ pub async fn run(config: Config, source: Source) -> crate::error::Result<()> {
     let cancel = CancellationToken::new();
     // Initialize remote logging (no-op if not configured).
     let logger = Logger::init(&config.logging);
-    let restored = open_state(&config.global.state_dir).await?;
+    let opened = open_state(&config.global.state_dir).await?;
+    // Compatibility trees also seed unexpired bans from the original
+    // Fail2Ban SQLite database; the WAL stays authoritative for any pair
+    // it already knows.
+    let restored = match &source {
+        Source::Fail2BanIni { dir, .. } => {
+            let dbfile = crate::config::compat::dbfile_of(dir)?;
+            let extra = crate::track::legacy_sqlite::restore_bans(&dbfile, &config)?;
+            Restored {
+                bans: crate::track::legacy_sqlite::merge_with_wal(opened.bans, extra),
+                ..opened
+            }
+        }
+        Source::Toml(_) => opened,
+    };
 
     let mut daemon = start_tasks(config, source, restored, logger, cancel).await?;
     info!(phase = "startup", "fail2ban-rs started");

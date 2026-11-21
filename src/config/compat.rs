@@ -85,37 +85,51 @@ fn safe_record_path(record: &Path) -> Result<PathBuf> {
     }
 }
 
+/// One option from the layered fail2ban.conf `[Definition]` section.
+fn definition_option(base: &Path, key: &str) -> Result<Option<String>> {
+    let cfg = legacy_layers::read(base, "fail2ban")?;
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    legacy_interp::get_effective(
+        "Definition",
+        key,
+        &cfg.defaults,
+        |name| cfg.sections.get(name),
+        None,
+    )
+    .map_err(|err| Error::config(format!("original fail2ban.conf option {key}: {err}")))
+}
+
+/// The original ban database of this tree, resolved exactly like the original
+/// daemon: the layered `dbfile` option or the built-in default. A relative
+/// value is refused by [`load_global`].
+pub(crate) fn dbfile_of(base: &Path) -> Result<PathBuf> {
+    let dbfile = definition_option(base, "dbfile")?
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from(ORIGINAL_DBFILE), PathBuf::from);
+    if !dbfile.is_absolute() {
+        return Err(Error::config(format!(
+            "original fail2ban.conf dbfile must be an absolute path: {}",
+            dbfile.display()
+        )));
+    }
+    Ok(dbfile)
+}
+
 /// Read fail2ban.conf layered overlays for the daemon socket and database
 /// location. Other original daemon options are left for later stages.
 fn load_global(base: &Path) -> Result<GlobalConfig> {
-    let mut socket = PathBuf::from(ORIGINAL_SOCKET);
-    let mut dbfile = PathBuf::from(ORIGINAL_DBFILE);
-    if let Some(cfg) = legacy_layers::read(base, "fail2ban")? {
-        let option = |key: &str| -> Result<Option<String>> {
-            legacy_interp::get_effective(
-                "Definition",
-                key,
-                &cfg.defaults,
-                |name| cfg.sections.get(name),
-                None,
-            )
-            .map_err(|err| Error::config(format!("original fail2ban.conf option {key}: {err}")))
-        };
-        if let Some(value) = option("socket")?.filter(|value| !value.is_empty()) {
-            socket = PathBuf::from(value);
-        }
-        if let Some(value) = option("dbfile")?.filter(|value| !value.is_empty()) {
-            dbfile = PathBuf::from(value);
-        }
+    let socket = definition_option(base, "socket")?
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from(ORIGINAL_SOCKET), PathBuf::from);
+    if !socket.is_absolute() {
+        return Err(Error::config(format!(
+            "original fail2ban.conf socket must be an absolute path: {}",
+            socket.display()
+        )));
     }
-    for (what, path) in [("socket", &socket), ("dbfile", &dbfile)] {
-        if !path.is_absolute() {
-            return Err(Error::config(format!(
-                "original fail2ban.conf {what} must be an absolute path: {}",
-                path.display()
-            )));
-        }
-    }
+    let dbfile = dbfile_of(base)?;
     let state_dir = dbfile
         .parent()
         .ok_or_else(|| Error::config("original fail2ban.conf dbfile has no directory"))?
