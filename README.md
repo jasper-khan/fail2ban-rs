@@ -194,9 +194,10 @@ cargo test
 ## Migration from fail2ban
 
 The daemon does not yet load original Fail2Ban INI files. The internal
-reader's file precedence, configuration merging, and selected filter
-configurations are tested separately against Fail2Ban 1.1.1. A separate
-offline replay tests the stock file-mode `nginx-http-auth` rules with
+reader's file precedence, configuration merging, and the whole stock
+config catalog (every jail, filter, action, and paths overlay option,
+each either expanded or error-identical) are tested separately against
+Fail2Ban 1.1.1. A separate offline replay tests the stock file-mode `nginx-http-auth` rules with
 single-line UTC fixtures. A separate SSH replay checks selected normal-mode
 session transitions in synthetic syslog. An offline jail decision test also
 checks original retry counting and ban expiry. Offline restore tests cover
