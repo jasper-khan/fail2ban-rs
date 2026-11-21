@@ -66,6 +66,7 @@ pub(crate) fn test_global_config() -> crate::config::GlobalConfig {
         ),
         legacy_socket_path: None,
         legacy_sqlite_rw_path: None,
+        legacy_sqlite_purge_age: 86_400,
     }
 }
 

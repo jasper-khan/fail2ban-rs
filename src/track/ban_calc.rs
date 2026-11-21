@@ -16,27 +16,45 @@ pub(crate) struct JailParams {
     pub(crate) bantime_factor: f64,
     pub(crate) bantime_multipliers: Vec<u32>,
     pub(crate) bantime_maxtime: i64,
+    pub(crate) bantime_rndtime: i64,
+    pub(crate) ignore_command: Option<String>,
     pub(crate) compat_mode: bool,
 }
 
 /// Calculate effective ban time with optional escalation.
 pub(crate) fn calc_ban_time(base: i64, count: u32, params: &JailParams) -> i64 {
-    if !params.bantime_increment || base < 0 {
+    if base < 0 {
         return base;
     }
-    let multiplier = if params.bantime_multipliers.is_empty() {
-        let exp = count.min(20);
-        2_f64.powi(exp as i32)
+    let mut effective = if params.bantime_increment {
+        let multiplier = if params.bantime_multipliers.is_empty() {
+            let exp = count.min(20);
+            2_f64.powi(exp as i32)
+        } else {
+            let idx = (count as usize).min(params.bantime_multipliers.len() - 1);
+            params
+                .bantime_multipliers
+                .get(idx)
+                .copied()
+                .map_or(1.0, f64::from)
+        };
+        (base as f64 * multiplier * params.bantime_factor) as i64
     } else {
-        let idx = (count as usize).min(params.bantime_multipliers.len() - 1);
-        params
-            .bantime_multipliers
-            .get(idx)
-            .copied()
-            .map_or(1.0, f64::from)
+        base
     };
-    let effective = (base as f64 * multiplier * params.bantime_factor) as i64;
-    if params.bantime_maxtime > 0 {
+    if params.bantime_rndtime > 0 && effective > 0 {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_i64(effective);
+        hasher.write_u32(count);
+        let span = u64::try_from(params.bantime_rndtime)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let jitter = i64::try_from(hasher.finish() % span).unwrap_or(0);
+        effective = effective.saturating_add(jitter);
+    }
+    if params.bantime_increment && params.bantime_maxtime > 0 {
         effective.min(params.bantime_maxtime)
     } else {
         effective
@@ -61,6 +79,8 @@ pub(crate) fn build_jail_params(
                     bantime_factor: cfg.bantime_factor,
                     bantime_multipliers: cfg.bantime_multipliers.clone(),
                     bantime_maxtime: cfg.bantime_maxtime,
+                    bantime_rndtime: cfg.bantime_rndtime,
+                    ignore_command: cfg.ignore_command.clone(),
                     compat_mode: cfg.compat_mode,
                 },
             )

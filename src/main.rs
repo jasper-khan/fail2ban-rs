@@ -72,6 +72,17 @@ enum Command {
         legacy_sqlite_rw: bool,
     },
 
+    /// Pure-Rust Fail2Ban 1.1.1 Unix socket client (drop-in replacement for `fail2ban-client`)
+    #[cfg(unix)]
+    Client {
+        /// Path to the legacy Fail2Ban Unix socket
+        #[arg(short, long, default_value = "/var/run/fail2ban/fail2ban.sock")]
+        socket: PathBuf,
+        /// Command arguments (e.g. `ping`, `status`, `status sshd`, `set sshd banip 1.2.3.4`)
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Show daemon status
     Status,
 
@@ -161,6 +172,15 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        #[cfg(unix)]
+        Command::Client { socket, args } => {
+            let reply = fail2ban_rs::legacy_protocol::send_legacy_command(&socket, &args)
+                .await
+                .context("legacy client command failed")?;
+            if !reply.is_empty() {
+                println!("{reply}");
+            }
+        }
         Command::Status => print_response(&send_control(path, Request::Status).await?),
         Command::ListBans { json } => list_bans(path, json).await?,
         Command::Stats => print_response(&send_control(path, Request::Stats).await?),
@@ -217,6 +237,8 @@ async fn run_daemon(
         let dbfile = fail2ban_rs::config::compat::dbfile_of(dir)
             .context("reading dbfile from legacy fail2ban.conf")?;
         config.global.legacy_sqlite_rw_path = Some(dbfile);
+        config.global.legacy_sqlite_purge_age = fail2ban_rs::config::compat::dbpurgeage_of(dir)
+            .context("reading dbpurgeage from legacy fail2ban.conf")?;
     }
     #[cfg(unix)]
     if let Some(sock) = legacy_socket {

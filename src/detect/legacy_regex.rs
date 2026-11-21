@@ -44,17 +44,19 @@ impl fmt::Display for Role {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Capture {
     Content,
     User,
+    Alt(String),
 }
 
 impl Capture {
-    fn name(self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             Self::Content => CONTENT,
             Self::User => USER,
+            Self::Alt(_) => USER,
         }
     }
 }
@@ -79,7 +81,56 @@ fn push_capture(out: &mut String, name: &str) {
 
 /// Compile an original filter regex for one line, without DNS or session
 /// state. `<HOST>` is supported only as an alias of the IP-only `<ADDR>`.
-pub(super) fn compile(pattern: &str, role: Role) -> Result<Regex> {
+///
+/// Dual-engine compiled Fail2Ban regex:
+/// - Fast path: linear-time `regex::Regex` (zero backtracking, ReDoS-safe).
+/// - Fallback: bounded-backtracking `fancy_regex::Regex` only when the pattern
+///   uses Python lookarounds (`(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`) or
+///   backreferences (`(?P=...)`).
+#[derive(Debug)]
+pub(super) enum CompiledRegex {
+    Linear(Regex),
+    Fancy(Box<fancy_regex::Regex>),
+}
+
+pub(super) enum CompiledCaptures<'t> {
+    Linear(regex::Captures<'t>),
+    Fancy(fancy_regex::Captures<'t>),
+}
+
+impl<'t> CompiledCaptures<'t> {
+    pub(super) fn name(&self, name: &str) -> Option<&'t str> {
+        match self {
+            Self::Linear(c) => c.name(name).map(|m| m.as_str()),
+            Self::Fancy(c) => c.name(name).map(|m| m.as_str()),
+        }
+    }
+}
+
+impl CompiledRegex {
+    pub(super) fn is_match(&self, text: &str) -> bool {
+        match self {
+            Self::Linear(r) => r.is_match(text),
+            Self::Fancy(r) => r.is_match(text).unwrap_or(false),
+        }
+    }
+
+    pub(super) fn captures<'t>(&self, text: &'t str) -> Option<CompiledCaptures<'t>> {
+        match self {
+            Self::Linear(r) => r.captures(text).map(CompiledCaptures::Linear),
+            Self::Fancy(r) => r.captures(text).ok().flatten().map(CompiledCaptures::Fancy),
+        }
+    }
+
+    pub(super) fn has_capture(&self, name: &str) -> bool {
+        match self {
+            Self::Linear(r) => r.capture_names().flatten().any(|g| g == name),
+            Self::Fancy(r) => r.capture_names().flatten().any(|g| g == name),
+        }
+    }
+}
+
+pub(super) fn compile(pattern: &str, role: Role) -> Result<CompiledRegex> {
     if pattern.trim().is_empty() {
         return Err(config_error(role, "empty regex"));
     }
@@ -95,6 +146,7 @@ pub(super) fn compile(pattern: &str, role: Role) -> Result<Regex> {
     let mut previous = None;
     let mut class = false;
     let mut class_first = false;
+    let mut needs_fancy = false;
     let mut address = false;
     let mut cursor = 0;
     while let Some(rest) = pattern.get(cursor..).filter(|s| !s.is_empty()) {
@@ -160,8 +212,9 @@ pub(super) fn compile(pattern: &str, role: Role) -> Result<Regex> {
                     } else {
                         Capture::User
                     };
+                    let capture_name = capture.name();
                     captures.push(capture);
-                    push_capture(&mut expanded, capture.name());
+                    push_capture(&mut expanded, capture_name);
                 }
                 "/F-CONTENT" | "/F-USER" => {
                     let capture = if tag == "/F-CONTENT" {
@@ -170,6 +223,20 @@ pub(super) fn compile(pattern: &str, role: Role) -> Result<Regex> {
                         Capture::User
                     };
                     if captures.pop() != Some(capture) {
+                        return Err(config_error(
+                            role,
+                            &format!("mismatched filter tag <{tag}>"),
+                        ));
+                    }
+                    expanded.push(')');
+                }
+                t if t.starts_with("F-ALT_") => {
+                    captures.push(Capture::Alt(t.to_owned()));
+                    expanded.push_str("(?:");
+                }
+                t if t.starts_with("/F-ALT_") => {
+                    let expected = Capture::Alt(t.trim_start_matches('/').to_owned());
+                    if captures.pop().as_ref() != Some(&expected) {
                         return Err(config_error(
                             role,
                             &format!("mismatched filter tag <{tag}>"),
@@ -198,10 +265,10 @@ pub(super) fn compile(pattern: &str, role: Role) -> Result<Regex> {
             }
             match ch {
                 '[' => {
-                    return Err(config_error(
-                        role,
-                        "nested character classes are unsupported",
-                    ));
+                    // In Python `re`, an unescaped `[` inside `[...]` is a
+                    // literal `[`, whereas Rust `regex` parses it as a nested
+                    // class unless escaped.
+                    expanded.push('\\');
                 }
                 ']' if !class_first => class = false,
                 _ => {}
@@ -211,8 +278,12 @@ pub(super) fn compile(pattern: &str, role: Role) -> Result<Regex> {
                 class_first = false;
             }
         } else {
-            if ch == '(' && rest.starts_with("(?") && !rest.starts_with("(?:") {
-                return Err(config_error(role, "unsupported regex group extension"));
+            if ch == '(' && rest.starts_with("(?") {
+                if is_fancy_group_extension(rest) {
+                    needs_fancy = true;
+                } else if !is_supported_group_extension(rest) {
+                    return Err(config_error(role, "unsupported regex group extension"));
+                }
             }
             if ch == '+' && previous.is_some_and(|c| matches!(c, '*' | '+' | '?' | '}')) {
                 return Err(config_error(role, "possessive quantifiers are unsupported"));
@@ -229,10 +300,20 @@ pub(super) fn compile(pattern: &str, role: Role) -> Result<Regex> {
     if !captures.is_empty() {
         return Err(config_error(role, "unclosed filter capture tag"));
     }
-    Regex::new(&expanded).map_err(|source| Error::Regex {
-        pattern: pattern.to_owned(),
-        source,
-    })
+    if needs_fancy {
+        let re = fancy_regex::RegexBuilder::new(&expanded)
+            .backtrack_limit(100_000)
+            .build()
+            .map_err(|err| config_error(role, &format!("fancy regex error: {err}")))?;
+        Ok(CompiledRegex::Fancy(Box::new(re)))
+    } else {
+        Regex::new(&expanded)
+            .map(CompiledRegex::Linear)
+            .map_err(|source| Error::Regex {
+                pattern: pattern.to_owned(),
+                source,
+            })
+    }
 }
 
 fn is_filter_tag(tag: &str) -> bool {
@@ -241,6 +322,32 @@ fn is_filter_tag(tag: &str) -> bool {
         "ADDR" | "HOST" | "IP4" | "IP6" | "DNS" | "CIDR" | "SUBNET" | "SKIPLINES"
     ) || tag.starts_with("F-")
         || tag.starts_with("/F-")
+}
+
+fn is_fancy_group_extension(rest: &str) -> bool {
+    rest.starts_with("(?=")
+        || rest.starts_with("(?!")
+        || rest.starts_with("(?<=")
+        || rest.starts_with("(?<!")
+        || rest.starts_with("(?P=")
+}
+
+fn is_supported_group_extension(rest: &str) -> bool {
+    if rest.starts_with("(?:") || rest.starts_with("(?P<") {
+        return true;
+    }
+    let Some(after) = rest.strip_prefix("(?") else {
+        return false;
+    };
+    let mut saw_flag = false;
+    for c in after.chars() {
+        match c {
+            'i' | 'm' | 's' | 'u' | 'x' | '-' => saw_flag = true,
+            ':' | ')' => return saw_flag,
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -264,11 +371,11 @@ mod tests {
         .unwrap();
         let line = r#"  [error] 12#34: *56 user "sample user": password mismatch, client: [2001:db8::7], server: example.test"#;
         let prefix_match = prefix.captures(line).unwrap();
-        let ip = prefix_match.name(ADDRESS).unwrap().as_str();
+        let ip = prefix_match.name(ADDRESS).unwrap();
         assert_eq!(ip.parse::<IpAddr>().unwrap().to_string(), "2001:db8::7");
-        let content = prefix_match.name(CONTENT).unwrap().as_str();
+        let content = prefix_match.name(CONTENT).unwrap();
         let failure_match = failure.captures(content).unwrap();
-        assert_eq!(failure_match.name(USER).unwrap().as_str(), "sample user");
+        assert_eq!(failure_match.name(USER).unwrap(), "sample user");
         assert!(failure_match.name(ADDRESS).is_none());
     }
 
@@ -296,7 +403,7 @@ mod tests {
         ] {
             let line = format!("source [{address}]");
             let captures = expression.captures(&line).unwrap();
-            let raw_ip = captures.name(ADDRESS).unwrap().as_str();
+            let raw_ip = captures.name(ADDRESS).unwrap();
             assert_eq!(raw_ip, address);
             assert!(raw_ip.parse::<IpAddr>().is_ok());
         }

@@ -33,7 +33,8 @@ mod validate;
 use std::path::PathBuf;
 
 pub use types::{
-    Backend, Config, GlobalConfig, JailConfig, LogBackend, LogEncoding, LoggingConfig, MaxmindField,
+    Backend, Config, GlobalConfig, JailConfig, LegacyActionFamilyCmds, LegacyActionSpec,
+    LogBackend, LogEncoding, LoggingConfig, MaxmindField,
 };
 
 use crate::error::Result;

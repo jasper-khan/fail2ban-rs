@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::control::{ControlCmd, Request, Response};
 use crate::track::TrackerCmd;
 
-use super::reload::{ReloadContext, reload_config};
+use super::reload::{ReloadContext, apply_config_change, reload_config};
 
 /// A control request answered purely by the tracker.
 pub(super) enum TrackerRequest {
@@ -39,6 +39,21 @@ pub(super) enum Dispatch {
     Immediate(Response),
     /// A config reload, which needs mutable daemon state.
     Reload,
+    /// Live runtime update of a single jail parameter.
+    SetJailParam {
+        jail: String,
+        param: String,
+        value: i64,
+    },
+    /// Enable or disable a single jail at runtime.
+    SetJailEnabled { jail: String, enabled: bool },
+    /// Mutate a jail's `logpath` or `ignoreip` list at runtime.
+    MutateJailList {
+        jail: String,
+        list: String,
+        add: bool,
+        value: String,
+    },
     /// Forward to the tracker.
     Tracker(TrackerRequest),
 }
@@ -56,6 +71,22 @@ pub(super) fn classify_request(request: Request, config: &Config) -> Dispatch {
         Request::Unban { ip, jail } => Dispatch::Tracker(TrackerRequest::Unban { ip, jail }),
         Request::Reload => Dispatch::Reload,
         Request::Stats => Dispatch::Tracker(TrackerRequest::Stats),
+        Request::ConfigSnapshot => Dispatch::Immediate(build_config_snapshot(config)),
+        Request::SetJailParam { jail, param, value } => {
+            Dispatch::SetJailParam { jail, param, value }
+        }
+        Request::SetJailEnabled { jail, enabled } => Dispatch::SetJailEnabled { jail, enabled },
+        Request::MutateJailList {
+            jail,
+            list,
+            add,
+            value,
+        } => Dispatch::MutateJailList {
+            jail,
+            list,
+            add,
+            value,
+        },
     }
 }
 
@@ -70,6 +101,24 @@ pub(super) async fn dispatch_control(
         Dispatch::Immediate(response) => send_response(ctrl.respond, response),
         Dispatch::Reload => {
             let response = handle_reload_request(tracker_cmd_tx, ctx).await;
+            send_response(ctrl.respond, response);
+        }
+        Dispatch::SetJailParam { jail, param, value } => {
+            let response = handle_set_jail_param(tracker_cmd_tx, ctx, &jail, &param, value).await;
+            send_response(ctrl.respond, response);
+        }
+        Dispatch::SetJailEnabled { jail, enabled } => {
+            let response = handle_set_jail_enabled(tracker_cmd_tx, ctx, &jail, enabled).await;
+            send_response(ctrl.respond, response);
+        }
+        Dispatch::MutateJailList {
+            jail,
+            list,
+            add,
+            value,
+        } => {
+            let response =
+                handle_mutate_jail_list(tracker_cmd_tx, ctx, &jail, &list, add, &value).await;
             send_response(ctrl.respond, response);
         }
         Dispatch::Tracker(req) => {
@@ -94,6 +143,18 @@ pub(super) async fn handle_control_request(
     match classify_request(request, ctx.config) {
         Dispatch::Immediate(response) => response,
         Dispatch::Reload => handle_reload_request(tracker_cmd_tx, ctx).await,
+        Dispatch::SetJailParam { jail, param, value } => {
+            handle_set_jail_param(tracker_cmd_tx, ctx, &jail, &param, value).await
+        }
+        Dispatch::SetJailEnabled { jail, enabled } => {
+            handle_set_jail_enabled(tracker_cmd_tx, ctx, &jail, enabled).await
+        }
+        Dispatch::MutateJailList {
+            jail,
+            list,
+            add,
+            value,
+        } => handle_mutate_jail_list(tracker_cmd_tx, ctx, &jail, &list, add, &value).await,
         Dispatch::Tracker(req) => forward_to_tracker(req, tracker_cmd_tx).await,
     }
 }
@@ -253,3 +314,195 @@ pub(super) fn resolve_ban_time(config: &Config, jail: &str) -> std::result::Resu
 )]
 #[path = "control_dispatch_test.rs"]
 mod control_dispatch_test;
+
+fn build_config_snapshot(config: &Config) -> Response {
+    let mut jails = serde_json::Map::new();
+    for (name, cfg) in &config.jail {
+        if !cfg.enabled {
+            continue;
+        }
+        let mut log_paths: Vec<String> = cfg
+            .log_paths
+            .iter()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string())
+            .collect();
+        if log_paths.is_empty() && !cfg.log_path.as_os_str().is_empty() {
+            log_paths.push(cfg.log_path.display().to_string());
+        }
+        let actions: Vec<String> = match &cfg.backend {
+            crate::config::Backend::LegacyAction { actions } => {
+                actions.iter().map(|a| a.name.clone()).collect()
+            }
+            crate::config::Backend::Script { .. } => vec!["record".to_owned()],
+            crate::config::Backend::Nftables => vec!["nftables".to_owned()],
+            crate::config::Backend::Iptables => vec!["iptables".to_owned()],
+            crate::config::Backend::Ipset { .. } => vec!["ipset".to_owned()],
+        };
+        jails.insert(
+            name.clone(),
+            serde_json::json!({
+                "maxretry": cfg.max_retry,
+                "findtime": cfg.find_time,
+                "bantime": cfg.ban_time,
+                "ignoreip": cfg.ignoreip,
+                "log_paths": log_paths,
+                "actions": actions,
+            }),
+        );
+    }
+    Response::ok_data(serde_json::json!({
+        "dbfile": config
+            .global
+            .legacy_sqlite_rw_path
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        "dbpurgeage": config.global.legacy_sqlite_purge_age,
+        "jails": jails,
+    }))
+}
+
+async fn handle_set_jail_param(
+    tracker_cmd_tx: &mpsc::Sender<TrackerCmd>,
+    ctx: &mut ReloadContext<'_>,
+    jail: &str,
+    param: &str,
+    value: i64,
+) -> Response {
+    let Some(cfg) = ctx.config.jail.get_mut(jail) else {
+        return Response::error(format!("NOK: ('{jail}',)"));
+    };
+    match param {
+        "maxretry" => {
+            let Ok(v) = u32::try_from(value) else {
+                return Response::error(format!("invalid maxretry: {value}"));
+            };
+            if v == 0 {
+                return Response::error("maxretry must be >= 1");
+            }
+            cfg.max_retry = v;
+        }
+        "findtime" => {
+            if value <= 0 {
+                return Response::error("findtime must be > 0");
+            }
+            cfg.find_time = value;
+        }
+        "bantime" => {
+            cfg.ban_time = value;
+        }
+        other => return Response::error(format!("unsupported parameter {other:?}")),
+    }
+    let enabled: std::collections::HashMap<String, crate::config::JailConfig> = ctx
+        .config
+        .jail
+        .iter()
+        .filter(|(_, j)| j.enabled)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let (tx, rx) = oneshot::channel();
+    if tracker_cmd_tx
+        .send(TrackerCmd::UpdateConfig {
+            global: ctx.config.global.clone(),
+            jails: enabled,
+            respond: tx,
+        })
+        .await
+        .is_err()
+    {
+        return Response::error("tracker unavailable");
+    }
+    match rx.await {
+        Ok(()) => Response::ok_data(serde_json::json!({ "value": value })),
+        Err(_) => Response::error("tracker did not acknowledge parameter update"),
+    }
+}
+
+async fn handle_set_jail_enabled(
+    tracker_cmd_tx: &mpsc::Sender<TrackerCmd>,
+    ctx: &mut ReloadContext<'_>,
+    jail: &str,
+    enabled: bool,
+) -> Response {
+    let mut next_config = ctx.config.clone();
+    let Some(cfg) = next_config.jail.get_mut(jail) else {
+        return Response::error(format!("NOK: ('{jail}',)"));
+    };
+    cfg.enabled = enabled;
+    match apply_config_change(
+        next_config,
+        ctx.executor_tx,
+        tracker_cmd_tx,
+        ctx.config,
+        ctx.watchers,
+        ctx.failure_tx,
+    )
+    .await
+    {
+        Ok(()) => Response::ok(if enabled { "started" } else { "stopped" }),
+        Err(e) => Response::error(format!("jail state change failed: {e}")),
+    }
+}
+
+async fn handle_mutate_jail_list(
+    tracker_cmd_tx: &mpsc::Sender<TrackerCmd>,
+    ctx: &mut ReloadContext<'_>,
+    jail: &str,
+    list: &str,
+    add: bool,
+    value: &str,
+) -> Response {
+    let mut next_config = ctx.config.clone();
+    let Some(cfg) = next_config.jail.get_mut(jail) else {
+        return Response::error(format!("NOK: ('{jail}',)"));
+    };
+    let updated_items: Vec<String> = match list {
+        "logpath" => {
+            let path = std::path::PathBuf::from(value);
+            if add {
+                if !cfg.log_paths.contains(&path) {
+                    cfg.log_paths.push(path.clone());
+                }
+                if cfg.log_path.as_os_str().is_empty() {
+                    cfg.log_path = path;
+                }
+            } else {
+                cfg.log_paths.retain(|p| p != &path);
+                if cfg.log_path == path {
+                    cfg.log_path = cfg.log_paths.first().cloned().unwrap_or_default();
+                }
+            }
+            cfg.log_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect()
+        }
+        "ignoreip" => {
+            if add {
+                if crate::detect::ignore::parse_entry(value).is_err() {
+                    return Response::error(format!("invalid ignoreip entry: {value}"));
+                }
+                if !cfg.ignoreip.iter().any(|e| e == value) {
+                    cfg.ignoreip.push(value.to_owned());
+                }
+            } else {
+                cfg.ignoreip.retain(|e| e != value);
+            }
+            cfg.ignoreip.clone()
+        }
+        other => return Response::error(format!("unsupported list {other:?}")),
+    };
+    match apply_config_change(
+        next_config,
+        ctx.executor_tx,
+        tracker_cmd_tx,
+        ctx.config,
+        ctx.watchers,
+        ctx.failure_tx,
+    )
+    .await
+    {
+        Ok(()) => Response::ok_data(serde_json::json!({ "items": updated_items })),
+        Err(e) => Response::error(format!("updating {list} failed: {e}")),
+    }
+}

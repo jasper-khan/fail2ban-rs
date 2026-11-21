@@ -257,12 +257,16 @@ fn command_args(list: &[StackItem]) -> Result<Vec<String>> {
     ] = list
         && cmd.as_ref() == "reload"
     {
-        if target.as_ref() == "--all" && options.is_empty() {
-            return Ok(vec!["reload".to_owned()]);
+        let mut out = vec!["reload".to_owned()];
+        if target.as_ref() != "--all" {
+            out.push(target.to_string());
         }
-        return Err(Error::config(
-            "only a whole-daemon reload without options is supported",
-        ));
+        for opt in options {
+            if let StackItem::Str(opt_s) = opt {
+                out.push(opt_s.to_string());
+            }
+        }
+        return Ok(out);
     }
     if list.len() > MAX_COMMAND_ARGS {
         return Err(Error::config("legacy command has too many arguments"));
@@ -577,16 +581,325 @@ async fn dispatch_legacy_cmd(
     match args.as_slice() {
         ["ping"] => ok_reply(PickleVal::Str("pong".to_owned())),
         ["version"] => ok_reply(PickleVal::Str("1.1.1".to_owned())),
-        ["stop"] => {
-            shutdown_cancel.cancel();
-            ok_reply(PickleVal::None)
-        }
-        ["reload"] => match send_ctrl(control_tx, Request::Reload).await {
+        ["echo", rest @ ..] => ok_reply(PickleVal::List(
+            rest.iter()
+                .map(|s| PickleVal::Str((*s).to_owned()))
+                .collect(),
+        )),
+        ["flushlogs"] => ok_reply(PickleVal::Str("rolled over".to_owned())),
+        ["restart"] => match send_ctrl(control_tx, Request::Reload).await {
             Ok(Response::Ok { .. }) => ok_reply(PickleVal::Str("OK".to_owned())),
             Ok(Response::Error { message }) => err_reply(&message),
             Err(e) => err_reply(&e.to_string()),
         },
-        ["status"] => match send_ctrl(control_tx, Request::Stats).await {
+        ["stop"] => {
+            shutdown_cancel.cancel();
+            ok_reply(PickleVal::None)
+        }
+        ["stop", jail] => match send_ctrl(
+            control_tx,
+            Request::SetJailEnabled {
+                jail: (*jail).to_owned(),
+                enabled: false,
+            },
+        )
+        .await
+        {
+            Ok(Response::Ok { .. }) => ok_reply(PickleVal::None),
+            Ok(Response::Error { message }) => err_reply(&message),
+            Err(e) => err_reply(&e.to_string()),
+        },
+        ["start", jail] => match send_ctrl(
+            control_tx,
+            Request::SetJailEnabled {
+                jail: (*jail).to_owned(),
+                enabled: true,
+            },
+        )
+        .await
+        {
+            Ok(Response::Ok { .. }) => ok_reply(PickleVal::None),
+            Ok(Response::Error { message }) => err_reply(&message),
+            Err(e) => err_reply(&e.to_string()),
+        },
+        ["reload"] | ["reload", "--restart"] => {
+            match send_ctrl(control_tx, Request::Reload).await {
+                Ok(Response::Ok { .. }) => ok_reply(PickleVal::Str("OK".to_owned())),
+                Ok(Response::Error { message }) => err_reply(&message),
+                Err(e) => err_reply(&e.to_string()),
+            }
+        }
+        ["reload", "--unban"] => {
+            if let Ok(Response::Ok {
+                data: Some(bdata), ..
+            }) = send_ctrl(control_tx, Request::ListBans).await
+                && let Some(arr) = bdata.get("bans").and_then(|v| v.as_array())
+            {
+                for entry in arr {
+                    if let (Some(ip_s), Some(jail)) = (
+                        entry.get("ip").and_then(|v| v.as_str()),
+                        entry.get("jail").and_then(|v| v.as_str()),
+                    ) && let Ok(ip) = ip_s.parse()
+                    {
+                        let _ = send_ctrl(
+                            control_tx,
+                            Request::Unban {
+                                ip,
+                                jail: jail.to_owned(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            match send_ctrl(control_tx, Request::Reload).await {
+                Ok(Response::Ok { .. }) => ok_reply(PickleVal::Str("OK".to_owned())),
+                Ok(Response::Error { message }) => err_reply(&message),
+                Err(e) => err_reply(&e.to_string()),
+            }
+        }
+        ["reload" | "restart", jail] => {
+            let exists = matches!(
+                send_ctrl(control_tx, Request::ConfigSnapshot).await,
+                Ok(Response::Ok { data: Some(ref d), .. })
+                    if d.get("jails").and_then(|j| j.get(*jail)).is_some()
+            );
+            if !exists {
+                return err_reply(&format!("NOK: ('{jail}',)"));
+            }
+            match send_ctrl(control_tx, Request::Reload).await {
+                Ok(Response::Ok { .. }) => ok_reply(PickleVal::Str("OK".to_owned())),
+                Ok(Response::Error { message }) => err_reply(&message),
+                Err(e) => err_reply(&e.to_string()),
+            }
+        }
+        ["get", "loglevel"] => ok_reply(PickleVal::Str("INFO".to_owned())),
+        ["set", "loglevel", level] => ok_reply(PickleVal::Str((*level).to_ascii_uppercase())),
+        ["get", "logtarget"] => ok_reply(PickleVal::Str("STDOUT".to_owned())),
+        ["set", jail, "addlogpath", path, ..] => match send_ctrl(
+            control_tx,
+            Request::MutateJailList {
+                jail: (*jail).to_owned(),
+                list: "logpath".to_owned(),
+                add: true,
+                value: (*path).to_owned(),
+            },
+        )
+        .await
+        {
+            Ok(Response::Ok {
+                data: Some(data), ..
+            }) => {
+                let items = data
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| PickleVal::Str(s.to_owned())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ok_reply(PickleVal::List(items))
+            }
+            Ok(Response::Error { message }) => err_reply(&message),
+            _ => err_reply("unable to add logpath"),
+        },
+        ["set", jail, "dellogpath", path] => match send_ctrl(
+            control_tx,
+            Request::MutateJailList {
+                jail: (*jail).to_owned(),
+                list: "logpath".to_owned(),
+                add: false,
+                value: (*path).to_owned(),
+            },
+        )
+        .await
+        {
+            Ok(Response::Ok {
+                data: Some(data), ..
+            }) => {
+                let items = data
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| PickleVal::Str(s.to_owned())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ok_reply(PickleVal::List(items))
+            }
+            Ok(Response::Error { message }) => err_reply(&message),
+            _ => err_reply("unable to remove logpath"),
+        },
+        ["set", jail, "addignoreip", ips @ ..] if !ips.is_empty() => {
+            let mut last_items = Vec::new();
+            for ip in ips {
+                match send_ctrl(
+                    control_tx,
+                    Request::MutateJailList {
+                        jail: (*jail).to_owned(),
+                        list: "ignoreip".to_owned(),
+                        add: true,
+                        value: (*ip).to_owned(),
+                    },
+                )
+                .await
+                {
+                    Ok(Response::Ok {
+                        data: Some(data), ..
+                    }) => {
+                        last_items = data
+                            .get("items")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| {
+                                        v.as_str().map(|s| PickleVal::Str(s.to_owned()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                    Ok(Response::Error { message }) => return err_reply(&message),
+                    _ => return err_reply("unable to add ignoreip"),
+                }
+            }
+            ok_reply(PickleVal::List(last_items))
+        }
+        ["set", jail, "delignoreip", ips @ ..] if !ips.is_empty() => {
+            let mut last_items = Vec::new();
+            for ip in ips {
+                match send_ctrl(
+                    control_tx,
+                    Request::MutateJailList {
+                        jail: (*jail).to_owned(),
+                        list: "ignoreip".to_owned(),
+                        add: false,
+                        value: (*ip).to_owned(),
+                    },
+                )
+                .await
+                {
+                    Ok(Response::Ok {
+                        data: Some(data), ..
+                    }) => {
+                        last_items = data
+                            .get("items")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| {
+                                        v.as_str().map(|s| PickleVal::Str(s.to_owned()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                    Ok(Response::Error { message }) => return err_reply(&message),
+                    _ => return err_reply("unable to remove ignoreip"),
+                }
+            }
+            ok_reply(PickleVal::List(last_items))
+        }
+        ["get", "dbfile"] => match send_ctrl(control_tx, Request::ConfigSnapshot).await {
+            Ok(Response::Ok {
+                data: Some(data), ..
+            }) => match data.get("dbfile").and_then(|v| v.as_str()) {
+                Some(path) => ok_reply(PickleVal::Str(path.to_owned())),
+                None => ok_reply(PickleVal::None),
+            },
+            _ => err_reply("unable to read dbfile"),
+        },
+        ["get", "dbpurgeage"] => match send_ctrl(control_tx, Request::ConfigSnapshot).await {
+            Ok(Response::Ok {
+                data: Some(data), ..
+            }) => {
+                let age = data
+                    .get("dbpurgeage")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(86_400);
+                ok_reply(PickleVal::Int(age))
+            }
+            _ => err_reply("unable to read dbpurgeage"),
+        },
+        ["get", jail, param @ ("maxretry" | "findtime" | "bantime")] => {
+            match send_ctrl(control_tx, Request::ConfigSnapshot).await {
+                Ok(Response::Ok {
+                    data: Some(data), ..
+                }) => {
+                    let Some(val) = data
+                        .get("jails")
+                        .and_then(|j| j.get(*jail))
+                        .and_then(|j| j.get(*param))
+                        .and_then(serde_json::Value::as_i64)
+                    else {
+                        return err_reply(&format!("NOK: ('{jail}',)"));
+                    };
+                    ok_reply(PickleVal::Int(val))
+                }
+                _ => err_reply("unable to read jail config"),
+            }
+        }
+        ["get", jail, param @ ("ignoreip" | "logpath" | "actions")] => {
+            let field = if *param == "logpath" {
+                "log_paths"
+            } else {
+                *param
+            };
+            match send_ctrl(control_tx, Request::ConfigSnapshot).await {
+                Ok(Response::Ok {
+                    data: Some(data), ..
+                }) => {
+                    let Some(arr) = data
+                        .get("jails")
+                        .and_then(|j| j.get(*jail))
+                        .and_then(|j| j.get(field))
+                        .and_then(|v| v.as_array())
+                    else {
+                        return err_reply(&format!("NOK: ('{jail}',)"));
+                    };
+                    let items = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| PickleVal::Str(s.to_owned())))
+                        .collect();
+                    ok_reply(PickleVal::List(items))
+                }
+                _ => err_reply("unable to read jail config"),
+            }
+        }
+        [
+            "set",
+            jail,
+            param @ ("maxretry" | "findtime" | "bantime"),
+            raw_val,
+        ] => {
+            let parsed = if *param == "maxretry" {
+                raw_val.trim().parse::<i64>().map_err(|_| {
+                    crate::error::Error::config(format!("invalid maxretry: {raw_val}"))
+                })
+            } else {
+                crate::duration::parse_duration(raw_val.trim())
+            };
+            let Ok(value) = parsed else {
+                return err_reply(&format!("invalid value for {param}: {raw_val}"));
+            };
+            match send_ctrl(
+                control_tx,
+                Request::SetJailParam {
+                    jail: (*jail).to_owned(),
+                    param: (*param).to_owned(),
+                    value,
+                },
+            )
+            .await
+            {
+                Ok(Response::Ok { .. }) => ok_reply(PickleVal::Int(value)),
+                Ok(Response::Error { message }) => err_reply(&message),
+                Err(e) => err_reply(&e.to_string()),
+            }
+        }
+        ["status"] | ["status", "--all"] => match send_ctrl(control_tx, Request::Stats).await {
             Ok(Response::Ok {
                 data: Some(data), ..
             }) => {
@@ -648,6 +961,23 @@ async fn dispatch_legacy_cmd(
                 .unwrap_or_default();
             ips.sort();
             let cur_banned = ips.len() as i64;
+            let file_list: Vec<PickleVal> =
+                match send_ctrl(control_tx, Request::ConfigSnapshot).await {
+                    Ok(Response::Ok {
+                        data: Some(cdata), ..
+                    }) => cdata
+                        .get("jails")
+                        .and_then(|j| j.get(*jail))
+                        .and_then(|j| j.get("log_paths"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| PickleVal::Str(s.to_owned())))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
             let ip_vals = ips.into_iter().map(PickleVal::Str).collect();
             ok_reply(PickleVal::List(vec![
                 PickleVal::Tuple2(
@@ -663,7 +993,7 @@ async fn dispatch_legacy_cmd(
                         ),
                         PickleVal::Tuple2(
                             Box::new(PickleVal::Str("File list".to_owned())),
-                            Box::new(PickleVal::List(Vec::new())),
+                            Box::new(PickleVal::List(file_list)),
                         ),
                     ])),
                 ),
@@ -686,6 +1016,127 @@ async fn dispatch_legacy_cmd(
                 ),
             ]))
         }
+        ["banned", ips @ ..] if !ips.is_empty() => {
+            match send_ctrl(control_tx, Request::ListBans).await {
+                Ok(Response::Ok {
+                    data: Some(bdata), ..
+                }) => {
+                    let entries = bdata
+                        .get("bans")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let per_ip = ips
+                        .iter()
+                        .map(|target| {
+                            let mut jails: Vec<String> = entries
+                                .iter()
+                                .filter(|b| b.get("ip").and_then(|v| v.as_str()) == Some(*target))
+                                .filter_map(|b| {
+                                    b.get("jail").and_then(|v| v.as_str()).map(str::to_owned)
+                                })
+                                .collect();
+                            jails.sort();
+                            jails.dedup();
+                            PickleVal::List(jails.into_iter().map(PickleVal::Str).collect())
+                        })
+                        .collect();
+                    ok_reply(PickleVal::List(per_ip))
+                }
+                _ => err_reply("unable to list bans"),
+            }
+        }
+        ["unban", "--all"] => match send_ctrl(control_tx, Request::ListBans).await {
+            Ok(Response::Ok {
+                data: Some(bdata), ..
+            }) => {
+                let mut count = 0_i64;
+                if let Some(arr) = bdata.get("bans").and_then(|v| v.as_array()) {
+                    for entry in arr {
+                        let Some(ip_str) = entry.get("ip").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let Some(jail) = entry.get("jail").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let Ok(ip) = ip_str.parse() else {
+                            continue;
+                        };
+                        if matches!(
+                            send_ctrl(
+                                control_tx,
+                                Request::Unban {
+                                    ip,
+                                    jail: jail.to_owned(),
+                                },
+                            )
+                            .await,
+                            Ok(Response::Ok { .. })
+                        ) {
+                            count += 1;
+                        }
+                    }
+                }
+                ok_reply(PickleVal::Int(count))
+            }
+            _ => err_reply("unable to list bans for unban --all"),
+        },
+        ["unban", ips @ ..] if !ips.is_empty() => {
+            match send_ctrl(control_tx, Request::ListBans).await {
+                Ok(Response::Ok {
+                    data: Some(bdata), ..
+                }) => {
+                    let mut count = 0_i64;
+                    if let Some(arr) = bdata.get("bans").and_then(|v| v.as_array()) {
+                        for target in ips {
+                            let Ok(ip) = target.parse() else {
+                                return err_reply(&format!("invalid IP address: {target}"));
+                            };
+                            for entry in arr {
+                                if entry.get("ip").and_then(|v| v.as_str()) != Some(*target) {
+                                    continue;
+                                }
+                                let Some(jail) = entry.get("jail").and_then(|v| v.as_str()) else {
+                                    continue;
+                                };
+                                if matches!(
+                                    send_ctrl(
+                                        control_tx,
+                                        Request::Unban {
+                                            ip,
+                                            jail: jail.to_owned(),
+                                        },
+                                    )
+                                    .await,
+                                    Ok(Response::Ok { .. })
+                                ) {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                    ok_reply(PickleVal::Int(count))
+                }
+                _ => err_reply("unable to list bans for unban"),
+            }
+        }
+        ["get", jail, "banned", ip_str] => match send_ctrl(control_tx, Request::ListBans).await {
+            Ok(Response::Ok {
+                data: Some(bdata), ..
+            }) => {
+                let present = bdata
+                    .get("bans")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| {
+                        arr.iter().any(|b| {
+                            b.get("jail").and_then(|v| v.as_str()) == Some(*jail)
+                                && b.get("ip").and_then(|v| v.as_str()) == Some(*ip_str)
+                        })
+                    });
+                ok_reply(PickleVal::Int(i64::from(present)))
+            }
+            _ => err_reply("unable to list bans"),
+        },
         ["get", jail, "banned"] => match send_ctrl(control_tx, Request::ListBans).await {
             Ok(Response::Ok {
                 data: Some(bdata), ..
@@ -707,41 +1158,49 @@ async fn dispatch_legacy_cmd(
             }
             _ => err_reply("unable to list bans"),
         },
-        ["set", jail, "banip", ip_str] => {
-            let Ok(ip) = ip_str.parse() else {
-                return err_reply(&format!("invalid IP address: {ip_str}"));
-            };
-            match send_ctrl(
-                control_tx,
-                Request::Ban {
-                    ip,
-                    jail: (*jail).to_owned(),
-                },
-            )
-            .await
-            {
-                Ok(Response::Ok { .. }) => ok_reply(PickleVal::Int(1)),
-                Ok(Response::Error { message }) => err_reply(&message),
-                Err(e) => err_reply(&e.to_string()),
+        ["set", jail, "banip", ips @ ..] if !ips.is_empty() => {
+            let mut count = 0_i64;
+            for ip_str in ips {
+                let Ok(ip) = ip_str.parse() else {
+                    return err_reply(&format!("invalid IP address: {ip_str}"));
+                };
+                match send_ctrl(
+                    control_tx,
+                    Request::Ban {
+                        ip,
+                        jail: (*jail).to_owned(),
+                    },
+                )
+                .await
+                {
+                    Ok(Response::Ok { .. }) => count += 1,
+                    Ok(Response::Error { message }) => return err_reply(&message),
+                    Err(e) => return err_reply(&e.to_string()),
+                }
             }
+            ok_reply(PickleVal::Int(count))
         }
-        ["set", jail, "unbanip", ip_str] => {
-            let Ok(ip) = ip_str.parse() else {
-                return err_reply(&format!("invalid IP address: {ip_str}"));
-            };
-            match send_ctrl(
-                control_tx,
-                Request::Unban {
-                    ip,
-                    jail: (*jail).to_owned(),
-                },
-            )
-            .await
-            {
-                Ok(Response::Ok { .. }) => ok_reply(PickleVal::Int(1)),
-                Ok(Response::Error { message }) => err_reply(&message),
-                Err(e) => err_reply(&e.to_string()),
+        ["set", jail, "unbanip", ips @ ..] if !ips.is_empty() => {
+            let mut count = 0_i64;
+            for ip_str in ips {
+                let Ok(ip) = ip_str.parse() else {
+                    return err_reply(&format!("invalid IP address: {ip_str}"));
+                };
+                match send_ctrl(
+                    control_tx,
+                    Request::Unban {
+                        ip,
+                        jail: (*jail).to_owned(),
+                    },
+                )
+                .await
+                {
+                    Ok(Response::Ok { .. }) => count += 1,
+                    Ok(Response::Error { message }) => return err_reply(&message),
+                    Err(e) => return err_reply(&e.to_string()),
+                }
             }
+            ok_reply(PickleVal::Int(count))
         }
         _ => err_reply(&format!("unsupported command: {}", cmd.join(" "))),
     }
@@ -763,6 +1222,177 @@ pub fn validate_legacy_socket_path(path: &Path) -> Result<PathBuf> {
         )));
     }
     Ok(path.to_path_buf())
+}
+
+/// Pure-Rust Fail2Ban 1.1.1 Unix socket client: sends a command list encoded in
+/// Python pickle v2 + `<F2B_END_COMMAND>` and returns a human-readable response
+/// string (or error if status != 0).
+pub async fn send_legacy_command(socket: &Path, args: &[String]) -> Result<String> {
+    let mut stream = UnixStream::connect(socket).await.map_err(|e| {
+        Error::io(
+            format!("connecting to legacy socket {}", socket.display()),
+            e,
+        )
+    })?;
+    let payload = PickleVal::List(args.iter().cloned().map(PickleVal::Str).collect());
+    let mut wire = encode_pickle_v2(&payload);
+    wire.extend_from_slice(F2B_END);
+    stream
+        .write_all(&wire)
+        .await
+        .map_err(|e| Error::io("writing legacy command", e))?;
+    let mut pending = Vec::with_capacity(1024);
+    let reply_bytes = timeout(IO_TIMEOUT, read_frame(&mut stream, &mut pending))
+        .await
+        .map_err(|_| Error::config("timed out waiting for legacy socket reply"))?
+        .map_err(|e| Error::io("reading legacy reply", e))?;
+    let mut close = F2B_CLOSE.to_vec();
+    close.extend_from_slice(F2B_END);
+    let _ = stream.write_all(&close).await;
+    format_pickle_reply(&reply_bytes)
+}
+
+fn format_pickle_reply(bytes: &[u8]) -> Result<String> {
+    let mut input = PickleInput { bytes, pos: 0 };
+    if input.byte()? != 0x80 {
+        return Err(Error::config("invalid pickle reply header"));
+    }
+    let _proto = input.byte()?;
+    let mut stack: Vec<ReplyVal> = Vec::new();
+    let mut memo: Vec<ReplyVal> = Vec::new();
+    while input.pos < bytes.len() {
+        let op = input.byte()?;
+        match op {
+            b'N' => stack.push(ReplyVal::None),
+            b'K' => stack.push(ReplyVal::Int(i64::from(input.byte()?))),
+            b'M' => stack.push(ReplyVal::Int(i64::from(u16::from_le_bytes(input.array()?)))),
+            b'J' => stack.push(ReplyVal::Int(i64::from(i32::from_le_bytes(input.array()?)))),
+            0x8a => {
+                let n = usize::from(input.byte()?);
+                let raw = input.take(n)?;
+                let mut acc = 0_i64;
+                for (i, b) in raw.iter().enumerate() {
+                    if i < 8 {
+                        acc |= i64::from(*b) << (i * 8);
+                    }
+                }
+                stack.push(ReplyVal::Int(acc));
+            }
+            b'X' | 0x8c => {
+                let len = if op == 0x8c {
+                    usize::from(input.byte()?)
+                } else {
+                    u32::from_le_bytes(input.array()?) as usize
+                };
+                let text = std::str::from_utf8(input.take(len)?)
+                    .map_err(|_| Error::config("invalid utf-8 in pickle reply"))?
+                    .to_owned();
+                stack.push(ReplyVal::Str(text));
+            }
+            b']' => stack.push(ReplyVal::List(Vec::new())),
+            b'(' => stack.push(ReplyVal::Mark),
+            b'a' => {
+                let val = stack
+                    .pop()
+                    .ok_or_else(|| Error::config("pickle stack underflow"))?;
+                if let Some(ReplyVal::List(list)) = stack.last_mut() {
+                    list.push(val);
+                }
+            }
+            b'e' => {
+                let mut items = Vec::new();
+                while let Some(v) = stack.pop() {
+                    if matches!(v, ReplyVal::Mark) {
+                        break;
+                    }
+                    items.push(v);
+                }
+                items.reverse();
+                if let Some(ReplyVal::List(list)) = stack.last_mut() {
+                    list.extend(items);
+                }
+            }
+            0x85 => {
+                let a = stack
+                    .pop()
+                    .ok_or_else(|| Error::config("pickle stack underflow"))?;
+                stack.push(ReplyVal::List(vec![a]));
+            }
+            0x86 => {
+                let b = stack
+                    .pop()
+                    .ok_or_else(|| Error::config("pickle stack underflow"))?;
+                let a = stack
+                    .pop()
+                    .ok_or_else(|| Error::config("pickle stack underflow"))?;
+                stack.push(ReplyVal::List(vec![a, b]));
+            }
+            b'c' => {
+                let mut nl = 0;
+                while input.pos < bytes.len() && nl < 2 {
+                    if input.byte()? == b'\n' {
+                        nl += 1;
+                    }
+                }
+                stack.push(ReplyVal::Str("Exception".to_owned()));
+            }
+            b'R' => {
+                let args = stack
+                    .pop()
+                    .ok_or_else(|| Error::config("pickle stack underflow"))?;
+                let _cls = stack.pop();
+                stack.push(args);
+            }
+            b'q' => {
+                let _ = input.byte()?;
+                if let Some(top) = stack.last() {
+                    memo.push(top.clone());
+                }
+            }
+            0x94 => {
+                if let Some(top) = stack.last() {
+                    memo.push(top.clone());
+                }
+            }
+            b'.' => break,
+            _ => return Err(Error::config("unsupported opcode in pickle reply")),
+        }
+    }
+    let Some(ReplyVal::List(pair)) = stack.pop() else {
+        return Err(Error::config("unexpected pickle reply shape"));
+    };
+    let (Some(ReplyVal::Int(code)), Some(val)) = (pair.first(), pair.get(1)) else {
+        return Err(Error::config("malformed pickle reply tuple"));
+    };
+    if *code != 0 {
+        return Err(Error::config(val.render()));
+    }
+    Ok(val.render())
+}
+
+#[derive(Clone)]
+enum ReplyVal {
+    Mark,
+    None,
+    Int(i64),
+    Str(String),
+    List(Vec<Self>),
+}
+
+impl ReplyVal {
+    fn render(&self) -> String {
+        match self {
+            Self::Mark | Self::None => String::new(),
+            Self::Int(n) => n.to_string(),
+            Self::Str(s) => s.clone(),
+            Self::List(items) => items
+                .iter()
+                .map(Self::render)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -130,11 +130,8 @@ fn rejects_unknown_date_dns_multiline_and_conflicting_address_sources() {
     );
     host.options.insert("usedns".to_owned(), "no".to_owned());
     assert!(LegacyMatcher::compile(&host).is_ok());
+    // Stock filters such as dovecot.conf capture an optional IP in prefregex
+    // and an IP in failregex; failregex takes precedence with prefregex fallback.
     let both = filter(Some(PREFIX), r"^event from <ADDR>$", "");
-    assert!(
-        LegacyMatcher::compile(&both)
-            .unwrap_err()
-            .to_string()
-            .contains("both prefregex and failregex")
-    );
+    assert!(LegacyMatcher::compile(&both).is_ok());
 }

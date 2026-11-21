@@ -169,6 +169,8 @@ fn test_prune_stale_failures_drops_out_of_window_entries() {
         bantime_factor: 1.0,
         bantime_multipliers: vec![],
         bantime_maxtime: 0,
+        bantime_rndtime: 0,
+        ignore_command: None,
         compat_mode: false,
     };
 

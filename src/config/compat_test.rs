@@ -174,24 +174,24 @@ fn rejects_options_outside_the_stage_one_subset() {
     for (jail_conf, needle) in [
         (
             concat!(
-                "[DEFAULT]\nbackend = auto\nusedns = no\nignoreself = false\naction =\n",
+                "[DEFAULT]\nbackend = bogus\nusedns = no\nignoreself = false\naction =\n",
                 "[bad]\nenabled = true\nport = 1\nfilter = chain-auth\nlogpath = /tmp/x.log\n",
             ),
             "polling",
         ),
         (
             concat!(
-                "[DEFAULT]\nbackend = polling\nusedns = warn\nignoreself = false\naction =\n",
+                "[DEFAULT]\nbackend = polling\nusedns = yes\nignoreself = false\naction =\n",
                 "[bad]\nenabled = true\nport = 1\nfilter = chain-auth\nlogpath = /tmp/x.log\n",
             ),
-            "usedns=no",
+            "usedns=",
         ),
         (
             concat!(
-                "[DEFAULT]\nbackend = polling\nusedns = no\nignoreself = true\naction =\n",
+                "[DEFAULT]\nbackend = polling\nusedns = no\nignoreself = maybe\naction =\n",
                 "[bad]\nenabled = true\nport = 1\nfilter = chain-auth\nlogpath = /tmp/x.log\n",
             ),
-            "ignoreself=false",
+            "invalid ignoreself",
         ),
         (
             concat!(
@@ -204,17 +204,17 @@ fn rejects_options_outside_the_stage_one_subset() {
         (
             concat!(
                 "[DEFAULT]\nbackend = polling\nusedns = no\nignoreself = false\naction =\n",
-                "[bad]\nenabled = true\nport = http\nfilter = chain-auth\nlogpath = /tmp/x.log\n",
+                "[bad]\nenabled = true\nport = not-a-real-service-xyz\nfilter = chain-auth\nlogpath = /tmp/x.log\n",
             ),
-            "numeric ports",
+            "unknown port or service name",
         ),
         (
             concat!(
                 "[DEFAULT]\nbackend = polling\nusedns = no\nignoreself = false\naction =\n",
                 "[bad]\nenabled = true\nport = 8081\nfilter = chain-auth\nlogpath = /tmp/x.log\n",
-                "bantime.increment = true\n",
+                "bantime.formula = ban.Time * 2\n",
             ),
-            "bantime.increment",
+            "bantime.formula",
         ),
     ] {
         let tmp = tempfile::tempdir().expect("scratch");
@@ -340,4 +340,63 @@ fn stock_nginx_filter_with_journalmatch_compiles_in_polling_mode() {
     );
     let _matcher = crate::detect::legacy_matcher::LegacyMatcher::compile(resolved)
         .expect("compile stock matcher with journal-only metadata");
+}
+
+#[test]
+#[ignore = "requires the original Fail2Ban 1.1.1 Git checkout (FAIL2BAN_111_SOURCE)"]
+#[allow(clippy::indexing_slicing)]
+fn stock_upstream_nftables_and_iptables_actions_resolve_cleanly() {
+    let source = std::fs::canonicalize(
+        std::env::var_os("FAIL2BAN_111_SOURCE").expect("set FAIL2BAN_111_SOURCE"),
+    )
+    .expect("locate Fail2Ban 1.1.1 source");
+    let config_dir = source.join("config");
+
+    let nft = super::resolve_legacy_action(
+        &config_dir,
+        "sshd",
+        "nftables[type=multiport, port=22, protocol=tcp]",
+        &["22".into()],
+        "tcp",
+        600,
+    )
+    .expect("stock nftables.conf should resolve cleanly");
+    let crate::config::Backend::LegacyAction { actions } = nft else {
+        panic!("expected LegacyAction");
+    };
+    assert_eq!(actions.len(), 1);
+    assert!(
+        actions[0].ipv4.ban.contains("addr-set-sshd") && actions[0].ipv4.ban.contains("<ip>"),
+        "unexpected v4 nft ban: {}",
+        actions[0].ipv4.ban
+    );
+    assert!(
+        actions[0].ipv6.ban.contains("addr6-set-sshd") && actions[0].ipv6.ban.contains("<ip>"),
+        "unexpected v6 nft ban: {}",
+        actions[0].ipv6.ban
+    );
+
+    let ipt = super::resolve_legacy_action(
+        &config_dir,
+        "sshd",
+        "iptables-multiport[name=sshd, port=22, protocol=tcp]",
+        &["22".into()],
+        "tcp",
+        600,
+    )
+    .expect("stock iptables-multiport.conf should resolve cleanly");
+    let crate::config::Backend::LegacyAction { actions: ipt_acts } = ipt else {
+        panic!("expected LegacyAction");
+    };
+    assert_eq!(ipt_acts.len(), 1);
+    assert!(
+        ipt_acts[0].ipv4.ban.contains("iptables") && ipt_acts[0].ipv4.ban.contains("<ip>"),
+        "unexpected v4 ipt ban: {}",
+        ipt_acts[0].ipv4.ban
+    );
+    assert!(
+        ipt_acts[0].ipv6.ban.contains("ip6tables") && ipt_acts[0].ipv6.ban.contains("<ip>"),
+        "unexpected v6 ipt ban: {}",
+        ipt_acts[0].ipv6.ban
+    );
 }

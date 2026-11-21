@@ -140,6 +140,7 @@ async fn handle_legacy_failure(failure: Failure, s: &mut TrackerState) {
     let max_retry = u64::from(params.max_retry);
     let find_time = params.find_time.max(0) as u64;
     let base_ban_time = params.ban_time;
+    let ignore_command = params.ignore_command.clone();
 
     let fm = s
         .legacy_failures
@@ -149,6 +150,26 @@ async fn handle_legacy_failure(failure: Failure, s: &mut TrackerState) {
     let Some(ticket) = fm.take_for_ban(Some(failure.ip)) else {
         return;
     };
+    if let Some(cmd_tpl) = ignore_command.as_deref() {
+        let ip_str = ticket.ip.to_string();
+        let command = cmd_tpl.replace("<ip>", &ip_str).replace("<IP>", &ip_str);
+        if let Ok(out) = crate::enforce::cmd::output_with_timeout(
+            "sh",
+            "ignorecommand",
+            &["-c", &command],
+            std::time::Duration::from_secs(5),
+        )
+        .await
+            && out.status.success()
+        {
+            tracing::info!(
+                ip = %ticket.ip,
+                jail = %failure.jail_id,
+                "IP ignored by ignorecommand; not banning"
+            );
+            return;
+        }
+    }
 
     let observed_at = chrono::Utc::now().timestamp();
     let incoming_end = (base_ban_time >= 0).then(|| ticket.time.saturating_add(base_ban_time));

@@ -7,7 +7,7 @@
 use std::net::IpAddr;
 use std::path::Path;
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
 use crate::track::state::BanRecord;
@@ -89,6 +89,9 @@ impl LegacySqliteDb {
                 .execute("INSERT INTO fail2banDb(version) VALUES(4)", [])
                 .map_err(|e| sql_error("writing schema version", &e))?;
         }
+        if objects {
+            upgrade_legacy_schema_to_v4(&snapshot, path)?;
+        }
         validate_v4(&snapshot)?;
         snapshot
             .commit()
@@ -117,6 +120,63 @@ impl LegacySqliteDb {
             .map_err(|e| sql_error("writing log checkpoint", &e))?;
         tx.commit()
             .map_err(|e| sql_error("committing log checkpoint", &e))
+    }
+
+    /// Encode Fail2Ban 1.1.1 ticket `data` JSON BLOB (`{"matches":[...]}`),
+    /// bounding entries (max 50 lines, 4 KiB each) for safe SQLite persistence.
+    pub fn encode_ticket_data(matches: &[String]) -> Vec<u8> {
+        let bounded: Vec<&str> = matches
+            .iter()
+            .take(50)
+            .map(|line| {
+                let mut end = line.len().min(4096);
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                line.get(..end).unwrap_or("")
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "matches": bounded }))
+            .unwrap_or_else(|_| EMPTY_DATA.to_vec())
+    }
+
+    /// Write the active row and history atomically with matched log lines stored
+    /// in the `data` JSON BLOB (`{"matches":[...]}`), matching Fail2Ban 1.1.1.
+    pub fn upsert_ban_with_matches(
+        &self,
+        ban: &BanRecord,
+        ban_count: i64,
+        matches: &[String],
+    ) -> Result<()> {
+        let data = Self::encode_ticket_data(matches);
+        let tx = self.begin()?;
+        ensure_jail(&tx, &ban.jail_id)?;
+        let ip = ban.ip.to_string();
+        tx.execute(
+            "INSERT OR REPLACE INTO bips(ip, jail, timeofban, bantime, bancount, data) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ip,
+                ban.jail_id,
+                ban.banned_at,
+                duration(ban),
+                ban_count,
+                data.as_slice()
+            ],
+        )
+        .map_err(|e| sql_error("writing active ban with matches", &e))?;
+        tx.execute(
+            INSERT_HISTORY,
+            params![
+                ban.jail_id,
+                ip,
+                ban.banned_at,
+                duration(ban),
+                ban_count,
+                data.as_slice()
+            ],
+        )
+        .map_err(|e| sql_error("writing ban history with matches", &e))?;
+        tx.commit().map_err(|e| sql_error("committing ban", &e))
     }
 
     /// Write the active row and history atomically. Ticket data matches the
@@ -179,6 +239,23 @@ impl LegacySqliteDb {
         commit_wal()?;
         tx.commit()
             .map_err(|e| sql_error("committing active ban extension", &e))
+    }
+
+    /// Purge expired ban history rows older than `purge_age_secs` from `bans`,
+    /// matching upstream Fail2Ban 1.1.1 `Fail2BanDb.purge()`.
+    pub fn purge(&self, now_secs: i64, purge_age_secs: i64) -> Result<usize> {
+        if purge_age_secs <= 0 {
+            return Ok(0);
+        }
+        let cutoff = now_secs.saturating_sub(purge_age_secs);
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM bans WHERE bantime >= 0 AND (timeofban + bantime) < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| Error::persistence(format!("purging Fail2Ban SQLite bans: {e}")))?;
+        Ok(deleted)
     }
 
     /// Remove the active row while retaining ban history.
@@ -251,6 +328,114 @@ fn write_active(connection: &Connection, ban: &BanRecord, ban_count: i64) -> Res
             ],
         )
         .map_err(|e| sql_error("writing active ban", &e))?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+        params![table],
+        |r| r.get(0),
+    )
+    .map_err(|e| sql_error("checking table existence", &e))
+}
+
+/// Automatically upgrade Fail2Ban SQLite schema v1, v2, or v3 to v4, matching
+/// upstream `Fail2BanDb.updateDb()` (and creating a pre-upgrade `.bak` copy).
+/// Unrelated databases without `fail2banDb` are left untouched so `validate_v4`
+/// rejects them safely.
+fn upgrade_legacy_schema_to_v4(conn: &Connection, db_path: &Path) -> Result<()> {
+    if !table_exists(conn, "fail2banDb")?
+        || !table_exists(conn, "jails")?
+        || !table_exists(conn, "logs")?
+        || !table_exists(conn, "bans")?
+    {
+        return Ok(());
+    }
+    let version: Option<i64> = conn
+        .query_row("SELECT version FROM fail2banDb LIMIT 1", [], |r| r.get(0))
+        .optional()
+        .map_err(|e| sql_error("reading fail2banDb version", &e))?;
+    let Some(version) = version else {
+        return Ok(());
+    };
+    if !(1..4).contains(&version) {
+        return Ok(());
+    }
+    let backup = db_path.with_extension("sqlite3.bak");
+    if db_path.is_file() && !backup.exists() {
+        let _ = std::fs::copy(db_path, &backup);
+    }
+    if version < 2 && table_exists(conn, "logs")? {
+        conn.execute_batch(concat!(
+            "CREATE TEMPORARY TABLE logs_temp AS SELECT * FROM logs;",
+            "DROP TABLE logs;",
+            "CREATE TABLE logs(",
+            "jail TEXT NOT NULL, ",
+            "path TEXT, ",
+            "firstlinemd5 TEXT, ",
+            "lastfilepos INTEGER DEFAULT 0, ",
+            "FOREIGN KEY(jail) REFERENCES jails(name) ON DELETE CASCADE, ",
+            "UNIQUE(jail, path), ",
+            "UNIQUE(jail, path, firstlinemd5)",
+            ");",
+            "CREATE INDEX IF NOT EXISTS logs_path ON logs(path);",
+            "CREATE INDEX IF NOT EXISTS logs_jail_path ON logs(jail, path);",
+            "INSERT INTO logs SELECT * FROM logs_temp;",
+            "DROP TABLE logs_temp;",
+            "UPDATE fail2banDb SET version = 2;",
+        ))
+        .map_err(|e| sql_error("migrating Fail2Ban SQLite v1 -> v2", &e))?;
+    }
+    if version < 3 && table_exists(conn, "bans")? {
+        conn.execute_batch(concat!(
+            "CREATE TEMPORARY TABLE bans_temp AS ",
+            "SELECT jail, ip, timeofban, -2 AS bantime, 1 AS bancount, data FROM bans;",
+            "DROP TABLE bans;",
+            "CREATE TABLE bans(",
+            "jail TEXT NOT NULL, ",
+            "ip TEXT, ",
+            "timeofban INTEGER NOT NULL, ",
+            "bantime INTEGER NOT NULL, ",
+            "bancount INTEGER NOT NULL default 1, ",
+            "data JSON, ",
+            "FOREIGN KEY(jail) REFERENCES jails(name) ON DELETE CASCADE",
+            ");",
+            "CREATE INDEX IF NOT EXISTS bans_jail_timeofban_ip ON bans(jail, timeofban);",
+            "CREATE INDEX IF NOT EXISTS bans_jail_ip ON bans(jail, ip);",
+            "CREATE INDEX IF NOT EXISTS bans_ip ON bans(ip);",
+            "INSERT INTO bans SELECT * FROM bans_temp;",
+            "DROP TABLE bans_temp;",
+        ))
+        .map_err(|e| sql_error("migrating Fail2Ban SQLite v2 -> v3", &e))?;
+    }
+    if version < 4 && !table_exists(conn, "bips")? {
+        conn.execute_batch(concat!(
+            "CREATE TABLE bips(",
+            "ip TEXT NOT NULL, ",
+            "jail TEXT NOT NULL, ",
+            "timeofban INTEGER NOT NULL, ",
+            "bantime INTEGER NOT NULL, ",
+            "bancount INTEGER NOT NULL default 1, ",
+            "data JSON, ",
+            "PRIMARY KEY(ip, jail)",
+            ");",
+            "CREATE INDEX IF NOT EXISTS bips_timeofban ON bips(timeofban);",
+            "CREATE INDEX IF NOT EXISTS bips_ip ON bips(ip);",
+            "UPDATE fail2banDb SET version = 4;",
+        ))
+        .map_err(|e| sql_error("migrating Fail2Ban SQLite v3 -> v4", &e))?;
+        if table_exists(conn, "bans")? {
+            conn.execute(
+                "INSERT OR REPLACE INTO bips(ip, jail, timeofban, bantime, bancount, data) \
+                 SELECT ip, jail, timeofban, bantime, bancount, data FROM bans ORDER BY timeofban",
+                [],
+            )
+            .map_err(|e| sql_error("backfilling bips during v4 migration", &e))?;
+        }
+    }
+    conn.execute_batch(SCHEMA_V4_DDL)
+        .map_err(|e| sql_error("finalizing v4 schema", &e))?;
     Ok(())
 }
 
@@ -526,5 +711,100 @@ print(json.dumps({'bans': bans, 'paths': paths}))
         let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(parsed["bans"], serde_json::json!(["198.51.100.81"]));
         assert_eq!(parsed["paths"], serde_json::json!(["/var/log/auth.log"]));
+    }
+
+    #[test]
+    fn purge_removes_expired_history_older_than_purge_age() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let db_path = dir.path().join("fail2ban.sqlite3");
+        let db = LegacySqliteDb::open_or_create(&db_path).expect("open");
+        let old_ban = BanRecord {
+            ip: "198.51.100.1".parse().expect("ip"),
+            jail_id: "sshd".to_owned(),
+            banned_at: 1_000,
+            expires_at: Some(1_600),
+        };
+        let recent_ban = BanRecord {
+            ip: "198.51.100.2".parse().expect("ip"),
+            jail_id: "sshd".to_owned(),
+            banned_at: 100_000,
+            expires_at: Some(100_600),
+        };
+        let perm_ban = BanRecord {
+            ip: "198.51.100.3".parse().expect("ip"),
+            jail_id: "sshd".to_owned(),
+            banned_at: 1_000,
+            expires_at: None,
+        };
+        db.upsert_ban(&old_ban, 1).expect("old");
+        db.upsert_ban(&recent_ban, 1).expect("recent");
+        db.upsert_ban(&perm_ban, 1).expect("perm");
+
+        let deleted = db.purge(100_500, 86_400).expect("purge");
+        assert_eq!(deleted, 1);
+
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM bans", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn migrates_legacy_v2_schema_to_v4_preserving_jails_logs_and_bans() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let db_path = dir.path().join("fail2ban.sqlite3");
+        {
+            let conn = Connection::open(&db_path).expect("seed v2");
+            conn.execute_batch(concat!(
+                "CREATE TABLE fail2banDb(version INTEGER);",
+                "INSERT INTO fail2banDb(version) VALUES(2);",
+                "CREATE TABLE jails(name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);",
+                "INSERT INTO jails(name, enabled) VALUES('sshd', 1);",
+                "CREATE TABLE logs(jail TEXT NOT NULL, path TEXT, firstlinemd5 TEXT, lastfilepos INTEGER DEFAULT 0, UNIQUE(jail, path));",
+                "INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES('sshd', '/var/log/auth.log', 'abc', 128);",
+                "CREATE TABLE bans(jail TEXT NOT NULL, ip TEXT, timeofban INTEGER NOT NULL, data JSON);",
+                "INSERT INTO bans(jail, ip, timeofban, data) VALUES('sshd', '198.51.100.7', 1700000000, X'7b7d');",
+            ))
+            .expect("v2 schema");
+        }
+        let db = LegacySqliteDb::open_or_create(&db_path).expect("migrate v2 -> v4");
+        assert!(db_path.with_extension("sqlite3.bak").is_file());
+        let ver: i64 = db
+            .conn
+            .query_row("SELECT version FROM fail2banDb LIMIT 1", [], |r| r.get(0))
+            .expect("ver");
+        assert_eq!(ver, 4);
+        let bip_ip: String = db
+            .conn
+            .query_row("SELECT ip FROM bips WHERE jail = 'sshd'", [], |r| r.get(0))
+            .expect("backfilled bip");
+        assert_eq!(bip_ip, "198.51.100.7");
+    }
+
+    #[test]
+    fn upsert_ban_with_matches_persists_upstream_json_blob() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let db_path = dir.path().join("fail2ban.sqlite3");
+        let db = LegacySqliteDb::open_or_create(&db_path).expect("open");
+        let ban = BanRecord {
+            ip: "198.51.100.44".parse().expect("ip"),
+            jail_id: "sshd".to_owned(),
+            banned_at: 1_700_000_123,
+            expires_at: Some(1_700_000_723),
+        };
+        let lines =
+            vec!["Nov 21 12:00:00 srv sshd[1]: Failed password from 198.51.100.44".to_owned()];
+        db.upsert_ban_with_matches(&ban, 1, &lines).expect("upsert");
+        let blob: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT data FROM bips WHERE ip = '198.51.100.44'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read data");
+        let val: serde_json::Value = serde_json::from_slice(&blob).expect("json");
+        assert_eq!(val.get("matches"), Some(&serde_json::json!(lines)));
     }
 }

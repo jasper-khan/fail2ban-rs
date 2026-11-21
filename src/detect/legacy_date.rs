@@ -134,6 +134,179 @@ pub(crate) fn split_nginx_ln_begin(line: &str) -> Option<LegacyDate<'_>> {
     })
 }
 
+/// Split a Fail2Ban 1.1.1 `{^LN-BEG}` line timestamp supporting:
+/// 1. Nginx `YYYY/MM/DD HH:MM:SS`
+/// 2. ISO 8601 `YYYY-MM-DD[T ]HH:MM:SS[.,frac][tz]` (e.g. `recidive`)
+/// 3. Apache `Day Mon DD HH:MM:SS[.frac] YYYY` (preserving surrounding `[` and `]` as `[]`)
+/// 4. Syslog `Mon [ ]D HH:MM:SS` (e.g. `postfix`, `dovecot`, `sshd`)
+pub(crate) fn split_legacy_ln_begin(line: &str) -> Option<LegacyDate<'_>> {
+    if let Some(d) = split_nginx_ln_begin(line) {
+        return Some(d);
+    }
+    if let Some(d) = split_iso_ln_begin(line) {
+        return Some(d);
+    }
+    if let Some(d) = split_apache_ln_begin(line) {
+        return Some(d);
+    }
+    split_syslog_ln_begin(line)
+}
+
+fn split_iso_ln_begin(line: &str) -> Option<LegacyDate<'_>> {
+    // Allow optional leading `[` or single space.
+    let (before, rest) = if let Some(r) = line.strip_prefix('[') {
+        ("[", r)
+    } else if let Some(r) = line.strip_prefix(' ') {
+        (" ", r)
+    } else {
+        ("", line)
+    };
+    let head = rest.get(..19)?;
+    let b = head.as_bytes();
+    if b.get(4) != Some(&b'-')
+        || b.get(7) != Some(&b'-')
+        || !matches!(b.get(10), Some(b' ' | b'T'))
+        || b.get(13) != Some(&b':')
+        || b.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let year: i32 = head.get(0..4)?.parse().ok()?;
+    let month: u32 = head.get(5..7)?.parse().ok()?;
+    let day: u32 = head.get(8..10)?.parse().ok()?;
+    let hour: u32 = head.get(11..13)?.parse().ok()?;
+    let min: u32 = head.get(14..16)?.parse().ok()?;
+    let sec: u32 = head.get(17..19)?.parse().ok()?;
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
+    let mut after = rest.get(19..)?;
+    if let Some(frac) = after.strip_prefix(['.', ',']) {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        after = frac.get(digits..)?;
+    }
+    if let Some(rem) = after.strip_prefix('Z') {
+        after = rem;
+    }
+    let unix_seconds = naive
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|dt| dt.timestamp())
+        .or_else(|| Some(naive.and_utc().timestamp()));
+    let matched = rest
+        .get(..rest.len().saturating_sub(after.len()))
+        .unwrap_or("");
+    Some(LegacyDate {
+        before,
+        matched,
+        after,
+        unix_seconds,
+    })
+}
+
+fn parse_month_abbrev(m: &str) -> Option<u32> {
+    match m {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn split_apache_ln_begin(line: &str) -> Option<LegacyDate<'_>> {
+    let (before, rest) = if let Some(r) = line.strip_prefix('[') {
+        ("[", r)
+    } else {
+        ("", line)
+    };
+    // Format: `Sat Nov 21 12:10:00[.123456] 2026`
+    let _dow = rest.get(0..3)?;
+    if rest.as_bytes().get(3) != Some(&b' ') {
+        return None;
+    }
+    let month = parse_month_abbrev(rest.get(4..7)?)?;
+    if rest.as_bytes().get(7) != Some(&b' ') {
+        return None;
+    }
+    let day_str = rest.get(8..10)?.trim();
+    let day: u32 = day_str.parse().ok()?;
+    if rest.as_bytes().get(10) != Some(&b' ') {
+        return None;
+    }
+    let hms = rest.get(11..19)?;
+    if hms.as_bytes().get(2) != Some(&b':') || hms.as_bytes().get(5) != Some(&b':') {
+        return None;
+    }
+    let hour: u32 = hms.get(0..2)?.parse().ok()?;
+    let min: u32 = hms.get(3..5)?.parse().ok()?;
+    let sec: u32 = hms.get(6..8)?.parse().ok()?;
+    let mut tail = rest.get(19..)?;
+    if let Some(frac) = tail.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        tail = frac.get(digits..)?;
+    }
+    let tail = tail.strip_prefix(' ')?;
+    let year: i32 = tail.get(0..4)?.parse().ok()?;
+    let after = tail.get(4..)?;
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
+    let unix_seconds = naive
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|dt| dt.timestamp())
+        .or_else(|| Some(naive.and_utc().timestamp()));
+    let matched = rest
+        .get(..rest.len().saturating_sub(after.len()))
+        .unwrap_or("");
+    Some(LegacyDate {
+        before,
+        matched,
+        after,
+        unix_seconds,
+    })
+}
+
+fn split_syslog_ln_begin(line: &str) -> Option<LegacyDate<'_>> {
+    // Format: `Nov 21 12:10:00` or `Nov  1 12:10:00`
+    let month = parse_month_abbrev(line.get(0..3)?)?;
+    if line.as_bytes().get(3) != Some(&b' ') {
+        return None;
+    }
+    let day_str = line.get(4..6)?.trim();
+    let day: u32 = day_str.parse().ok()?;
+    if line.as_bytes().get(6) != Some(&b' ') {
+        return None;
+    }
+    let hms = line.get(7..15)?;
+    if hms.as_bytes().get(2) != Some(&b':') || hms.as_bytes().get(5) != Some(&b':') {
+        return None;
+    }
+    let hour: u32 = hms.get(0..2)?.parse().ok()?;
+    let min: u32 = hms.get(3..5)?.parse().ok()?;
+    let sec: u32 = hms.get(6..8)?.parse().ok()?;
+    let after = line.get(15..)?;
+    let year = chrono::Datelike::year(&chrono::Local::now());
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
+    let unix_seconds = naive
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|dt| dt.timestamp())
+        .or_else(|| Some(naive.and_utc().timestamp()));
+    let matched = line.get(..15).unwrap_or("");
+    Some(LegacyDate {
+        before: "",
+        matched,
+        after,
+        unix_seconds,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

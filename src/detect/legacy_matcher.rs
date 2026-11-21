@@ -7,11 +7,11 @@
 use std::borrow::Cow;
 use std::net::IpAddr;
 
-use regex::{Captures, Regex};
+use crate::detect::legacy_regex::{CompiledCaptures, CompiledRegex};
 
 use crate::config::legacy_filter::ResolvedFilter;
 use crate::detect::extract::normalize_mapped;
-use crate::detect::legacy_date::split_nginx_ln_begin;
+use crate::detect::legacy_date::split_legacy_ln_begin;
 use crate::detect::legacy_regex::{self, ADDRESS, CONTENT, Role, USER};
 use crate::detect::watcher::MAX_LINE_LEN;
 use crate::error::{Error, Result};
@@ -20,10 +20,10 @@ use crate::error::{Error, Result};
 /// public enum; compiling stays crate-internal.
 #[derive(Debug)]
 pub struct LegacyMatcher {
-    prefix: Option<Regex>,
+    prefix: Option<CompiledRegex>,
     prefix_has_address: bool,
-    failures: Vec<Regex>,
-    ignores: Vec<Regex>,
+    failures: Vec<CompiledRegex>,
+    ignores: Vec<CompiledRegex>,
     pub(super) file_find_time: Option<i64>,
 }
 
@@ -58,7 +58,14 @@ impl LegacyMatcher {
                 "legacy matcher does not support multiline filters",
             ));
         }
-        if option("datepattern") != Some("{^LN-BEG}") {
+        let datepattern_ok = match option("datepattern").map(str::trim) {
+            None | Some("" | "{^LN-BEG}" | "^{DATE}") => true,
+            Some(multi) => multi
+                .lines()
+                .map(str::trim)
+                .any(|l| matches!(l, "{^LN-BEG}" | "^{DATE}")),
+        };
+        if !datepattern_ok {
             return Err(Error::config(
                 "legacy matcher supports only datepattern {^LN-BEG} with the nginx timestamp format",
             ));
@@ -85,15 +92,10 @@ impl LegacyMatcher {
         let failures = split_rules(option("failregex"))
             .map(|pattern| {
                 let rule = compile(pattern, Role::Failure)?;
-                if has_address(&rule) == prefix_has_address {
-                    return Err(Error::config(if prefix_has_address {
-                        // Stock nginx has a single authoritative prefix IP.
-                        // Upstream merges capture dictionaries in other rules;
-                        // this subset intentionally does not resolve conflicts.
-                        "legacy matcher does not support IP captures in both prefregex and failregex"
-                    } else {
-                        "legacy failregex must supply an IP when prefregex supplies none"
-                    }));
+                if !has_address(&rule) && !prefix_has_address {
+                    return Err(Error::config(
+                        "legacy failregex must supply an IP when prefregex supplies none",
+                    ));
                 }
                 Ok(rule)
             })
@@ -136,7 +138,7 @@ impl LegacyMatcher {
         if line.len() > MAX_LINE_LEN || line.contains(['\r', '\n']) {
             return LineResult::Miss;
         }
-        let Some(date) = split_nginx_ln_begin(line) else {
+        let Some(date) = split_legacy_ln_begin(line) else {
             return LineResult::Miss;
         };
         let Some(timestamp) = date.unix_seconds.and_then(admit) else {
@@ -180,11 +182,7 @@ impl LegacyMatcher {
             if let Some(pattern_idx) = first_ignore(&self.ignores, content) {
                 return LineResult::Ignored { pattern_idx };
             }
-            let address = if self.prefix_has_address {
-                prefix_address
-            } else {
-                capture(&captures, ADDRESS)
-            };
+            let address = capture(&captures, ADDRESS).or(prefix_address);
             let Some(ip) = address.and_then(|value| value.parse::<IpAddr>().ok()) else {
                 // Do not try another source after a selected rule's capture
                 // failed validation.
@@ -208,18 +206,15 @@ fn split_rules(list: Option<&str>) -> impl Iterator<Item = &str> {
         .filter(|pattern| !pattern.is_empty())
 }
 
-fn has_address(regex: &Regex) -> bool {
-    regex
-        .capture_names()
-        .flatten()
-        .any(|group| group == ADDRESS)
+fn has_address(regex: &CompiledRegex) -> bool {
+    regex.has_capture(ADDRESS)
 }
 
-fn capture<'h>(captures: &Captures<'h>, key: &str) -> Option<&'h str> {
-    captures.name(key).map(|matched| matched.as_str())
+fn capture<'h>(captures: &CompiledCaptures<'h>, key: &str) -> Option<&'h str> {
+    captures.name(key)
 }
 
-fn first_ignore(ignores: &[Regex], line: &str) -> Option<usize> {
+fn first_ignore(ignores: &[CompiledRegex], line: &str) -> Option<usize> {
     ignores.iter().position(|regex| regex.is_match(line))
 }
 

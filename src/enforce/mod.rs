@@ -4,7 +4,7 @@
 //! reading commands from a bounded mpsc channel.
 
 /// Shared subprocess runner with timeout and kill-on-drop.
-mod cmd;
+pub(crate) mod cmd;
 /// Executor task loop and per-command firewall handlers.
 mod executor;
 /// ipset firewall backend.
@@ -287,17 +287,9 @@ pub fn create_backend(backend: &Backend) -> Result<Box<dyn FirewallBackend>> {
             ban_cmd.clone(),
             unban_cmd.clone(),
         ))),
-        Backend::LegacyAction {
-            action_start,
-            action_ban,
-            action_unban,
-            action_stop,
-        } => Ok(Box::new(legacy_action_backend::LegacyActionBackend::new(
-            action_start.clone(),
-            action_ban.clone(),
-            action_unban.clone(),
-            action_stop.clone(),
-        ))),
+        Backend::LegacyAction { actions } => Ok(Box::new(
+            legacy_action_backend::LegacyActionBackend::new(actions.clone()),
+        )),
     }
 }
 

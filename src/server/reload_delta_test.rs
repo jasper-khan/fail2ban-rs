@@ -43,6 +43,8 @@ pub(crate) fn test_jail_config() -> JailConfig {
         bantime_factor: 1.0,
         bantime_multipliers: vec![],
         bantime_maxtime: 604_800,
+        bantime_rndtime: 0,
+        ignore_command: None,
         backend: crate::config::Backend::Nftables,
         log_backend: crate::config::LogBackend::default(),
         journalmatch: vec![],

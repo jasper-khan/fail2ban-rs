@@ -58,6 +58,12 @@ pub(super) async fn process_unbans(s: &mut TrackerState) {
     for key in expired {
         unban_expired(key, s).await;
     }
+    if let Some(db) = &s.sqlite_mirror {
+        let guard = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(err) = guard.purge(now, s.sqlite_purge_age) {
+            warn!(error = %err, "failed to purge expired Fail2Ban SQLite ban history");
+        }
+    }
 
     prune_stale_failures(&mut s.failures, &s.jail_params, now);
     for fm in s.legacy_failures.values_mut() {

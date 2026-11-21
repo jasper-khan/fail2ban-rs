@@ -101,6 +101,7 @@ pub(super) struct TrackerState {
     /// Optional live mirror to Fail2Ban 1.1.1 v4 SQLite (`--legacy-sqlite-rw`).
     pub(super) sqlite_mirror:
         Option<Arc<std::sync::Mutex<crate::track::legacy_sqlite_rw::LegacySqliteDb>>>,
+    pub(super) sqlite_purge_age: i64,
     /// A detection could not be persisted; freeze durable log progress so
     /// a restart can replay it instead of silently skipping that input.
     pub(super) automatic_persistence_failed: bool,

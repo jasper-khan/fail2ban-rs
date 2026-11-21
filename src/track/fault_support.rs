@@ -105,6 +105,7 @@ pub(crate) fn rig(store: BanStore) -> Rig {
         legacy_failures: HashMap::new(),
         automatic_persistence_failed: false,
         sqlite_mirror: None,
+        sqlite_purge_age: 86_400,
         store,
         index: BanIndex::default(),
         counters: Counters::default(),

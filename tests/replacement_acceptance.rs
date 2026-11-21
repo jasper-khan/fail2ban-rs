@@ -784,3 +784,426 @@ print(json.dumps({"bans": bans, "logs": [[r[0], r[1]] for r in rows]}))
         "rollback log offset must advance past initial {initial_pos}, got {persisted_pos}"
     );
 }
+
+#[test]
+#[ignore = "requires local pinned Fail2Ban 1.1.1 via FAIL2BAN_111_SOURCE and Python 3"]
+fn dual_stack_multi_action_and_extended_client_commands_e2e() {
+    let source = std::fs::canonicalize(
+        std::env::var_os("FAIL2BAN_111_SOURCE").expect("set FAIL2BAN_111_SOURCE"),
+    )
+    .expect("locate Fail2Ban 1.1.1 source");
+
+    let tmp = tempfile::tempdir().expect("scratch");
+    let base = tmp.path().join("f2b");
+    let filter_dir = base.join("filter.d");
+    let action_dir = base.join("action.d");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&filter_dir).expect("filter.d");
+    std::fs::create_dir_all(&action_dir).expect("action.d");
+    std::fs::create_dir_all(&state).expect("state");
+
+    let db_path = state.join("fail2ban.sqlite3");
+    let fw_log = tmp.path().join("fw-audit.log");
+    let notify_log = tmp.path().join("notify-audit.log");
+    let repair_marker = tmp.path().join("repaired.flag");
+    let legacy_sock = tmp.path().join("fail2ban-dual.sock");
+    let auth_log = tmp.path().join("auth.log");
+    std::fs::write(&auth_log, b"").expect("auth.log");
+
+    std::fs::copy(
+        source.join("config/filter.d/common.conf"),
+        filter_dir.join("common.conf"),
+    )
+    .expect("copy common.conf");
+    std::fs::copy(
+        source.join("config/filter.d/sshd.conf"),
+        filter_dir.join("sshd.conf"),
+    )
+    .expect("copy sshd.conf");
+
+    // Primary dual-stack action with actionstart_on_demand, actioncheck/repair,
+    // actionflush, and [Init?family=inet6] override.
+    // The first ban fails until repair_marker is created by actionrepair, exercising
+    // the exact upstream check -> repair -> retry ban path!
+    std::fs::write(
+        action_dir.join("dual-fw.conf"),
+        format!(
+            "[Definition]\n\
+             actionstart_on_demand = true\n\
+             actionstart = printf 'START <set_name> <port>\\n' >> {log}\n\
+             actioncheck = test -f {marker}\n\
+             actionrepair = touch {marker} && printf 'REPAIR <set_name>\\n' >> {log}\n\
+             actionflush = printf 'FLUSH <set_name>\\n' >> {log}\n\
+             actionstop = printf 'STOP <set_name>\\n' >> {log}\n\
+             actionban = test -f {marker} && printf 'BAN <set_name> <family> <ip> <ip-rev>\\n' >> {log}\n\
+             actionunban = printf 'UNBAN <set_name> <family> <ip>\\n' >> {log}\n\
+             [Init]\n\
+             set_name = v4-<name>\n\
+             [Init?family=inet6]\n\
+             set_name = v6-<name>\n",
+            log = fw_log.display(),
+            marker = repair_marker.display(),
+        ),
+    )
+    .expect("dual-fw.conf");
+
+    // Secondary notification action to verify multi-action execution.
+    std::fs::write(
+        action_dir.join("notify-audit.conf"),
+        format!(
+            "[Definition]\n\
+             actionban = printf 'NOTIFY-BAN <name> <ip>\\n' >> {log}\n\
+             actionunban = printf 'NOTIFY-UNBAN <name> <ip>\\n' >> {log}\n",
+            log = notify_log.display(),
+        ),
+    )
+    .expect("notify-audit.conf");
+
+    std::fs::write(
+        base.join("fail2ban.conf"),
+        format!(
+            "[Definition]\nsocket = {}\ndbfile = {}\n",
+            tmp.path().join("orig.sock").display(),
+            db_path.display()
+        ),
+    )
+    .expect("fail2ban.conf");
+
+    // Uses stock `backend = auto`, `port = ssh`, `ignoreself = true`, and TWO actions!
+    std::fs::write(
+        base.join("jail.conf"),
+        format!(
+            "[DEFAULT]\n\
+             backend = auto\n\
+             usedns = no\n\
+             ignoreself = true\n\
+             \n\
+             [sshd]\n\
+             enabled = true\n\
+             port = ssh\n\
+             protocol = tcp\n\
+             filter = sshd\n\
+             action = dual-fw[name=sshd]\n  notify-audit[name=sshd]\n\
+             logpath = {}\n\
+             maxretry = 2\n\
+             findtime = 120s\n\
+             bantime = 600s\n",
+            auth_log.display(),
+        ),
+    )
+    .expect("jail.conf");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fail2ban-rs"))
+        .arg("run")
+        .arg("--legacy-dir")
+        .arg(&base)
+        .arg("--legacy-execute-actions")
+        .arg("--legacy-sqlite-rw")
+        .arg("--legacy-socket")
+        .arg(&legacy_sock)
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fail2ban-rs");
+    let stderr = child.stderr.take().expect("stderr");
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            sink.lock().expect("lock").push(line);
+        }
+    });
+    let daemon = Daemon { child, lines };
+
+    wait_for("startup + legacy socket", &daemon, || {
+        daemon.saw("fail2ban-rs started") && legacy_sock.exists()
+    });
+    // Because actionstart_on_demand = true, START must NOT have run yet!
+    assert!(
+        decisions(&fw_log).is_empty(),
+        "actionstart_on_demand should defer START until first ban"
+    );
+
+    let run_client = |args: &[&str]| -> std::process::Output {
+        Command::new("python3")
+            .arg(source.join("bin/fail2ban-client"))
+            .arg("-c")
+            .arg(&base)
+            .arg("-s")
+            .arg(&legacy_sock)
+            .args(args)
+            .env("PYTHONPATH", &source)
+            .output()
+            .expect("run upstream fail2ban-client")
+    };
+
+    // Extended client commands: version, echo, flushlogs.
+    let ver = run_client(&["version"]);
+    assert!(ver.status.success());
+    assert!(String::from_utf8_lossy(&ver.stdout).contains("1.1.1"));
+
+    let echo = run_client(&["echo", "hello", "f2b"]);
+    assert!(echo.status.success());
+    assert!(String::from_utf8_lossy(&echo.stdout).contains("hello"));
+
+    let fl = run_client(&["flushlogs"]);
+    assert!(fl.status.success());
+
+    // Runtime get/set queries matching upstream fail2ban-client.
+    let get_mr = run_client(&["get", "sshd", "maxretry"]);
+    assert!(get_mr.status.success());
+    assert_eq!(String::from_utf8_lossy(&get_mr.stdout).trim(), "2");
+
+    let get_ft = run_client(&["get", "sshd", "findtime"]);
+    assert!(get_ft.status.success());
+    assert_eq!(String::from_utf8_lossy(&get_ft.stdout).trim(), "120");
+
+    let get_bt = run_client(&["get", "sshd", "bantime"]);
+    assert!(get_bt.status.success());
+    assert_eq!(String::from_utf8_lossy(&get_bt.stdout).trim(), "600");
+
+    let get_acts = run_client(&["get", "sshd", "actions"]);
+    assert!(get_acts.status.success());
+    let acts_out = String::from_utf8_lossy(&get_acts.stdout);
+    assert!(
+        acts_out.contains("dual-fw") && acts_out.contains("notify-audit"),
+        "actions: {acts_out}"
+    );
+
+    let get_lp = run_client(&["get", "sshd", "logpath"]);
+    assert!(get_lp.status.success());
+    assert!(String::from_utf8_lossy(&get_lp.stdout).contains("auth.log"));
+
+    let get_db = run_client(&["get", "dbfile"]);
+    assert!(get_db.status.success());
+    assert!(String::from_utf8_lossy(&get_db.stdout).contains("fail2ban.sqlite3"));
+
+    let get_pa = run_client(&["get", "dbpurgeage"]);
+    assert!(get_pa.status.success());
+    assert!(String::from_utf8_lossy(&get_pa.stdout).contains("86400"));
+
+    // Pure-Rust `fail2ban-rs client` drop-in CLI test against the live legacy socket!
+    let rust_ping = Command::new(env!("CARGO_BIN_EXE_fail2ban-rs"))
+        .arg("client")
+        .arg("-s")
+        .arg(&legacy_sock)
+        .arg("ping")
+        .output()
+        .expect("run fail2ban-rs client ping");
+    assert!(
+        rust_ping.status.success(),
+        "fail2ban-rs client ping failed: {}",
+        String::from_utf8_lossy(&rust_ping.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rust_ping.stdout).trim(), "pong");
+
+    // Dynamic addignoreip / delignoreip, addlogpath / dellogpath, status --all, loglevel!
+    let add_ig = run_client(&["set", "sshd", "addignoreip", "192.0.2.55"]);
+    assert!(
+        add_ig.status.success(),
+        "addignoreip failed: {}",
+        String::from_utf8_lossy(&add_ig.stderr)
+    );
+    let get_ig = run_client(&["get", "sshd", "ignoreip"]);
+    assert!(String::from_utf8_lossy(&get_ig.stdout).contains("192.0.2.55"));
+    let del_ig = run_client(&["set", "sshd", "delignoreip", "192.0.2.55"]);
+    assert!(del_ig.status.success());
+
+    let extra_log = tmp.path().join("extra.log");
+    std::fs::write(&extra_log, b"").expect("extra.log");
+    let add_lp = run_client(&["set", "sshd", "addlogpath", extra_log.to_str().unwrap()]);
+    assert!(
+        add_lp.status.success(),
+        "addlogpath failed: {}",
+        String::from_utf8_lossy(&add_lp.stderr)
+    );
+    let del_lp = run_client(&["set", "sshd", "dellogpath", extra_log.to_str().unwrap()]);
+    assert!(del_lp.status.success());
+
+    let st_all = run_client(&["status", "--all"]);
+    assert!(st_all.status.success());
+    let ll = run_client(&["get", "loglevel"]);
+    assert!(ll.status.success());
+
+    let set_mr = run_client(&["set", "sshd", "maxretry", "4"]);
+    assert!(
+        set_mr.status.success(),
+        "set maxretry failed: {}",
+        String::from_utf8_lossy(&set_mr.stderr)
+    );
+    let get_mr2 = run_client(&["get", "sshd", "maxretry"]);
+    assert_eq!(String::from_utf8_lossy(&get_mr2.stdout).trim(), "4");
+
+    // Multi-IP ban covering BOTH IPv4 and IPv6!
+    let ban = run_client(&["set", "sshd", "banip", "198.51.100.42", "2001:db8::9"]);
+    assert!(
+        ban.status.success(),
+        "multi banip failed: {}",
+        String::from_utf8_lossy(&ban.stderr)
+    );
+
+    wait_for("dual-stack + repair + multi-action ban", &daemon, || {
+        let fw = decisions(&fw_log);
+        let nt = decisions(&notify_log);
+        fw.iter().any(|l| l == "START v4-sshd 22")
+            && fw.iter().any(|l| l == "REPAIR v4-sshd")
+            && fw
+                .iter()
+                .any(|l| l == "BAN v4-sshd inet4 198.51.100.42 42.100.51.198.")
+            && fw.iter().any(|l| l == "START v6-sshd 22")
+            && fw
+                .iter()
+                .any(|l| l.starts_with("BAN v6-sshd inet6 2001:db8::9 "))
+            && nt.iter().any(|l| l == "NOTIFY-BAN sshd 198.51.100.42")
+            && nt.iter().any(|l| l == "NOTIFY-BAN sshd 2001:db8::9")
+    });
+
+    // Query `get sshd banned <ip>` and global `banned <ip>`.
+    let is_banned = run_client(&["get", "sshd", "banned", "198.51.100.42"]);
+    assert!(is_banned.status.success());
+    assert_eq!(String::from_utf8_lossy(&is_banned.stdout).trim(), "1");
+
+    let global_banned = run_client(&["banned", "198.51.100.42"]);
+    assert!(global_banned.status.success());
+    assert!(String::from_utf8_lossy(&global_banned.stdout).contains("sshd"));
+
+    // Global `unban --all` unbans both IPv4 and IPv6 across both actions!
+    let unban_all = run_client(&["unban", "--all"]);
+    assert!(
+        unban_all.status.success(),
+        "unban --all failed: {}",
+        String::from_utf8_lossy(&unban_all.stderr)
+    );
+    wait_for("both actions unbanned v4+v6", &daemon, || {
+        let fw = decisions(&fw_log);
+        let nt = decisions(&notify_log);
+        fw.iter().any(|l| l == "UNBAN v4-sshd inet4 198.51.100.42")
+            && fw.iter().any(|l| l == "UNBAN v6-sshd inet6 2001:db8::9")
+            && nt.iter().any(|l| l == "NOTIFY-UNBAN sshd 198.51.100.42")
+            && nt.iter().any(|l| l == "NOTIFY-UNBAN sshd 2001:db8::9")
+    });
+
+    // Single-jail `stop sshd` then `start sshd` via real upstream fail2ban-client!
+    let stop_jail = run_client(&["stop", "sshd"]);
+    assert!(
+        stop_jail.status.success(),
+        "stop sshd failed: {}",
+        String::from_utf8_lossy(&stop_jail.stderr)
+    );
+    let st_after_stop = run_client(&["status"]);
+    assert!(st_after_stop.status.success());
+    assert!(
+        String::from_utf8_lossy(&st_after_stop.stdout).contains("Number of jail:	0"),
+        "expected 0 jails after stop sshd, got: {}",
+        String::from_utf8_lossy(&st_after_stop.stdout)
+    );
+    let start_jail = run_client(&["start", "sshd"]);
+    assert!(
+        start_jail.status.success(),
+        "start sshd failed: {}",
+        String::from_utf8_lossy(&start_jail.stderr)
+    );
+    let st_after_start = run_client(&["status"]);
+    assert!(st_after_start.status.success());
+    assert!(
+        String::from_utf8_lossy(&st_after_start.stdout).contains("sshd"),
+        "expected sshd back after start sshd, got: {}",
+        String::from_utf8_lossy(&st_after_start.stdout)
+    );
+
+    // Stop daemon and verify FLUSH + STOP for both v4 and v6!
+    let stop = run_client(&["stop"]);
+    assert!(stop.status.success());
+    let exit = daemon.wait_exit();
+    assert!(exit.success());
+
+    let fw = decisions(&fw_log);
+    assert!(
+        fw.iter().any(|l| l == "FLUSH v4-sshd"),
+        "missing FLUSH v4: {fw:?}"
+    );
+    assert!(
+        fw.iter().any(|l| l == "STOP v4-sshd"),
+        "missing STOP v4: {fw:?}"
+    );
+    assert!(
+        fw.iter().any(|l| l == "FLUSH v6-sshd"),
+        "missing FLUSH v6: {fw:?}"
+    );
+    assert!(
+        fw.iter().any(|l| l == "STOP v6-sshd"),
+        "missing STOP v6: {fw:?}"
+    );
+}
+
+#[test]
+fn ignorecommand_prevents_ban_for_whitelisted_ip_and_allows_others() {
+    let tmp = tempfile::tempdir().expect("scratch");
+    let base = tmp.path().join("f2b");
+    let filter_dir = base.join("filter.d");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&filter_dir).expect("filter.d");
+    std::fs::create_dir_all(&state).expect("state");
+    let record = tmp.path().join("decisions.log");
+    let log_path = tmp.path().join("auth.log");
+    std::fs::write(&log_path, b"").expect("log");
+
+    std::fs::write(
+        base.join("fail2ban.conf"),
+        format!(
+            "[Definition]\nsocket = {}\ndbfile = {}\n",
+            tmp.path().join("orig.sock").display(),
+            state.join("fail2ban.sqlite3").display()
+        ),
+    )
+    .expect("fail2ban.conf");
+    std::fs::write(
+        base.join("jail.conf"),
+        format!(
+            "[DEFAULT]\n\
+             backend = polling\n\
+             usedns = no\n\
+             ignoreself = false\n\
+             action =\n\
+             \n\
+             [ic-jail]\n\
+             enabled = true\n\
+             port = 22\n\
+             filter = ic-mini\n\
+             logpath = {}\n\
+             maxretry = 1\n\
+             findtime = 120s\n\
+             bantime = 60s\n\
+             ignorecommand = test \"<ip>\" = \"198.51.100.1\"\n",
+            log_path.display(),
+        ),
+    )
+    .expect("jail.conf");
+    std::fs::write(
+        filter_dir.join("ic-mini.conf"),
+        "[Definition]\nfailregex = failed login from <HOST>\nignoreregex =\n",
+    )
+    .expect("filter");
+
+    let daemon = spawn_daemon(&base, &record, None);
+    wait_for("startup", &daemon, || daemon.saw("fail2ban-rs started"));
+
+    let ts = syslog_prefix_now();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .expect("open");
+    writeln!(f, "{ts} app[1]: failed login from 198.51.100.1").unwrap();
+    writeln!(f, "{ts} app[1]: failed login from 198.51.100.2").unwrap();
+    f.flush().unwrap();
+
+    wait_for("non-ignored IP banned", &daemon, || {
+        decisions(&record).contains(&"BAN ic-jail 198.51.100.2".to_owned())
+    });
+    assert!(
+        !decisions(&record).contains(&"BAN ic-jail 198.51.100.1".to_owned()),
+        "ignorecommand IP 198.51.100.1 should NOT have been banned: {:?}",
+        decisions(&record)
+    );
+}

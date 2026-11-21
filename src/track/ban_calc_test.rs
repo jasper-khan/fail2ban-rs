@@ -13,6 +13,8 @@ fn base_params() -> JailParams {
         bantime_increment: false,
         bantime_factor: 1.0,
         bantime_multipliers: vec![],
+        bantime_rndtime: 0,
+        ignore_command: None,
         bantime_maxtime: 604_800,
         compat_mode: false,
     }
@@ -245,4 +247,28 @@ fn test_build_params_preserves_defaults() {
     assert!(p.bantime_multipliers.is_empty());
     assert_eq!(p.bantime_maxtime, 604_800);
     assert!(p.webhook.is_none());
+}
+
+#[test]
+fn rndtime_adds_bounded_jitter_respecting_maxtime() {
+    let params = JailParams {
+        max_retry: 5,
+        find_time: 600,
+        ban_time: 100,
+        webhook: None,
+        bantime_increment: true,
+        bantime_factor: 1.0,
+        bantime_multipliers: vec![1, 2],
+        bantime_maxtime: 120,
+        bantime_rndtime: 50,
+        ignore_command: None,
+        compat_mode: true,
+    };
+    for _ in 0..16 {
+        let d = calc_ban_time(100, 0, &params);
+        assert!(
+            (100..=120).contains(&d),
+            "jittered ban time out of bounds: {d}"
+        );
+    }
 }

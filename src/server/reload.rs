@@ -39,6 +39,35 @@ pub(super) struct ReloadContext<'a> {
 /// Every fallible step (config parse, watcher plan, firewall delta) runs
 /// before the old watchers are touched, so a failed reload leaves them
 /// running.
+///
+/// Apply an in-memory config transition (e.g. single-jail `start`/`stop`):
+/// diff firewall backends, update tracker params, and restart watchers.
+pub(super) async fn apply_config_change(
+    new_config: Config,
+    executor_tx: &mpsc::Sender<FirewallCmd>,
+    tracker_cmd_tx: &mpsc::Sender<TrackerCmd>,
+    current_config: &mut Config,
+    watchers: &mut Watchers,
+    failure_tx: &mpsc::Sender<Failure>,
+) -> crate::error::Result<()> {
+    let new_watcher_plan = build_watcher_plan(&new_config)?;
+    let delta = FirewallDelta::compute(current_config, &new_config);
+    let applied = apply_firewall_delta(
+        executor_tx,
+        tracker_cmd_tx,
+        &delta,
+        current_config,
+        &new_config,
+    )
+    .await;
+    request_jail_reconciles(tracker_cmd_tx, delta.replacements()).await;
+    applied?;
+    update_tracker_config(tracker_cmd_tx, &new_config).await?;
+    restart_watchers(new_watcher_plan, failure_tx, watchers).await;
+    *current_config = new_config;
+    Ok(())
+}
+
 pub(super) async fn reload_config(
     source: &Source,
     executor_tx: &mpsc::Sender<FirewallCmd>,
@@ -67,6 +96,7 @@ pub(super) async fn reload_config(
     }
     new_config.global.legacy_socket_path = current_config.global.legacy_socket_path.clone();
     new_config.global.legacy_sqlite_rw_path = current_config.global.legacy_sqlite_rw_path.clone();
+    new_config.global.legacy_sqlite_purge_age = current_config.global.legacy_sqlite_purge_age;
     let new_watcher_plan = build_watcher_plan(&new_config)?;
 
     let delta = FirewallDelta::compute(current_config, &new_config);

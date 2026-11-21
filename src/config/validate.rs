@@ -246,18 +246,25 @@ impl Config {
                 Self::validate_ipset_backend(name, maxelem, chain)
             }
             Backend::Nftables | Backend::Iptables => Ok(()),
-            Backend::LegacyAction {
-                ref action_ban,
-                ref action_unban,
-                ..
-            } => {
-                if action_ban.trim().is_empty() || action_unban.trim().is_empty() {
-                    Err(Error::config(format!(
-                        "jail '{name}': legacy action requires non-empty actionban and actionunban"
-                    )))
-                } else {
-                    Ok(())
+            Backend::LegacyAction { ref actions } => {
+                if actions.is_empty() {
+                    return Err(Error::config(format!(
+                        "jail '{name}': legacy action backend requires at least one action"
+                    )));
                 }
+                for act in actions {
+                    if act.ipv4.ban.trim().is_empty()
+                        || act.ipv4.unban.trim().is_empty()
+                        || act.ipv6.ban.trim().is_empty()
+                        || act.ipv6.unban.trim().is_empty()
+                    {
+                        return Err(Error::config(format!(
+                            "jail '{name}': legacy action '{}' requires non-empty actionban and actionunban",
+                            act.name
+                        )));
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -332,8 +339,13 @@ impl Config {
     /// Validate ports, protocol, ignoreip entries, and the webhook URL.
     fn validate_jail_network(name: &str, jail: &JailConfig) -> Result<()> {
         for port in &jail.port {
+            let range_ok = jail.compat_mode
+                && port.split_once(':').is_some_and(|(a, b)| {
+                    matches!((a.parse::<u16>(), b.parse::<u16>()), (Ok(lo), Ok(hi)) if lo <= hi)
+                });
             match port.parse::<u16>() {
                 Ok(n) if n >= 1 => {}
+                _ if range_ok => {}
                 _ => {
                     return Err(Error::config(format!(
                         "jail '{name}': invalid port '{port}' (expected 1-65535)"

@@ -312,6 +312,7 @@ fn init_state(
         reconcile_queue: VecDeque::new(),
         logger: io.logger,
         sqlite_mirror: io.sqlite_mirror,
+        sqlite_purge_age: global_config.legacy_sqlite_purge_age,
         #[cfg(feature = "maxmind")]
         maxmind: MaxmindState::load(global_config, jail_configs),
     }

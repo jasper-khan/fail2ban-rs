@@ -88,6 +88,11 @@ pub struct GlobalConfig {
     /// Fail2Ban 1.1.1's v4 `fail2ban.sqlite3` (`--legacy-sqlite-rw`).
     #[serde(skip, default)]
     pub legacy_sqlite_rw_path: Option<PathBuf>,
+
+    /// Retention age (seconds) for expired `bans` history in Fail2Ban SQLite
+    /// (`dbpurgeage` from `fail2ban.conf`/`fail2ban.local`, default 1d = 86400s).
+    #[serde(skip, default = "default_legacy_purge_age")]
+    pub legacy_sqlite_purge_age: i64,
 }
 
 /// Per-jail configuration.
@@ -179,6 +184,15 @@ pub struct JailConfig {
     )]
     pub bantime_maxtime: i64,
 
+    /// Optional random ban-time jitter (`bantime.rndtime` in Fail2Ban 1.1.1, seconds).
+    #[serde(skip, default)]
+    pub bantime_rndtime: i64,
+
+    /// Optional external command to check whether an IP should be ignored
+    /// (`ignorecommand` in Fail2Ban 1.1.1; exit 0 = ignore).
+    #[serde(skip, default)]
+    pub ignore_command: Option<String>,
+
     /// Log source backend (file or systemd journal).
     #[serde(default)]
     pub log_backend: LogBackend,
@@ -252,14 +266,10 @@ pub enum Backend {
         /// Command run to unban an IP.
         unban_cmd: String,
     },
-    /// Resolved Fail2Ban 1.1.1 `action.d` lifecycle commands.
+    /// Resolved Fail2Ban 1.1.1 `action.d` lifecycle commands (one or more actions,
+    /// each with independent IPv4 and IPv6 command templates).
     #[serde(skip)]
-    LegacyAction {
-        action_start: Option<String>,
-        action_ban: String,
-        action_unban: String,
-        action_stop: Option<String>,
-    },
+    LegacyAction { actions: Vec<LegacyActionSpec> },
     /// ipset — per-jail `hash:ip` sets referenced from one iptables rule
     /// per address family, giving O(1) ban lookups.
     Ipset {
@@ -268,6 +278,32 @@ pub enum Backend {
         /// iptables chain the `-m set` DROP rule is inserted into.
         chain: String,
     },
+}
+
+/// Resolved per-address-family shell commands for one Fail2Ban 1.1.1 action.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyActionFamilyCmds {
+    pub start: Option<String>,
+    pub stop: Option<String>,
+    pub flush: Option<String>,
+    pub check: Option<String>,
+    pub repair: Option<String>,
+    pub ban: String,
+    pub unban: String,
+    pub reban: Option<String>,
+    pub reload: Option<String>,
+}
+
+/// One resolved `action.d/<name>.conf` entry attached to a compat jail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyActionSpec {
+    pub name: String,
+    pub ban_time: i64,
+    pub start_on_demand: bool,
+    pub repair_on_unban: bool,
+    pub timeout_secs: u64,
+    pub ipv4: LegacyActionFamilyCmds,
+    pub ipv6: LegacyActionFamilyCmds,
 }
 
 /// Log source backend selection.
@@ -307,6 +343,10 @@ pub(super) fn default_channel_size() -> usize {
 
 pub(super) fn default_ban_count_decay() -> i64 {
     2_592_000 // 30 days
+}
+
+pub(super) fn default_legacy_purge_age() -> i64 {
+    86_400 // 1 day (Fail2Ban 1.1.1 default dbpurgeage)
 }
 
 pub(super) fn default_true() -> bool {
@@ -371,6 +411,7 @@ impl Default for GlobalConfig {
             maxmind_city: None,
             legacy_socket_path: None,
             legacy_sqlite_rw_path: None,
+            legacy_sqlite_purge_age: default_legacy_purge_age(),
         }
     }
 }
@@ -396,6 +437,8 @@ impl Default for JailConfig {
             bantime_factor: default_bantime_factor(),
             bantime_multipliers: vec![],
             bantime_maxtime: default_bantime_maxtime(),
+            bantime_rndtime: 0,
+            ignore_command: None,
             log_backend: LogBackend::default(),
             journalmatch: vec![],
             backend: Backend::default(),

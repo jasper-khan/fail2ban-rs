@@ -46,6 +46,23 @@ pub enum Request {
     Reload,
     /// Get daemon statistics.
     Stats,
+    /// Snapshot active jail and database configuration (used by legacy client queries).
+    ConfigSnapshot,
+    /// Live runtime update of a jail parameter (`maxretry`, `findtime`, `bantime`).
+    SetJailParam {
+        jail: String,
+        param: String,
+        value: i64,
+    },
+    /// Enable or disable a single jail at runtime (`start <jail>` / `stop <jail>`).
+    SetJailEnabled { jail: String, enabled: bool },
+    /// Add or remove an entry from a jail's `logpath` or `ignoreip` list at runtime.
+    MutateJailList {
+        jail: String,
+        list: String,
+        add: bool,
+        value: String,
+    },
 }
 
 /// Response from the daemon.

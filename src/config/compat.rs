@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::types::{
-    Backend, Config, GlobalConfig, JailConfig, LogBackend, LogEncoding, LoggingConfig,
+    Backend, Config, GlobalConfig, JailConfig, LegacyActionFamilyCmds, LegacyActionSpec,
+    LogBackend, LogEncoding, LoggingConfig,
 };
 use crate::detect::date::DateFormat;
 use crate::error::{Error, Result};
@@ -140,6 +141,18 @@ pub fn dbfile_of(base: &Path) -> Result<PathBuf> {
     Ok(dbfile)
 }
 
+/// Resolve `dbpurgeage` from `fail2ban.conf` / `fail2ban.local` (default 86400s = 1d).
+pub fn dbpurgeage_of(base: &Path) -> Result<i64> {
+    match definition_option(base, "dbpurgeage")?
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        None => Ok(86_400),
+        Some(raw) => duration(raw, "dbpurgeage"),
+    }
+}
+
 /// Each recording gets a sibling runtime directory. Never derive the
 /// listener or writable WAL from the original daemon's socket or database.
 fn recording_global(record: &Path) -> Result<GlobalConfig> {
@@ -205,36 +218,54 @@ fn load_jail(
     if get("enabled")?.as_deref().and_then(original_bool) != Some(true) {
         return Ok(None);
     }
-    let backend_name = required("backend")?;
-    let log_backend = match backend_name.as_str() {
-        "polling" => LogBackend::File,
+    let backend_name = get("backend")?.unwrap_or_else(|| "auto".to_owned());
+    let log_backend = match backend_name.trim() {
+        "polling" | "pyinotify" => LogBackend::File,
         "systemd" => LogBackend::Systemd,
+        "auto" | "" => {
+            if get("logpath")?.is_some_and(|v| !v.trim().is_empty()) {
+                LogBackend::File
+            } else {
+                LogBackend::Systemd
+            }
+        }
         _ => {
             return Err(Error::config(
-                "the original compat daemon currently requires backend=polling or backend=systemd",
+                "the original compat daemon currently requires backend=auto, polling, or systemd",
             ));
         }
     };
-    if required("usedns")? != "no" {
-        return Err(Error::config(
-            "the original compat daemon currently requires usedns=no",
-        ));
+    match get("usedns")?.as_deref().map(str::trim) {
+        None | Some("" | "no" | "warn" | "raw") => {}
+        Some(other) => {
+            return Err(Error::config(format!(
+                "the original compat daemon does not support usedns={other:?}"
+            )));
+        }
     }
-    if original_bool(&required("ignoreself")?) != Some(false) {
-        return Err(Error::config(
-            "the original compat daemon currently requires ignoreself=false",
-        ));
-    }
+    let ignoreself = match get("ignoreself")?.as_deref().map(str::trim) {
+        None | Some("") => true,
+        Some(raw) => original_bool(raw).ok_or_else(|| {
+            Error::config(format!(
+                "original jail {jail:?} has invalid ignoreself={raw:?}"
+            ))
+        })?,
+    };
     if record.is_some() {
         reject_active("action")?;
     }
-    for key in ["ignorecommand", "ignorecache"] {
-        reject_active(key)?;
-    }
+    // ignorecache admitted.
     for key in UNSUPPORTED_BANTIME_OPTIONS {
         if !matches!(
             *key,
-            "bantime.factor" | "bantime.multipliers" | "bantime.maxtime" | "journalmatch"
+            "bantime.factor"
+                | "bantime.multipliers"
+                | "bantime.maxtime"
+                | "bantime.rndtime"
+                | "bantime.overalljails"
+                | "journalmatch"
+                | "ignorecommand"
+                | "ignorecache"
         ) {
             reject_active(key)?;
         }
@@ -277,13 +308,20 @@ fn load_jail(
         .map(|v| duration(&v, "bantime.maxtime"))
         .transpose()?
         .unwrap_or(604_800);
-    for key in ["skip_if_nologs", "systemd_if_nologs"] {
-        if get(key)?.is_some_and(|value| original_bool(&value) != Some(false)) {
-            return Err(Error::config(format!(
-                "the original compat daemon does not yet support {key}"
-            )));
-        }
-    }
+    let bantime_rndtime = get("bantime.rndtime")?
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| duration(&v, "bantime.rndtime"))
+        .transpose()?
+        .unwrap_or(0);
+    let ignore_command = get("ignorecommand")?
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let skip_if_nologs = get("skip_if_nologs")?
+        .and_then(|v| original_bool(&v))
+        .unwrap_or(false);
+    let systemd_if_nologs = get("systemd_if_nologs")?
+        .and_then(|v| original_bool(&v))
+        .unwrap_or(false);
     if let Some(value) = get("logtimezone")?
         && !matches!(value.as_str(), "" | "UTC")
     {
@@ -308,7 +346,14 @@ fn load_jail(
         let admitted = SUPPORTED_JAIL_KEYS.contains(&base_name)
             || matches!(
                 base_name,
-                "bantime.factor" | "bantime.multipliers" | "bantime.maxtime" | "journalmatch"
+                "bantime.factor"
+                    | "bantime.multipliers"
+                    | "bantime.maxtime"
+                    | "bantime.rndtime"
+                    | "bantime.overalljails"
+                    | "journalmatch"
+                    | "ignorecommand"
+                    | "ignorecache"
             )
             || known.is_some_and(|rest| SUPPORTED_JAIL_KEYS.contains(&rest));
         if !admitted {
@@ -318,8 +363,32 @@ fn load_jail(
         }
     }
 
+    let mut log_backend = log_backend;
     let paths = if log_backend == LogBackend::File {
-        log_paths(&required("logpath")?)?
+        let raw_lp = get("logpath")?.unwrap_or_default();
+        if raw_lp.trim().is_empty() {
+            if systemd_if_nologs {
+                log_backend = LogBackend::Systemd;
+                Vec::new()
+            } else if skip_if_nologs {
+                return Ok(None);
+            } else {
+                return Err(Error::config(format!(
+                    "original jail {jail:?} requires logpath"
+                )));
+            }
+        } else {
+            let expanded = log_paths(&raw_lp)?;
+            let any_exists = expanded.iter().any(|p| p.exists());
+            if !any_exists && systemd_if_nologs {
+                log_backend = LogBackend::Systemd;
+                Vec::new()
+            } else if !any_exists && skip_if_nologs {
+                return Ok(None);
+            } else {
+                expanded
+            }
+        }
     } else {
         Vec::new()
     };
@@ -397,7 +466,14 @@ fn load_jail(
         .options
         .get("prefregex")
         .is_some_and(|value| !value.is_empty());
+    let has_ln_beg_datepattern = resolved.options.get("datepattern").is_some_and(|value| {
+        value
+            .lines()
+            .map(str::trim)
+            .any(|l| matches!(l, "{^LN-BEG}" | "^{DATE}"))
+    });
     if !has_prefregex
+        && !has_ln_beg_datepattern
         && resolved
             .options
             .get("datepattern")
@@ -407,12 +483,25 @@ fn load_jail(
             "the original compat daemon does not yet support filter datepattern",
         ));
     }
+    let has_f_tags = resolved
+        .options
+        .get("failregex")
+        .is_some_and(|v| v.contains("<F-"));
+    let use_legacy_matcher =
+        has_prefregex || has_ln_beg_datepattern || (has_f_tags && max_lines == 1);
     if let Some(value) = resolved.options.get("usedns")
         && value != "no"
     {
         return Err(Error::config(
             "the original compat daemon does not yet support filter usedns",
         ));
+    }
+    let mut resolved = resolved;
+    if use_legacy_matcher {
+        resolved
+            .options
+            .entry("usedns".to_owned())
+            .or_insert_with(|| "no".to_owned());
     }
     if let Some(value) = resolved.options.get("logtype") {
         let ok = match log_backend {
@@ -435,7 +524,7 @@ fn load_jail(
         let mut ssh = resolved.clone();
         ssh.ssh_normal = true;
         (Vec::new(), Vec::new(), Some(ssh))
-    } else if has_prefregex {
+    } else if use_legacy_matcher {
         (Vec::new(), Vec::new(), Some(resolved.clone()))
     } else {
         (
@@ -499,13 +588,15 @@ fn load_jail(
         bantime_factor,
         bantime_multipliers,
         bantime_maxtime,
+        bantime_rndtime,
+        ignore_command,
         port,
         protocol,
         log_backend,
         journalmatch,
         backend,
         ignoreip,
-        ignoreself: false,
+        ignoreself,
         ..JailConfig::default()
     }))
 }
@@ -604,27 +695,88 @@ fn parse_maxretry(raw: &str) -> Result<u32> {
         .map_err(|_| Error::config(format!("original maxretry {raw:?} is out of range")))
 }
 
-/// Parse the original `port` shorthand into numeric port strings.
+/// Parse the original `port` shorthand into numeric ports, ranges (`lo:hi`),
+/// or `/etc/services` service names (matching Fail2Ban 1.1.1).
 fn parse_ports(jail: &str, raw: &str) -> Result<Vec<String>> {
     let ports = raw
         .split(|ch: char| ch.is_whitespace() || ch == ',')
         .filter(|part| !part.is_empty())
-        .map(|part| {
-            part.parse::<u16>()
-                .ok()
-                .filter(|n| (1..=u16::MAX).contains(n))
-                .map_or_else(
-                    || {
-                        Err(Error::config(format!(
-                            "the original compat daemon currently requires numeric ports, \
-                             got {part:?} in jail {jail:?}"
-                        )))
-                    },
-                    |n| Ok(n.to_string()),
-                )
-        })
+        .map(|part| resolve_port_token(jail, part))
         .collect::<Result<Vec<_>>>()?;
     Ok(ports)
+}
+
+fn resolve_port_token(jail: &str, token: &str) -> Result<String> {
+    if let Ok(n) = token.parse::<u16>()
+        && n >= 1
+    {
+        return Ok(n.to_string());
+    }
+    if let Some((lo_s, hi_s)) = token.split_once(':')
+        && let (Ok(lo), Ok(hi)) = (lo_s.parse::<u16>(), hi_s.parse::<u16>())
+        && lo <= hi
+    {
+        return Ok(format!("{lo}:{hi}"));
+    }
+    if let Some(port) = lookup_service_port(token) {
+        return Ok(port.to_string());
+    }
+    Err(Error::config(format!(
+        "unknown port or service name {token:?} in jail {jail:?}"
+    )))
+}
+
+fn lookup_service_port(name: &str) -> Option<u16> {
+    let needle = name.to_ascii_lowercase();
+    if let Ok(contents) = std::fs::read_to_string("/etc/services") {
+        for line in contents.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let Some(primary) = fields.next() else {
+                continue;
+            };
+            let Some(port_proto) = fields.next() else {
+                continue;
+            };
+            let Some((port_str, _)) = port_proto.split_once('/') else {
+                continue;
+            };
+            let Ok(port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            if primary.eq_ignore_ascii_case(&needle)
+                || fields.any(|alias| alias.eq_ignore_ascii_case(&needle))
+            {
+                return Some(port);
+            }
+        }
+    }
+    match needle.as_str() {
+        "ftp-data" => Some(20),
+        "ftp" => Some(21),
+        "ssh" => Some(22),
+        "telnet" => Some(23),
+        "smtp" => Some(25),
+        "domain" => Some(53),
+        "http" | "www" => Some(80),
+        "pop3" => Some(110),
+        "imap" | "imap2" => Some(143),
+        "ldap" => Some(389),
+        "https" => Some(443),
+        "smtps" | "submissions" => Some(465),
+        "submission" => Some(587),
+        "ldaps" => Some(636),
+        "imaps" => Some(993),
+        "pop3s" => Some(995),
+        "mysql" => Some(3306),
+        "sieve" => Some(4190),
+        "postgresql" => Some(5432),
+        "http-alt" => Some(8080),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -632,7 +784,13 @@ fn parse_ports(jail: &str, raw: &str) -> Result<Vec<String>> {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests;
 
-/// Resolve a jail's `action = <name>[k=v, ...]` against `base/action.d/<name>.conf`.
+/// Resolve a jail's `action = ...` list against `base/action.d/<name>.conf`.
+///
+/// Supports multiple action lines per jail, dual-stack `?family=inet6`
+/// conditional sections and keys, `actionstart_on_demand`,
+/// `actionrepair_on_unban`, `actioncheck`, `actionrepair`, `actionflush`,
+/// `actionreban`, `actionreload`, `timeout`, nested `<tag>` expansion, and
+/// standard Fail2Ban formatting/runtime tags.
 fn resolve_legacy_action(
     base: &Path,
     jail: &str,
@@ -641,86 +799,283 @@ fn resolve_legacy_action(
     protocol: &str,
     ban_time: i64,
 ) -> Result<Backend> {
-    let mut actions = expression
+    let lines: Vec<&str> = expression
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let first_line = actions
-        .next()
-        .ok_or_else(|| Error::config(format!("original jail {jail:?} has empty action")))?;
-    if actions.next().is_some() {
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
         return Err(Error::config(format!(
-            "original jail {jail:?} declares multiple live actions; only one is supported"
+            "original jail {jail:?} has empty action"
         )));
     }
-    let spec = legacy_filter_spec::parse(first_line)?;
+    let mut resolved_actions = Vec::with_capacity(lines.len());
+    for line in lines {
+        resolved_actions.push(resolve_single_legacy_action(
+            base, jail, line, ports, protocol, ban_time,
+        )?);
+    }
+    Ok(Backend::LegacyAction {
+        actions: resolved_actions,
+    })
+}
+
+fn is_supported_condition(cond: &str) -> bool {
+    matches!(
+        cond.to_ascii_lowercase().as_str(),
+        "family=inet4" | "family=inet6"
+    )
+}
+
+fn validate_action_conditions(
+    action_name: &str,
+    tree: &crate::config::legacy_layers::LayeredConfig,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    for (section, values) in &tree.sections {
+        if let Some((_, cond)) = section.split_once('?')
+            && !is_supported_condition(cond)
+        {
+            return Err(Error::config(format!(
+                "original action {action_name:?} uses unsupported section condition {section:?}"
+            )));
+        }
+        for key in values.keys() {
+            if let Some((_, cond)) = key.split_once('?')
+                && !is_supported_condition(cond)
+            {
+                return Err(Error::config(format!(
+                    "original action {action_name:?} uses unsupported option condition {key:?}"
+                )));
+            }
+        }
+    }
+    for key in tree.defaults.keys().chain(params.keys()) {
+        if let Some((_, cond)) = key.split_once('?')
+            && !is_supported_condition(cond)
+        {
+            return Err(Error::config(format!(
+                "original action {action_name:?} uses unsupported option condition {key:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_single_legacy_action(
+    base: &Path,
+    jail: &str,
+    action_line: &str,
+    ports: &[String],
+    protocol: &str,
+    ban_time: i64,
+) -> Result<LegacyActionSpec> {
+    let spec = legacy_filter_spec::parse(action_line)?;
     let action_dir = base.join("action.d");
     let tree = legacy_layers::read(&action_dir, spec.name)?
         .ok_or_else(|| Error::config(format!("original action {:?} not found", spec.name)))?;
+    validate_action_conditions(spec.name, &tree, &spec.parameters)?;
 
-    let unsupported = |key: &str| {
-        Error::config(format!(
-            "original action {:?} uses unsupported live option {key:?}",
-            spec.name
-        ))
-    };
-    let controls = [
-        "actionstart_on_demand",
-        "actionrepair_on_unban",
-        "actionflush",
-        "actioncheck",
-        "actionrepair",
-        "actionreban",
-        "actionreload",
-        "timeout",
-        "family",
-    ];
-    let reject_control = |key: &str, value: &str| -> Result<()> {
-        let normalized = key.to_ascii_lowercase();
-        if normalized.contains('?')
-            || (controls.contains(&normalized.as_str())
-                && !value.trim().is_empty()
-                && !(normalized == "actionstart_on_demand"
-                    && original_bool(value.trim()) == Some(false)))
+    let (ipv4, start_on_demand, repair_on_unban, timeout_secs) = resolve_action_family(
+        &tree,
+        spec.name,
+        &spec.parameters,
+        jail,
+        ports,
+        protocol,
+        ban_time,
+        "inet4",
+    )?;
+    let (ipv6, _, _, _) = resolve_action_family(
+        &tree,
+        spec.name,
+        &spec.parameters,
+        jail,
+        ports,
+        protocol,
+        ban_time,
+        "inet6",
+    )?;
+
+    Ok(LegacyActionSpec {
+        name: spec.name.to_owned(),
+        ban_time,
+        start_on_demand,
+        repair_on_unban,
+        timeout_secs,
+        ipv4,
+        ipv6,
+    })
+}
+
+fn merge_section_for_family(
+    tree: &crate::config::legacy_layers::LayeredConfig,
+    base_section: &str,
+    family: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let family_suffix = format!("?family={family}");
+    let mut out = std::collections::BTreeMap::new();
+    // Base section non-conditional keys first, then conditional keys matching `family`.
+    if let Some(sec) = tree.sections.get(base_section) {
+        for (k, v) in sec {
+            if !k.contains('?') {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in sec {
+            if let Some((base_key, cond)) = k.split_once('?')
+                && cond.eq_ignore_ascii_case(&format!("family={family}"))
+            {
+                out.insert(base_key.to_owned(), v.clone());
+            }
+        }
+    }
+    // Conditional section `[Section?family=<family>]` overrides base section.
+    for (sec_name, sec) in &tree.sections {
+        if let Some((prefix, cond)) = sec_name.split_once('?')
+            && prefix == base_section
+            && cond.eq_ignore_ascii_case(&format!("family={family}"))
         {
-            return Err(unsupported(key));
+            for (k, v) in sec {
+                if !k.contains('?') {
+                    out.insert(k.clone(), v.clone());
+                } else if let Some(base_key) = k.strip_suffix(&family_suffix) {
+                    out.insert(base_key.to_owned(), v.clone());
+                }
+            }
         }
-        Ok(())
-    };
-    for values in tree.sections.values() {
-        for (key, value) in values {
-            reject_control(key, value)?;
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_action_family(
+    tree: &crate::config::legacy_layers::LayeredConfig,
+    action_name: &str,
+    params: &std::collections::BTreeMap<String, String>,
+    jail: &str,
+    ports: &[String],
+    protocol: &str,
+    ban_time: i64,
+    family: &str,
+) -> Result<(LegacyActionFamilyCmds, bool, bool, u64)> {
+    let def_sec = merge_section_for_family(tree, "Definition", family);
+    let init_sec = merge_section_for_family(tree, "Init", family);
+
+    let mut sections: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = std::collections::BTreeMap::new();
+    sections.insert("Definition".to_owned(), def_sec.clone());
+    sections.insert("Init".to_owned(), init_sec.clone());
+
+    let mut defaults = std::collections::BTreeMap::new();
+    for (k, v) in &tree.defaults {
+        if !k.contains('?') {
+            defaults.insert(k.clone(), v.clone());
         }
     }
-    for (key, value) in &tree.defaults {
-        reject_control(key, value)?;
+    for (k, v) in &tree.defaults {
+        if let Some((base_key, cond)) = k.split_once('?')
+            && cond.eq_ignore_ascii_case(&format!("family={family}"))
+        {
+            defaults.insert(base_key.to_owned(), v.clone());
+        }
     }
-    for (key, value) in &spec.parameters {
-        reject_control(key, value)?;
-    }
+
+    // Build tag map: [Definition] interpolated values < [Init] < built-ins < action[params].
     let mut tags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    if let Some(init) = tree.sections.get("Init") {
-        for (k, v) in init {
-            tags.insert(k.clone(), v.clone());
+    tags.insert("sp".to_owned(), " ".to_owned());
+    tags.insert("br".to_owned(), "\n".to_owned());
+    tags.insert("newl".to_owned(), "\n".to_owned());
+    tags.insert("tb".to_owned(), "\t".to_owned());
+
+    for k in def_sec.keys() {
+        if let Ok(Some(val)) = legacy_interp::get_effective(
+            "Definition",
+            k,
+            &defaults,
+            |name| sections.get(name),
+            None,
+        ) {
+            tags.insert(k.clone(), val);
+        }
+    }
+    for k in init_sec.keys() {
+        if let Ok(Some(val)) =
+            legacy_interp::get_effective("Init", k, &defaults, |name| sections.get(name), None)
+        {
+            tags.insert(k.clone(), val);
         }
     }
     tags.insert("name".to_owned(), jail.to_owned());
     tags.insert("port".to_owned(), ports.join(","));
     tags.insert("protocol".to_owned(), protocol.to_owned());
     tags.insert("bantime".to_owned(), ban_time.to_string());
-    for (k, v) in &spec.parameters {
-        tags.insert(k.clone(), v.clone());
+    tags.insert("family".to_owned(), family.to_owned());
+
+    for (k, v) in params {
+        if !k.contains('?') {
+            tags.insert(k.clone(), v.clone());
+        }
+    }
+    for (k, v) in params {
+        if let Some((base_key, cond)) = k.split_once('?')
+            && cond.eq_ignore_ascii_case(&format!("family={family}"))
+        {
+            tags.insert(base_key.to_owned(), v.clone());
+        }
     }
 
-    let get_cmd = |key: &str| -> Result<Option<String>> {
+    let start_on_demand = tags
+        .get("actionstart_on_demand")
+        .and_then(|v| original_bool(v.trim()))
+        .unwrap_or(false);
+    let repair_on_unban = tags
+        .get("actionrepair_on_unban")
+        .and_then(|v| original_bool(v.trim()))
+        .unwrap_or(false);
+    let timeout_secs = match tags
+        .get("timeout")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => raw.parse::<u64>().map_err(|_| {
+            Error::config(format!(
+                "original action {action_name:?} has invalid timeout {raw:?}"
+            ))
+        })?,
+        None => 60,
+    };
+
+    let runtime_tags = [
+        "<ip>",
+        "<IP>",
+        "<ip-rev>",
+        "<family>",
+        "<name>",
+        "<JAIL>",
+        "<port>",
+        "<protocol>",
+        "<time>",
+        "<bantime>",
+        "<failures>",
+        "<ipfailures>",
+        "<ipjailfailures>",
+        "<matches>",
+        "<ipmatches>",
+        "<ipjailmatches>",
+    ];
+
+    let get_cmd = |key: &str, allow_runtime_tags: bool| -> Result<Option<String>> {
         let raw = legacy_interp::get_effective(
             "Definition",
             key,
-            &tree.defaults,
-            |name| tree.sections.get(name),
+            &defaults,
+            |name| sections.get(name),
             None,
         )
-        .map_err(|err| Error::config(format!("original action {:?} {key}: {err}", spec.name)))?;
+        .map_err(|err| Error::config(format!("original action {action_name:?} {key}: {err}")))?;
         let Some(raw) = raw else {
             return Ok(None);
         };
@@ -729,79 +1084,196 @@ fn resolve_legacy_action(
             return Ok(None);
         }
         let mut expanded = trimmed.to_owned();
-        for _ in 0..4 {
+        for _ in 0..12 {
             let before = expanded.clone();
             for (tag, value) in &tags {
-                expanded = expanded.replace(&format!("<{tag}>"), value);
+                let needle = format!("<{tag}>");
+                if expanded.contains(&needle) {
+                    expanded = expanded.replace(&needle, value);
+                }
             }
             if expanded == before {
                 break;
             }
         }
-        let remaining = if matches!(key, "actionban" | "actionunban") {
-            expanded.replace("<ip>", "").replace("<IP>", "")
-        } else {
-            expanded.clone()
-        };
-        if remaining.contains('<') || remaining.contains("%(") {
-            return Err(unsupported(key));
+        let mut check_str = expanded.clone();
+        if allow_runtime_tags {
+            for rt in runtime_tags {
+                check_str = check_str.replace(rt, "");
+            }
+        }
+        if contains_unexpanded_tag(&check_str) || check_str.contains("%(") {
+            return Err(Error::config(format!(
+                "original action {action_name:?} {key} contains unexpanded tag in {expanded:?}"
+            )));
         }
         Ok(Some(expanded))
     };
 
-    let action_start = get_cmd("actionstart")?;
-    let action_ban = get_cmd("actionban")?.ok_or_else(|| {
-        Error::config(format!("original action {:?} missing actionban", spec.name))
+    let start = get_cmd("actionstart", false)?;
+    let stop = get_cmd("actionstop", false)?;
+    let flush = get_cmd("actionflush", false)?;
+    let check = get_cmd("actioncheck", false)?;
+    let repair = get_cmd("actionrepair", false)?;
+    let ban = get_cmd("actionban", true)?.ok_or_else(|| {
+        Error::config(format!("original action {action_name:?} missing actionban"))
     })?;
-    let action_unban = get_cmd("actionunban")?.ok_or_else(|| {
+    let unban = get_cmd("actionunban", true)?.ok_or_else(|| {
         Error::config(format!(
-            "original action {:?} missing actionunban",
-            spec.name
+            "original action {action_name:?} missing actionunban"
         ))
     })?;
-    let action_stop = get_cmd("actionstop")?;
+    let reban = get_cmd("actionreban", true)?;
+    let reload = get_cmd("actionreload", false)?;
 
-    Ok(Backend::LegacyAction {
-        action_start,
-        action_ban,
-        action_unban,
-        action_stop,
-    })
+    Ok((
+        LegacyActionFamilyCmds {
+            start,
+            stop,
+            flush,
+            check,
+            repair,
+            ban,
+            unban,
+            reban,
+            reload,
+        },
+        start_on_demand,
+        repair_on_unban,
+        timeout_secs,
+    ))
+}
+
+/// Detect unexpanded Fail2Ban `<tag>` tokens while allowing shell redirections
+/// such as `< /dev/null` or `<<EOF`.
+fn contains_unexpanded_tag(s: &str) -> bool {
+    for (idx, _) in s.match_indices('<') {
+        let start = idx + 1;
+        if let Some(rest) = s.get(start..)
+            && let Some(rel_end) = rest.find('>')
+            && let Some(inner) = rest.get(..rel_end)
+            && !inner.is_empty()
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod live_action_admission_tests {
     use super::*;
 
     #[test]
-    fn live_action_admission_rejects_unimplemented_forms_before_execution() {
+    fn live_action_supports_multi_action_dual_stack_and_rejects_unknown_tags() {
         let temp = tempfile::tempdir().unwrap();
         let actions = temp.path().join("action.d");
         std::fs::create_dir(&actions).unwrap();
         let file = actions.join("audit.conf");
-        let resolve =
-            |expression| resolve_legacy_action(temp.path(), "fixture", expression, &[], "tcp", 60);
-        let base = "[Definition]\nactionban = printf '<ip>'\nactionunban = printf '<ip>'\n";
-        std::fs::write(&file, base).unwrap();
-        assert!(resolve("audit").is_ok());
-        assert!(
-            resolve("audit\naudit")
-                .unwrap_err()
-                .to_string()
-                .contains("multiple live actions")
+        let resolve = |expression| {
+            resolve_legacy_action(
+                temp.path(),
+                "fixture",
+                expression,
+                &["22".into()],
+                "tcp",
+                60,
+            )
+        };
+        let base = concat!(
+            "[Definition]\n",
+            "actionstart = printf 'start <addr_set>'\n",
+            "actioncheck = printf 'check <addr_set>'\n",
+            "actionflush = printf 'flush <addr_set>'\n",
+            "actionrepair = printf 'repair <addr_set>'\n",
+            "actionban = printf 'ban <addr_set> <ip> <ip-rev>'\n",
+            "actionunban = printf 'unban <addr_set> <ip>'\n",
+            "actionstart_on_demand = true\n",
+            "timeout = 12\n",
+            "[Init]\n",
+            "addr_set = v4-set-<name>\n",
+            "[Init?family=inet6]\n",
+            "addr_set = v6-set-<name>\n",
         );
-        for option in [
-            "actioncheck = printf 'test'",
-            "actionflush = printf 'test'",
-            "actionrepair = printf 'test'",
-            "actionban?family=inet6 = printf 'test'",
-            "actionstart_on_demand = true",
-            "timeout = 8",
-            "actionstart = printf '<unsupported-tag>'",
-        ] {
-            std::fs::write(&file, format!("{base}{option}\n")).unwrap();
-            assert!(resolve("audit").is_err(), "admitted unsupported: {option}");
-        }
+        std::fs::write(&file, base).unwrap();
+
+        let Backend::LegacyAction { actions: resolved } =
+            resolve("audit\naudit[addr_set=custom]").unwrap()
+        else {
+            panic!("expected LegacyAction");
+        };
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved[0].start_on_demand);
+        assert_eq!(resolved[0].timeout_secs, 12);
+        assert_eq!(
+            resolved[0].ipv4.ban,
+            "printf 'ban v4-set-fixture <ip> <ip-rev>'"
+        );
+        assert_eq!(
+            resolved[0].ipv6.ban,
+            "printf 'ban v6-set-fixture <ip> <ip-rev>'"
+        );
+        assert_eq!(resolved[1].ipv4.ban, "printf 'ban custom <ip> <ip-rev>'");
+
+        // Unknown tags and unknown section conditions are still rejected before execution.
+        std::fs::write(
+            &file,
+            "[Definition]\nactionstart = printf '<unsupported-tag>'\nactionban = printf '<ip>'\nactionunban = printf '<ip>'\n",
+        )
+        .unwrap();
+        assert!(resolve("audit").is_err());
+
+        std::fs::write(
+            &file,
+            "[Definition]\nactionban?bogus=1 = printf '<ip>'\nactionban = printf '<ip>'\nactionunban = printf '<ip>'\n",
+        )
+        .unwrap();
+        assert!(resolve("audit").is_err());
+    }
+
+    #[test]
+    fn parse_ports_resolves_service_names_and_ranges() {
+        assert_eq!(parse_ports("sshd", "ssh").unwrap(), vec!["22"]);
+        assert_eq!(parse_ports("web", "http,https").unwrap(), vec!["80", "443"]);
+        assert_eq!(parse_ports("all", "0:65535").unwrap(), vec!["0:65535"]);
+    }
+
+    #[test]
+    fn skip_if_nologs_and_systemd_if_nologs_behave_like_fail2ban_111() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("f2b");
+        let filter_dir = base.join("filter.d");
+        std::fs::create_dir_all(&filter_dir).unwrap();
+        std::fs::write(
+            base.join("fail2ban.conf"),
+            format!(
+                "[Definition]\nsocket = {}\ndbfile = {}\n",
+                tmp.path().join("s.sock").display(),
+                tmp.path().join("db.sqlite3").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            filter_dir.join("mini.conf"),
+            "[Definition]\nfailregex = fail from <HOST>\nignoreregex =\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("jail.conf"),
+            "[DEFAULT]\nbackend = polling\nusedns = no\nignoreself = false\naction =\n\n\
+             [skipped]\nenabled = true\nport = 22\nfilter = mini\nlogpath = /nonexistent/does-not-exist.log\nskip_if_nologs = true\nbantime.overalljails = true\n\n\
+             [fallback]\nenabled = true\nport = 22\nfilter = mini\nlogpath = /nonexistent/also-missing.log\nsystemd_if_nologs = true\n",
+        ).unwrap();
+        let cfg = load(&base, &tmp.path().join("rec.log")).unwrap();
+        assert!(
+            !cfg.jail.contains_key("skipped"),
+            "skip_if_nologs should skip missing-log jail"
+        );
+        let fb = cfg.jail.get("fallback").expect("systemd_if_nologs jail");
+        assert_eq!(fb.log_backend, LogBackend::Systemd);
     }
 }

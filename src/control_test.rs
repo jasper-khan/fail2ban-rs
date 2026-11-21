@@ -150,6 +150,10 @@ async fn all_request_variants_through_socket() {
                 Request::Unban { ip, jail } => Response::ok(format!("unbanned {ip} from {jail}")),
                 Request::Reload => Response::ok("reloaded"),
                 Request::Stats => Response::ok_data(serde_json::json!({"uptime": 42})),
+                Request::ConfigSnapshot
+                | Request::SetJailParam { .. }
+                | Request::SetJailEnabled { .. }
+                | Request::MutateJailList { .. } => Response::ok("ok"),
             };
             let _ = cmd.respond.send(response);
         }
