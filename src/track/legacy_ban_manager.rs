@@ -3,7 +3,7 @@
 //! This is a per-jail decision model. It never changes firewall or service
 //! state, and does not load state, perform escalation, or read a clock.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{BinaryHeap, HashMap, hash_map::Entry};
 use std::net::IpAddr;
 
 // The original manager compares the permanent ticket's numeric end with
@@ -135,6 +135,34 @@ impl BanManager {
         });
         expired.sort_unstable_by_key(|(sequence, _)| *sequence);
         expired.into_iter().map(|(_, ban)| ban).collect()
+    }
+
+    /// Remove only the earliest inserted due tickets; unselected due tickets
+    /// stay active for subsequent worker ticks. Candidate memory is bounded
+    /// by the requested limit, independent of the number of active bans.
+    pub(super) fn expire_up_to(&mut self, observed_at: i64, limit: usize) -> Vec<ActiveBan> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut earliest = BinaryHeap::new();
+        for (&address, &(sequence, ban)) in &self.active {
+            if ban.comparison_end() >= i128::from(observed_at) {
+                continue;
+            }
+            let candidate = (sequence, address);
+            if earliest.len() < limit {
+                earliest.push(candidate);
+            } else if let Some(mut latest_selected) = earliest.peek_mut()
+                && candidate < *latest_selected
+            {
+                *latest_selected = candidate;
+            }
+        }
+        earliest
+            .into_sorted_vec()
+            .into_iter()
+            .filter_map(|(_, address)| self.active.remove(&address).map(|(_, ban)| ban))
+            .collect()
     }
 }
 

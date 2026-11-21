@@ -11,20 +11,30 @@ use std::net::IpAddr;
 use super::legacy_ban_manager::{AddResult, BanManager, Duration};
 use super::legacy_fail_manager::LegacyFailManager;
 
-pub(super) struct LegacyJail {
+pub(crate) struct LegacyJail {
     failures: LegacyFailManager,
     bans: BanManager,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Attempt {
+pub(crate) struct Attempt {
     /// Retry score before a qualifying failure ticket is removed.
     pub(super) retry: u64,
     /// Disposition of the qualifying ticket, if the threshold was reached.
     pub(super) decision: Option<AddResult>,
 }
 
+impl Attempt {
+    pub(crate) fn newly_banned(&self) -> bool {
+        self.decision == Some(AddResult::Added)
+    }
+}
+
 impl LegacyJail {
+    pub(crate) fn for_replay(max_retry: u64, find_time: u64, ban_time: i64) -> Self {
+        Self::new(max_retry, find_time, Duration::from_seconds(ban_time))
+    }
+
     pub(super) fn new(max_retry: u64, find_time: u64, bantime: Duration) -> Self {
         Self {
             failures: LegacyFailManager::new(max_retry, find_time),
@@ -37,7 +47,7 @@ impl LegacyJail {
     /// The timestamp on the failure ticket (not the cleanup or processing
     /// clock) starts its ban. A repeated qualifying ticket is still consumed
     /// from the failure counter even when the address was already banned.
-    pub(super) fn record(&mut self, ip: IpAddr, event_time: i64, observed_at: i64) -> Attempt {
+    pub(crate) fn record(&mut self, ip: IpAddr, event_time: i64, observed_at: i64) -> Attempt {
         let retry = self.failures.record(ip, event_time);
         let decision = self
             .failures
@@ -50,7 +60,7 @@ impl LegacyJail {
         self.failures.cleanup(now)
     }
 
-    pub(super) fn expire(&mut self, now: i64) -> Vec<IpAddr> {
+    pub(crate) fn expire(&mut self, now: i64) -> Vec<IpAddr> {
         self.bans
             .expire(now)
             .into_iter()

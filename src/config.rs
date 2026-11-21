@@ -14,6 +14,8 @@ mod legacy_ini;
 #[allow(dead_code)]
 mod legacy_interp;
 #[allow(dead_code)]
+pub(crate) mod legacy_jail_plan;
+#[allow(dead_code)]
 mod legacy_layers;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

@@ -32,11 +32,18 @@ mod journal_line;
 mod journal_proc;
 // Original-filter replay is intentionally separate from the deployed matcher.
 #[allow(dead_code)]
-mod legacy_date;
+pub(crate) mod legacy_date;
 #[allow(dead_code)]
-mod legacy_matcher;
+pub(crate) mod legacy_file_cursor;
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) mod legacy_file_identity;
+#[allow(dead_code)]
+pub(crate) mod legacy_matcher;
 #[cfg(test)]
 mod legacy_matcher_parity_test;
+#[allow(dead_code)]
+pub(crate) mod legacy_observation_time;
 #[allow(dead_code)]
 mod legacy_regex;
 #[allow(dead_code)]

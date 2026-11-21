@@ -19,13 +19,17 @@ pub mod state;
 mod commands;
 mod execute;
 mod failure;
+#[allow(dead_code)]
+pub(crate) mod legacy_action_queue;
+#[cfg(test)]
+mod legacy_action_queue_parity_test;
 // The original jail decision path is verified offline before runtime wiring.
 #[allow(dead_code)]
 mod legacy_ban_manager;
 #[allow(dead_code)]
-mod legacy_fail_manager;
+pub(crate) mod legacy_fail_manager;
 #[allow(dead_code)]
-mod legacy_jail;
+pub(crate) mod legacy_jail;
 #[cfg(test)]
 mod legacy_jail_parity_test;
 #[allow(dead_code)]
