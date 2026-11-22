@@ -108,20 +108,38 @@ impl CommandAction {
         self.ban_epoch
     }
 
+    pub fn invalidate_ban_epoch(&mut self) {
+        self.ban_epoch = self.ban_epoch.saturating_add(1);
+    }
+
+    pub async fn execute_raw_cmd(
+        &self,
+        real_cmd: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<bool> {
+        if real_cmd.trim().is_empty() {
+            return Ok(true);
+        }
+        let _guard = cmd_lock().lock().await;
+        let (ok, _) =
+            cmd::run_shell_cmd(real_cmd, timeout_override.unwrap_or(self.timeout), &[0]).await?;
+        Ok(ok)
+    }
+
     pub fn norestored(&self) -> bool {
         self.norestored
     }
 
     pub fn prolongable(&self) -> bool {
-        self.properties
-            .iter()
-            .any(|(k, v)| (k == "actionprolong" || k.starts_with("actionprolong?family=")) && !v.trim().is_empty())
+        self.properties.iter().any(|(k, v)| {
+            (k == "actionprolong" || k.starts_with("actionprolong?family=")) && !v.trim().is_empty()
+        })
     }
 
     pub fn supports_flush(&self) -> bool {
-        self.properties
-            .iter()
-            .any(|(k, v)| (k == "actionflush" || k.starts_with("actionflush?family=")) && !v.trim().is_empty())
+        self.properties.iter().any(|(k, v)| {
+            (k == "actionflush" || k.starts_with("actionflush?family=")) && !v.trim().is_empty()
+        })
     }
 
     /// Clear all parameters back to defaults (used during config reload).
@@ -132,7 +150,8 @@ impl CommandAction {
         for &key in DEFAULT_EMPTY_PROPS {
             self.properties.insert(key.to_owned(), String::new());
         }
-        self.properties.insert("timeout".to_owned(), "60".to_owned());
+        self.properties
+            .insert("timeout".to_owned(), "60".to_owned());
         self.timeout = Duration::from_secs(60);
         self.norestored = false;
         self.actionrepair_on_unban = false;
@@ -191,6 +210,9 @@ impl CommandAction {
     }
 
     pub fn get_property(&self, key: &str) -> Option<String> {
+        if key == "banEpoch" {
+            return Some(self.ban_epoch.to_string());
+        }
         self.properties.get(key).cloned()
     }
 
@@ -208,11 +230,19 @@ impl CommandAction {
     }
 
     pub fn property_names(&self) -> Vec<String> {
-        self.properties
+        let mut names: Vec<String> = self
+            .properties
             .keys()
             .filter(|k| !k.starts_with('_'))
             .cloned()
-            .collect()
+            .collect();
+        for builtin in ["ESCAPE_CRE", "ESCAPE_VN_CRE", "banEpoch"] {
+            if !names.iter().any(|n| n == builtin) {
+                names.push(builtin.to_owned());
+            }
+        }
+        names.sort();
+        names
     }
 
     pub fn methods(&self) -> Vec<String> {
@@ -220,11 +250,15 @@ impl CommandAction {
             "ban",
             "clearAllParams",
             "consistencyCheck",
+            "escapeTag",
             "executeCmd",
             "flush",
+            "invalidateBanEpoch",
             "prolong",
             "reban",
             "reload",
+            "replaceDynamicTags",
+            "replaceTag",
             "start",
             "stop",
             "unban",
@@ -356,7 +390,11 @@ impl CommandAction {
             if state == 0 {
                 continue;
             }
-            if self.get_operation("<actioncheck>", family)?.trim().is_empty() {
+            if self
+                .get_operation("<actioncheck>", family)?
+                .trim()
+                .is_empty()
+            {
                 continue;
             }
             if !self.invariant_check(family, true, true).await? {
@@ -397,14 +435,12 @@ impl CommandAction {
     }
 
     fn record_operation_executed(&mut self, tag: &str, family: Family, cmd_str: String) {
-        self.executed_ops
-            .insert((tag.to_owned(), family), cmd_str);
+        self.executed_ops.insert((tag.to_owned(), family), cmd_str);
     }
 
     fn clear_operation_executed(&mut self, tag: &str, family: Family) {
         if let Some(prev) = self.executed_ops.remove(&(tag.to_owned(), family)) {
-            self.executed_ops
-                .retain(|(t, _), v| t != tag || *v != prev);
+            self.executed_ops.retain(|(t, _), v| t != tag || *v != prev);
         }
     }
 
@@ -413,12 +449,7 @@ impl CommandAction {
             .await
     }
 
-    async fn ban_with_tag(
-        &mut self,
-        tag: &str,
-        ctx: &ActionContext,
-        family: Family,
-    ) -> Result<()> {
+    async fn ban_with_tag(&mut self, tag: &str, ctx: &ActionContext, family: Family) -> Result<()> {
         let policy = self.policy()?;
         if policy.start_on_demand && !self.is_started(family) {
             self.start_one(family).await?;
@@ -516,7 +547,12 @@ impl CommandAction {
 
         let mut repcnt = 0u8;
         loop {
-            if repcnt > 0 && !self.get_operation("<actioncheck>", family)?.trim().is_empty() {
+            if repcnt > 0
+                && !self
+                    .get_operation("<actioncheck>", family)?
+                    .trim()
+                    .is_empty()
+            {
                 let is_unban = tag == "<actionunban>";
                 let allow_repair = !is_unban || self.actionrepair_on_unban;
                 let force_start = !is_unban;
@@ -726,7 +762,8 @@ mod tests {
         act.set_property("norestored", "yes").unwrap();
         assert!(act.norestored());
 
-        act.set_property("actionprolong", "echo prolong <ip>").unwrap();
+        act.set_property("actionprolong", "echo prolong <ip>")
+            .unwrap();
         assert!(act.prolongable());
 
         let names = act.property_names();
@@ -764,8 +801,11 @@ mod tests {
             &format!("echo ban6:<ip> >> '{log_s}'"),
         )
         .unwrap();
-        act.set_property("actionunban", &format!("echo unban:<family>:<ip> >> '{log_s}'"))
-            .unwrap();
+        act.set_property(
+            "actionunban",
+            &format!("echo unban:<family>:<ip> >> '{log_s}'"),
+        )
+        .unwrap();
         act.set_property("actionflush", &format!("echo flush >> '{log_s}'"))
             .unwrap();
         act.set_property("actionstop", &format!("echo stop >> '{log_s}'"))
@@ -823,12 +863,21 @@ mod tests {
         let l_s = log.display().to_string();
 
         let mut act = CommandAction::new("sshd".to_owned(), "fw".to_owned());
-        act.set_property("actionstart", &format!("echo start >> '{l_s}'; touch '{h_s}'"))
-            .unwrap();
-        act.set_property("actioncheck", &format!("echo check >> '{l_s}'; test -f '{h_s}'"))
-            .unwrap();
-        act.set_property("actionrepair", &format!("echo repair >> '{l_s}'; touch '{h_s}'"))
-            .unwrap();
+        act.set_property(
+            "actionstart",
+            &format!("echo start >> '{l_s}'; touch '{h_s}'"),
+        )
+        .unwrap();
+        act.set_property(
+            "actioncheck",
+            &format!("echo check >> '{l_s}'; test -f '{h_s}'"),
+        )
+        .unwrap();
+        act.set_property(
+            "actionrepair",
+            &format!("echo repair >> '{l_s}'; touch '{h_s}'"),
+        )
+        .unwrap();
         act.set_property(
             "actionban",
             &format!("echo ban:<ip> >> '{l_s}'; test -f '{h_s}'"),
@@ -906,12 +955,21 @@ mod tests {
         let l_s = log.display().to_string();
 
         let mut act = CommandAction::new("nginx".to_owned(), "fw".to_owned());
-        act.set_property("actionstart", &format!("echo start >> '{l_s}'; touch '{h_s}'"))
-            .unwrap();
-        act.set_property("actionstop", &format!("echo stop >> '{l_s}'; rm -f '{h_s}'"))
-            .unwrap();
-        act.set_property("actioncheck", &format!("echo check >> '{l_s}'; test -f '{h_s}'"))
-            .unwrap();
+        act.set_property(
+            "actionstart",
+            &format!("echo start >> '{l_s}'; touch '{h_s}'"),
+        )
+        .unwrap();
+        act.set_property(
+            "actionstop",
+            &format!("echo stop >> '{l_s}'; rm -f '{h_s}'"),
+        )
+        .unwrap();
+        act.set_property(
+            "actioncheck",
+            &format!("echo check >> '{l_s}'; test -f '{h_s}'"),
+        )
+        .unwrap();
 
         act.start(false).await.unwrap();
         std::fs::remove_file(&healthy).unwrap();

@@ -26,7 +26,9 @@ use crate::filter::LogEncoding;
 use crate::filter::backend::inotify::FilterPyinotify;
 use crate::filter::backend::polling::FilterPoll;
 use crate::filter::backend::systemd::FilterSystemd;
-use crate::filter::backend::{BackendKind, FileLogConfig, JournalConfig, LogEvent};
+use crate::filter::backend::{
+    AutoSeekConfig, BackendKind, FileLogConfig, JournalConfig, LogEvent, expand_journal_files,
+};
 use crate::filter::file_identity::file_first_line_sha1;
 use crate::filter::ipdns::allow_ipv6;
 use crate::logging::LogLevel;
@@ -51,6 +53,8 @@ struct ParsedBackend {
     real_backend: BackendKind,
     journal_flags: Option<u32>,
     journal_path: Option<PathBuf>,
+    journal_files: Vec<PathBuf>,
+    journal_namespace: Option<String>,
     journal_tail: bool,
 }
 
@@ -69,15 +73,18 @@ fn parse_backend_spec(raw: &str) -> Result<ParsedBackend> {
 
     let mut journal_flags = None;
     let mut journal_path = None;
+    let mut journal_files = Vec::new();
+    let mut journal_namespace = None;
     let mut journal_tail = false;
 
     let trimmed = raw.trim();
     if trimmed.contains('[') {
         let parsed = spec::parse(trimmed)?;
         if let Some(v) = parsed.parameters.get("journalflags") {
-            let flags = v.trim().parse::<u32>().map_err(|_| {
-                Error::invalid_command(format!("invalid journalflags value {v:?}"))
-            })?;
+            let flags = v
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::invalid_command(format!("invalid journalflags value {v:?}")))?;
             journal_flags = Some(flags);
         }
         if let Some(v) = parsed.parameters.get("journalpath") {
@@ -85,6 +92,18 @@ fn parse_backend_spec(raw: &str) -> Result<ParsedBackend> {
             if !p.is_empty() {
                 journal_path = Some(PathBuf::from(p));
             }
+        }
+        if let Some(v) = parsed.parameters.get("journalfiles") {
+            journal_files = expand_journal_files(v);
+        }
+        if let Some(v) = parsed.parameters.get("namespace") {
+            let ns = v.trim();
+            if !ns.is_empty() {
+                journal_namespace = Some(ns.to_owned());
+            }
+        }
+        if let Some(v) = parsed.parameters.get("rotated") {
+            let _ = parse_bool(v)?;
         }
         if let Some(v) = parsed.parameters.get("tail") {
             journal_tail = parse_bool(v)?;
@@ -95,6 +114,8 @@ fn parse_backend_spec(raw: &str) -> Result<ParsedBackend> {
         real_backend,
         journal_flags,
         journal_path,
+        journal_files,
+        journal_namespace,
         journal_tail,
     })
 }
@@ -123,6 +144,8 @@ pub struct JailState {
     pub journal_matches: Vec<Vec<String>>,
     pub journal_flags: Option<u32>,
     pub journal_path: Option<PathBuf>,
+    pub journal_files: Vec<PathBuf>,
+    pub journal_namespace: Option<String>,
     pub journal_tail: bool,
     pub db: Option<Arc<std::sync::Mutex<Fail2BanDb>>>,
     ban_epoch: u64,
@@ -130,6 +153,9 @@ pub struct JailState {
     last_periodic_check: f64,
     file_checkpoints: BTreeMap<PathBuf, (String, u64)>,
     last_journal_ts: Option<f64>,
+    journal_dirty: bool,
+    journal_events_since_sync: u64,
+    last_journal_db_sync: f64,
     reloading: bool,
     reload_logs: Option<BTreeSet<PathBuf>>,
     reload_actions: Option<BTreeMap<String, Option<String>>>,
@@ -194,6 +220,8 @@ impl JailState {
             journal_matches: Vec::new(),
             journal_flags: parsed.journal_flags,
             journal_path: parsed.journal_path,
+            journal_files: parsed.journal_files,
+            journal_namespace: parsed.journal_namespace,
             journal_tail: parsed.journal_tail,
             db,
             ban_epoch: 0,
@@ -201,6 +229,9 @@ impl JailState {
             last_periodic_check: current_unix_seconds(),
             file_checkpoints: BTreeMap::new(),
             last_journal_ts: None,
+            journal_dirty: false,
+            journal_events_since_sync: 0,
+            last_journal_db_sync: 0.0,
             reloading: false,
             reload_logs: None,
             reload_actions: None,
@@ -217,14 +248,14 @@ impl JailState {
     }
 
     /// Add a log file path to monitor (`FileFilter.addLogPath` semantics).
-    pub fn add_log_path(&mut self, path: PathBuf, tail: bool) {
+    pub fn add_log_path(&mut self, path: PathBuf, tail: bool) -> Result<()> {
         if self.real_backend == BackendKind::Systemd {
-            return;
+            return Ok(());
         }
         if let Some(ref mut reload_set) = self.reload_logs
             && reload_set.remove(&path)
         {
-            return;
+            return Ok(());
         }
         if self.log_paths.iter().any(|(p, _)| p == &path) {
             f2b_log!(
@@ -233,9 +264,21 @@ impl JailState {
                 "{} already exists",
                 path.display()
             );
-            return;
+            return Ok(());
         }
+        let check_file = || {
+            let file = std::fs::File::open(&path)?;
+            if file.metadata()?.is_dir() {
+                return Err(std::io::Error::from_raw_os_error(nix::libc::EISDIR));
+            }
+            Ok(())
+        };
+        check_file().map_err(|source| Error::LogPath {
+            path: path.clone(),
+            source,
+        })?;
         self.log_paths.push((path, tail));
+        Ok(())
     }
 
     /// Remove a monitored log file path (`FileFilter.delLogPath` semantics).
@@ -389,8 +432,8 @@ impl JailState {
             journal_matches: self.journal_matches.clone(),
             encoding: self.filter.log_encoding(),
         });
-        let _ = self.filter.del_fail_regex(None);
-        let _ = self.filter.del_ignore_regex(None);
+        self.filter.del_fail_regex(None);
+        self.filter.del_ignore_regex(None);
         let _ = self.filter.del_ignore_ip(None);
         let _ = self.filter.set_prefregex(None);
         self.journal_matches.clear();
@@ -511,6 +554,15 @@ impl JailState {
             } => {
                 if let Some(ts) = preset_date {
                     self.last_journal_ts = Some(ts);
+                    if self.real_backend == BackendKind::Systemd {
+                        self.journal_dirty = true;
+                        self.journal_events_since_sync += 1;
+                        if self.journal_events_since_sync >= 100
+                            || now >= self.last_journal_db_sync + 5.0
+                        {
+                            self.flush_journal_pos_to_db(now);
+                        }
+                    }
                 }
                 let processed = self.filter.process_line_at(&line, preset_date, now);
                 for m in processed.results {
@@ -537,7 +589,7 @@ impl JailState {
                     );
 
                     let mut attempts = self.fail_manager.add_failure(ticket.clone(), 1, false);
-                    if self.ban_extra.increment {
+                    if self.ban_extra.increment() {
                         let boost = self.db_failure_found_boost(&mut ticket);
                         if boost > 0 {
                             attempts = self.fail_manager.add_failure(ticket, boost, true);
@@ -558,10 +610,14 @@ impl JailState {
     pub async fn periodic_tick(&mut self, now: f64) {
         let expired = self.ban_manager.unban(now);
         for ticket in expired {
+            // Keep expired entries in SQLite `bips` (cleaned by `purge`) so `bantime.increment` sees prior bans.
             self.unban_ticket_actions(&ticket, true).await;
-            self.db_del_ban(Some(&ticket.fid));
         }
         self.fail_manager.cleanup(now);
+
+        if self.journal_dirty && now >= self.last_journal_db_sync + 5.0 {
+            self.flush_journal_pos_to_db(now);
+        }
 
         if now >= self.last_periodic_check + PERIODIC_CHECK_INTERVAL_SECS {
             self.last_periodic_check = now;
@@ -574,7 +630,7 @@ impl JailState {
         let already_banned = self.ban_manager.in_ban_list(&ticket.fid);
         let mut incremented_in_observer = false;
 
-        if !ticket.restored && self.ban_extra.increment {
+        if !ticket.restored && self.ban_extra.increment() {
             let pre_cnt = ticket.ban_count;
             let db_guard = self.db.as_ref().and_then(|d| d.lock().ok());
             observer::incr_ban_time(
@@ -592,8 +648,7 @@ impl JailState {
 
         // Prevent double-incrementing `ban_count` when inserting a new ticket into `BanManager`,
         // since `BanManager::add_ban_ticket` increments `ban_count` by 1 on `Entry::Vacant`.
-        if !already_banned && (incremented_in_observer || ticket.restored) && ticket.ban_count > 0
-        {
+        if !already_banned && (incremented_in_observer || ticket.restored) && ticket.ban_count > 0 {
             ticket.ban_count = ticket.ban_count.saturating_sub(1);
         }
 
@@ -767,7 +822,8 @@ impl JailState {
         let before = self.ban_manager.total_bans();
         for raw in ips {
             let id = TicketId::parse(raw);
-            let ticket = Ticket::new(id, now);
+            let mut ticket = Ticket::new(id, now);
+            ticket.attempts = 0;
             self.ban_ticket(ticket, now).await;
         }
         Ok((self.ban_manager.total_bans().saturating_sub(before)) as usize)
@@ -795,7 +851,11 @@ impl JailState {
                                 cnt += 1;
                             }
                         } else {
-                            f2b_log!(LogLevel::Notice, "fail2ban.actions", "{target} is not banned");
+                            f2b_log!(
+                                LogLevel::Notice,
+                                "fail2ban.actions",
+                                "{target} is not banned"
+                            );
                             if !ifexists {
                                 missed.push(raw.clone());
                             }
@@ -803,7 +863,9 @@ impl JailState {
                     }
                 }
                 if !missed.is_empty() {
-                    return Err(Error::invalid_command(format!("not banned: {missed:?}")));
+                    let rendered =
+                        crate::client::beautifier::py_repr(&PickleValue::str_list(missed));
+                    return Err(Error::Value(format!("not banned: {rendered}")));
                 }
                 Ok(cnt)
             }
@@ -831,7 +893,7 @@ impl JailState {
         );
         let count = u64::try_from(matches.len().max(1)).unwrap_or(1);
         let mut attempts = self.fail_manager.add_failure(ticket.clone(), count, false);
-        if self.ban_extra.increment {
+        if self.ban_extra.increment() {
             let boost = self.db_failure_found_boost(&mut ticket);
             if boost > 0 {
                 attempts = self.fail_manager.add_failure(ticket, boost, true);
@@ -962,17 +1024,19 @@ impl JailState {
             ]));
         }
         if flavor == "cymru" {
+            let banned_ids = self.ban_manager.get_ban_list(false);
+            let cymru = crate::filter::ipdns::lookup_cymru_info(&banned_ids);
             action_items.push(PickleValue::Tuple(vec![
                 PickleValue::Str("Banned ASN list".to_owned()),
-                PickleValue::List(Vec::new()),
+                PickleValue::str_list(cymru.asns),
             ]));
             action_items.push(PickleValue::Tuple(vec![
                 PickleValue::Str("Banned Country list".to_owned()),
-                PickleValue::List(Vec::new()),
+                PickleValue::str_list(cymru.countries),
             ]));
             action_items.push(PickleValue::Tuple(vec![
                 PickleValue::Str("Banned RIR list".to_owned()),
-                PickleValue::List(Vec::new()),
+                PickleValue::str_list(cymru.rirs),
             ]));
         }
 
@@ -1109,13 +1173,27 @@ impl JailState {
 
     fn build_file_log_configs(&self) -> Vec<FileLogConfig> {
         let mut out = Vec::with_capacity(self.log_paths.len());
+        let seek_cutoff = if self.filter.check_find_time() {
+            Some(current_unix_seconds() - self.filter.find_time())
+        } else {
+            None
+        };
         for (path, tail) in &self.log_paths {
+            let auto_seek = if !*tail {
+                seek_cutoff.map(|start_time| AutoSeekConfig {
+                    start_time,
+                    date_detector: self.filter.date_detector().clone(),
+                })
+            } else {
+                None
+            };
             if let Some((fp, off)) = self.file_checkpoints.get(path) {
                 out.push(FileLogConfig {
                     path: path.clone(),
                     tail: *tail,
                     resume_fingerprint: Some(fp.clone()),
                     resume_offset: *off,
+                    auto_seek,
                 });
                 continue;
             }
@@ -1129,6 +1207,7 @@ impl JailState {
                 tail: *tail,
                 resume_fingerprint,
                 resume_offset,
+                auto_seek,
             });
         }
         out
@@ -1138,7 +1217,7 @@ impl JailState {
         let Some(ref db_arc) = self.db else {
             return Vec::new();
         };
-        let (forbantime, correct_ban_time) = if self.ban_extra.increment {
+        let (forbantime, correct_ban_time) = if self.ban_extra.increment() {
             (
                 None,
                 Some(self.ban_extra.max_ban_time(self.ban_manager.ban_time())),
@@ -1220,6 +1299,41 @@ impl JailState {
                 self.name
             );
         }
+    }
+
+    fn db_get_journal_pos(&self) -> Option<f64> {
+        let db_arc = self.db.as_ref()?;
+        let guard = db_arc.lock().ok()?;
+        guard
+            .get_journal_pos(&self.name, "systemd-journal")
+            .ok()
+            .flatten()
+    }
+
+    fn flush_journal_pos_to_db(&mut self, now: f64) {
+        if !self.journal_dirty {
+            return;
+        }
+        let Some(ts) = self.last_journal_ts else {
+            self.journal_dirty = false;
+            return;
+        };
+        if let Some(ref db_arc) = self.db
+            && let Ok(guard) = db_arc.lock()
+        {
+            let iso = format!("{} ", time2str(ts));
+            if let Err(err) = guard.update_journal(&self.name, "systemd-journal", ts, &iso) {
+                f2b_log!(
+                    LogLevel::Warning,
+                    "fail2ban.jail",
+                    "Failed to update systemd-journal checkpoint for '{}': {err}",
+                    self.name
+                );
+            }
+        }
+        self.journal_dirty = false;
+        self.journal_events_since_sync = 0;
+        self.last_journal_db_sync = now;
     }
 
     fn db_add_ban(&self, ticket: &Ticket) {
@@ -1343,7 +1457,12 @@ impl Jail {
         }
 
         let jail_name = st.name.clone();
-        f2b_log!(LogLevel::Debug, "fail2ban.jail", "Starting jail '{}'", jail_name);
+        f2b_log!(
+            LogLevel::Debug,
+            "fail2ban.jail",
+            "Starting jail '{}'",
+            jail_name
+        );
         st.db_add_jail();
 
         let ipv6_allowed = allow_ipv6();
@@ -1370,12 +1489,8 @@ impl Jail {
         let (backend_shut_tx, backend_shut_rx) = watch::channel(false);
 
         let backend_handle = spawn_backend_task(&st, event_tx.clone(), backend_shut_rx);
-        let worker_handle = spawn_worker_task(
-            Arc::clone(&self.state),
-            event_rx,
-            worker_shut_rx,
-            idle_rx,
-        );
+        let worker_handle =
+            spawn_worker_task(Arc::clone(&self.state), event_rx, worker_shut_rx, idle_rx);
 
         st.alive = true;
         st.idle = false;
@@ -1390,7 +1505,12 @@ impl Jail {
             event_tx,
         });
 
-        f2b_log!(LogLevel::Info, "fail2ban.jail", "Jail '{}' started", jail_name);
+        f2b_log!(
+            LogLevel::Info,
+            "fail2ban.jail",
+            "Jail '{}' started",
+            jail_name
+        );
         Ok(())
     }
 
@@ -1409,6 +1529,7 @@ impl Jail {
         }
 
         let mut st = self.state.lock().await;
+        st.flush_journal_pos_to_db(current_unix_seconds());
         if st.alive || !st.ban_manager.get_ban_list(false).is_empty() || !st.actions.is_empty() {
             let _ = st.flush_bans(false, true).await;
         }
@@ -1423,7 +1544,12 @@ impl Jail {
             }
         }
         st.alive = false;
-        f2b_log!(LogLevel::Info, "fail2ban.jail", "Jail '{}' stopped", jail_name);
+        f2b_log!(
+            LogLevel::Info,
+            "fail2ban.jail",
+            "Jail '{}' stopped",
+            jail_name
+        );
         Ok(())
     }
 
@@ -1463,14 +1589,6 @@ impl Jail {
             st.idle = idle;
         }
         self.sync_idle_signal(idle).await;
-    }
-
-    pub async fn is_idle(&self) -> bool {
-        self.state.lock().await.idle
-    }
-
-    pub async fn is_alive(&self) -> bool {
-        self.state.lock().await.alive
     }
 
     pub async fn reload_begin(&self) {
@@ -1565,9 +1683,24 @@ fn spawn_backend_task(
                 matches: st.journal_matches.clone(),
                 flags: st.journal_flags,
                 path: st.journal_path.clone(),
+                files: st.journal_files.clone(),
+                namespace: st.journal_namespace.clone(),
             };
-            let reader = FilterSystemd::new(jcfg, encoding, st.journal_tail)
-                .with_since(st.last_journal_ts);
+            let saved_ts = st.last_journal_ts.or_else(|| st.db_get_journal_pos());
+            let since_epoch = if let Some(ts) = saved_ts {
+                let floor = if st.filter.check_find_time() {
+                    current_unix_seconds() - st.filter.find_time()
+                } else {
+                    0.0
+                };
+                Some((ts + 0.000_001).max(floor))
+            } else if !st.journal_tail && st.filter.check_find_time() {
+                Some(current_unix_seconds() - st.filter.find_time())
+            } else {
+                None
+            };
+            let reader =
+                FilterSystemd::new(jcfg, encoding, st.journal_tail).with_since(since_epoch);
             Some(tokio::spawn(async move {
                 if let Err(err) = reader.run(event_tx, shutdown_rx).await {
                     f2b_log!(
@@ -1650,17 +1783,19 @@ mod tests {
         {
             let mut st = jail.state.lock().await;
             st.filter.set_ignore_self(false);
-            st.filter.set_check_find_time(false);
             st.filter
                 .add_fail_regex(r"Failed password for \S+ from <HOST> port \d+")
                 .unwrap();
             st.fail_manager.set_max_retry(2);
-            st.ban_manager.set_ban_time(1);
-            st.add_log_path(log_file.clone(), false);
+            st.ban_manager.set_ban_time(3);
+            st.add_log_path(log_file.clone(), false).unwrap();
             st.add_action("rec", None, None).unwrap();
             let act = st.get_action_mut("rec").unwrap();
-            act.set_property("actionban", &format!("echo ban:<ip> >> '{}'", ban_log.display()))
-                .unwrap();
+            act.set_property(
+                "actionban",
+                &format!("echo ban:<ip> >> '{}'", ban_log.display()),
+            )
+            .unwrap();
             act.set_property(
                 "actionunban",
                 &format!("echo unban:<ip> >> '{}'", ban_log.display()),
@@ -1675,20 +1810,20 @@ mod tests {
                 .append(true)
                 .open(&log_file)
                 .unwrap();
+            let date = chrono::Local::now().format("%b %e %H:%M:%S%.3f");
             writeln!(
                 f,
-                "May 14 08:30:01 host sshd[10]: Failed password for root from 203.0.113.42 port 22"
+                "{date} host sshd[10]: Failed password for root from 203.0.113.42 port 22"
             )
             .unwrap();
             writeln!(
                 f,
-                "May 14 08:30:02 host sshd[11]: Failed password for root from 203.0.113.42 port 22"
+                "{date} host sshd[11]: Failed password for root from 203.0.113.42 port 22"
             )
             .unwrap();
         }
 
-        // Wait up to 4s for polling -> ban -> DB persistence -> 1s expiry -> unban.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         let mut saw_ban_and_unban = false;
         while tokio::time::Instant::now() < deadline {
             if let Ok(contents) = std::fs::read_to_string(&ban_log)
@@ -1706,16 +1841,22 @@ mod tests {
             std::fs::read_to_string(&ban_log)
         );
 
-        // Verify SQLite bans history retained the ban while active bips was cleared on unban.
+        // Verify natural expiry keeps `bans` & `bips` history (for `bantime.increment`)
+        // while `get_current_bans` no longer reports the expired ticket as active.
         {
             let guard = db.lock().unwrap();
-            let (cnt, matches) = guard
-                .get_bans_merged(&TicketId::parse("203.0.113.42"), Some("sshd"))
-                .unwrap();
+            let ip = TicketId::parse("203.0.113.42");
+            let (cnt, matches) = guard.get_bans_merged(&ip, Some("sshd")).unwrap();
             assert_eq!(cnt, 2);
             assert_eq!(matches.len(), 2);
+            assert!(guard.get_ban(&ip, Some("sshd"), false).unwrap().is_some());
             let cur = guard
-                .get_current_bans(Some("sshd"), None, None, current_unix_seconds() as i64)
+                .get_current_bans(
+                    Some("sshd"),
+                    None,
+                    None,
+                    current_unix_seconds().ceil() as i64,
+                )
                 .unwrap();
             assert!(cur.is_empty());
         }
@@ -1751,7 +1892,10 @@ mod tests {
             st.add_action("fw", None, None).unwrap();
             st.get_action_mut("fw")
                 .unwrap()
-                .set_property("actionban", &format!("echo fw:<ip> >> '{}'", ban_log.display()))
+                .set_property(
+                    "actionban",
+                    &format!("echo fw:<ip> >> '{}'", ban_log.display()),
+                )
                 .unwrap();
 
             st.add_action("notify", None, None).unwrap();
@@ -1786,10 +1930,11 @@ mod tests {
 
     #[tokio::test]
     async fn jail_status_and_ban_list_formats_match_upstream() {
+        let log = tempfile::NamedTempFile::new().unwrap();
         let jail = Jail::new("sshd", "polling", None).unwrap();
         {
             let mut st = jail.state.lock().await;
-            st.add_log_path(PathBuf::from("/var/log/auth.log"), false);
+            st.add_log_path(log.path().to_owned(), false).unwrap();
             st.ban_manager.set_ban_time(600);
             let mut t = Ticket::new(TicketId::parse("192.0.2.9"), 1_700_000_000.0);
             t.ban_time = Some(-1);
@@ -1811,5 +1956,46 @@ mod tests {
             assert!(list_wt[0].contains("192.0.2.9 \t"));
             assert!(list_wt[0].contains("+ -1 = 9999-12-31 23:59:59"));
         }
+    }
+
+    #[tokio::test]
+    async fn systemd_backend_parses_journalfiles_namespace_and_persists_journal_pos() {
+        let dir = TempDir::new().unwrap();
+        let jf1 = dir.path().join("system.journal");
+        let jf2 = dir.path().join("user.journal");
+        std::fs::write(&jf1, b"").unwrap();
+        std::fs::write(&jf2, b"").unwrap();
+
+        let glob_pat = format!("{}/*.journal", dir.path().display());
+        let spec = format!("systemd[journalfiles=\"{glob_pat}\", namespace=customns, rotated=1]");
+        let db = Arc::new(std::sync::Mutex::new(
+            Fail2BanDb::open(":memory:", 86_400, 10).unwrap(),
+        ));
+
+        let jail = Jail::new("sshd-j", spec, Some(Arc::clone(&db))).unwrap();
+        {
+            let mut st = jail.state.lock().await;
+            assert_eq!(st.real_backend, BackendKind::Systemd);
+            assert_eq!(st.journal_files, vec![jf1.clone(), jf2.clone()]);
+            assert_eq!(st.journal_namespace.as_deref(), Some("customns"));
+            assert_eq!(st.db_get_journal_pos(), None);
+
+            st.handle_log_event(
+                LogEvent::Line {
+                    line: "srv sshd[1]: benign".to_owned(),
+                    preset_date: Some(1_715_675_415.75),
+                    log_path: None,
+                },
+                1_715_675_416.0,
+            )
+            .await;
+            st.flush_journal_pos_to_db(1_715_675_416.0);
+        }
+
+        // A newly constructed jail backed by the same SQLite DB resumes from stored timestamp.
+        let jail2 = Jail::new("sshd-j", "systemd", Some(Arc::clone(&db))).unwrap();
+        let st2 = jail2.state.lock().await;
+        let resumed = st2.db_get_journal_pos().unwrap();
+        assert!((resumed - 1_715_675_415.75).abs() < 1e-6);
     }
 }

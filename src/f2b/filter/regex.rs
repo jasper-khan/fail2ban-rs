@@ -10,7 +10,7 @@ use super::ipdns::{IP_4_RE, IP_6_RE, UseDns};
 const FAILURE_ID_GROUPS: &[&str] = &["fid", "ip4", "ip6", "dns"];
 const FAILURE_ID_PRESENTS: &[&str] = &["fid", "ip4", "ip6", "dns", "mlfid"];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Engine {
     Fast(regex::Regex),
     Fancy(Box<fancy_regex::Regex>),
@@ -19,7 +19,7 @@ enum Engine {
 /// Dual-engine regex wrapper: compiles with linear-time `regex::Regex` first
 /// and falls back to `fancy_regex::Regex` for lookaround, backreferences, and
 /// conditionals.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledRegex {
     engine: Engine,
     capture_names: Vec<Option<String>>,
@@ -87,11 +87,11 @@ impl CompiledRegex {
     /// falling back to `fancy_regex::Regex` on lookaround/backref/conditionals.
     pub fn compile(pattern: &str, multiline: bool) -> Result<Self> {
         let norm = normalize_python_regex(pattern);
-        if let Ok(re) = regex::RegexBuilder::new(&norm).multi_line(multiline).build() {
-            let capture_names = re
-                .capture_names()
-                .map(|n| n.map(str::to_owned))
-                .collect();
+        if let Ok(re) = regex::RegexBuilder::new(&norm)
+            .multi_line(multiline)
+            .build()
+        {
+            let capture_names = re.capture_names().map(|n| n.map(str::to_owned)).collect();
             return Ok(Self {
                 engine: Engine::Fast(re),
                 capture_names,
@@ -107,13 +107,15 @@ impl CompiledRegex {
         let re = fancy_regex::RegexBuilder::new(&fancy_pat)
             .backtrack_limit(200_000)
             .build()
-            .map_err(|err| Error::regex(format!("Unable to compile regular expression {pattern:?}: {err}")))?;
+            .map_err(|err| {
+                Error::regex(format!(
+                    "Unable to compile regular expression {pattern:?}: {err}"
+                ))
+            })?;
         let capture_names = if extracted_names.len() == re.captures_len() {
             extracted_names
         } else {
-            re.capture_names()
-                .map(|n| n.map(str::to_owned))
-                .collect()
+            re.capture_names().map(|n| n.map(str::to_owned)).collect()
         };
         Ok(Self {
             engine: Engine::Fancy(Box::new(re)),
@@ -126,10 +128,7 @@ impl CompiledRegex {
     }
 
     pub fn has_capture(&self, name: &str) -> bool {
-        self.capture_names
-            .iter()
-            .flatten()
-            .any(|n| n == name)
+        self.capture_names.iter().flatten().any(|n| n == name)
     }
 
     pub fn is_match(&self, text: &str) -> bool {
@@ -154,7 +153,11 @@ impl CompiledRegex {
         start: usize,
         end: usize,
     ) -> Option<RegexMatch<'t>> {
-        if start > end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        if start > end
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+        {
             return None;
         }
         let slice = &text[..end];
@@ -171,6 +174,7 @@ impl CompiledRegex {
 
 /// Normalize Python `re` syntax quirks into Rust `regex` / `fancy-regex` syntax:
 /// - Inside `[...]`: escape unescaped `[`, leading `]`, and set operators `&&`/`--`/`~~`
+/// - `\<` and `\>` are literal brackets in Python, word boundaries in Rust
 /// - Outside `[...]`:
 ///   - `\Z` -> `\z`
 ///   - `{,N}` -> `{0,N}`
@@ -190,6 +194,8 @@ pub fn normalize_python_regex(pattern: &str) -> String {
             if let Some(next) = pattern[i + 1..].chars().next() {
                 if !in_class && next == 'Z' {
                     pass1.push_str(r"\z");
+                } else if matches!(next, '<' | '>') {
+                    pass1.push(next);
                 } else {
                     pass1.push('\\');
                     pass1.push(next);
@@ -356,11 +362,15 @@ fn resolve_named_conditionals(pattern: &str) -> String {
             }
 
             if pattern[i..].starts_with("(?(")
-                && let Some((name, consumed)) = parse_python_named_cond(&pattern[i + 3..])
-                && let Some(&idx) = group_map.get(name)
+                && let Some((name, consumed)) = parse_group_condition(&pattern[i + 3..])
             {
-                out.push_str(&format!("(?({idx})"));
-                i += 3 + consumed;
+                let end = i + 3 + consumed;
+                if let Some(&idx) = group_map.get(name) {
+                    out.push_str(&format!("(?({idx})"));
+                } else {
+                    out.push_str(&pattern[i..end]);
+                }
+                i = end;
                 continue;
             }
 
@@ -473,6 +483,14 @@ fn strip_group_names_for_fancy(pattern: &str) -> (String, Vec<Option<String>>) {
                 i = end;
                 continue;
             }
+            if pattern[i..].starts_with("(?(")
+                && let Some((_, consumed)) = parse_group_condition(&pattern[i + 3..])
+            {
+                let end = i + 3 + consumed;
+                out.push_str(&pattern[i..end]);
+                i = end;
+                continue;
+            }
             if pattern[i..].starts_with("(?P=")
                 && let Some(rel_end) = pattern[i + 4..].find(')')
             {
@@ -547,7 +565,7 @@ fn parse_glob_to_loc_flags(rest: &str) -> Option<(&str, usize)> {
     Some((flags, prefix_len + end + 1))
 }
 
-fn parse_python_named_cond(rest: &str) -> Option<(&str, usize)> {
+fn parse_group_condition(rest: &str) -> Option<(&str, usize)> {
     if let Some(inner) = rest.strip_prefix('<') {
         let first = inner.as_bytes().first()?;
         if !(first.is_ascii_alphabetic() || *first == b'_') {
@@ -562,7 +580,7 @@ fn parse_python_named_cond(rest: &str) -> Option<(&str, usize)> {
         return Some((&inner[..end], 1 + end + 2));
     }
     let first = rest.as_bytes().first()?;
-    if !(first.is_ascii_alphabetic() || *first == b'_') {
+    if !(first.is_ascii_alphanumeric() || *first == b'_') {
         return None;
     }
     let end = rest
@@ -667,20 +685,20 @@ impl FailRegex {
         let has_id = compiled.has_failure_id_group()
             || pref_regex.is_some_and(FailRegex::has_failure_id_group);
         if !has_id {
-            return Err(Error::regex(format!(
-                "No failure-id group in {:?}",
-                compiled.effective_regex
-            )));
+            let quoted = if compiled.effective_regex.contains('\'')
+                && !compiled.effective_regex.contains('"')
+            {
+                format!("\"{}\"", compiled.effective_regex)
+            } else {
+                format!("'{}'", compiled.effective_regex.replace('\'', "\\'"))
+            };
+            return Err(Error::regex(format!("No failure-id group in {quoted}")));
         }
         Ok(compiled)
     }
 
     /// Compile a filter regex without requiring a failure-id group (used for `prefregex` and `ignoreregex`).
-    pub fn compile_filter_regex(
-        pattern: &str,
-        multiline: bool,
-        use_dns: UseDns,
-    ) -> Result<Self> {
+    pub fn compile_filter_regex(pattern: &str, multiline: bool, use_dns: UseDns) -> Result<Self> {
         let resolved = Self::resolve_host_tag(pattern, use_dns);
         if resolved.trim_start().is_empty() {
             return Err(Error::regex("Cannot add empty regex"));
@@ -747,9 +765,8 @@ impl FailRegex {
                     .unwrap_or(tn)
                     .strip_suffix('/')
                     .unwrap_or_else(|| tn.strip_prefix('/').unwrap_or(tn));
-                let valid_shape = !tn.starts_with("//")
-                    && !tn.ends_with("//")
-                    && is_valid_ftag_body(inner);
+                let valid_shape =
+                    !tn.starts_with("//") && !tn.ends_with("//") && is_valid_ftag_body(inner);
 
                 if valid_shape {
                     let full_tag = &regex[i..=end];
@@ -863,7 +880,6 @@ impl FailRegex {
         let m_start = m.start();
         let m_end = m.end();
         let raw_groups = m.named_groups(self.compiled.capture_names());
-        self.last_groups = merge_alt_and_tuple_groups(raw_groups, &self.alt_values, &self.tuple_values);
 
         let mut skipped_raw = String::new();
         let mut n = 0usize;
@@ -872,15 +888,14 @@ impl FailRegex {
             if !self.compiled.has_capture(&key) {
                 break;
             }
-            if let Some(val) = m.name(&key) {
+            if let Some(val) = raw_groups.get(&key) {
                 skipped_raw.push_str(val);
             }
             n += 1;
         }
-        self.skipped_lines = skipped_raw
-            .lines()
-            .map(str::to_owned)
-            .collect();
+        self.skipped_lines = skipped_raw.lines().map(str::to_owned).collect();
+        self.last_groups =
+            merge_alt_and_tuple_groups(raw_groups, &self.alt_values, &self.tuple_values);
 
         self.matched = true;
         if org_lines.len() <= 1 {
@@ -892,8 +907,8 @@ impl FailRegex {
             } else {
                 m_start.min(bytes.len())
             };
-            let match_line_start = memchr::memrchr(b'\n', &bytes[..search_start_end])
-                .map_or(0, |p| p + 1);
+            let match_line_start =
+                memchr::memrchr(b'\n', &bytes[..search_start_end]).map_or(0, |p| p + 1);
 
             let end_probe = m_end.saturating_sub(1).min(bytes.len());
             let match_line_end = memchr::memchr(b'\n', &bytes[end_probe..])
@@ -915,11 +930,12 @@ impl FailRegex {
 
             let mut cursor = 0usize;
             for skipped in &self.skipped_lines {
-                if let Some(rel) = self.matched_tuple_lines[cursor..]
-                    .iter()
-                    .position(|(pre, _, post)| {
-                        skipped.strip_prefix(pre.as_str()) == Some(post.as_str())
-                    })
+                if let Some(rel) =
+                    self.matched_tuple_lines[cursor..]
+                        .iter()
+                        .position(|(pre, _, post)| {
+                            skipped.strip_prefix(pre.as_str()) == Some(post.as_str())
+                        })
                 {
                     let removed = self.matched_tuple_lines.remove(cursor + rel);
                     self.unmatched_tuple_lines.push(removed);
@@ -1048,6 +1064,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn escaped_angle_brackets_match_literal_text() {
+        let regex = CompiledRegex::compile(r"^\<?(?P<peer>\S+?)\>?$", false).unwrap();
+        for line in ["<192.0.2.1>", "192.0.2.1"] {
+            let captures = regex.search(line).unwrap();
+            assert_eq!(captures.name("peer"), Some("192.0.2.1"));
+        }
+    }
+
+    #[test]
     fn resolves_tags_and_compiles_with_fancy_fallback() {
         let re = FailRegex::new(
             r#"^Failed password for (?:invalid user )?<F-USER>(?P<cond_user>\S+)</F-USER> from <HOST>(?(cond_user): |.*)$"#,
@@ -1066,7 +1091,7 @@ mod tests {
         let line = vec![(
             String::new(),
             "Jan  1 00:00:00 ".to_owned(),
-            "Failed password for admin from 2001:db8::1: bad".to_owned(),
+            "Failed password for admin from 2001:db8::1: ".to_owned(),
         )];
         let buf = FailRegex::tuple_lines_buf(&line);
         assert!(r.search(&buf, &line));
@@ -1095,7 +1120,10 @@ mod tests {
             "Failed password for invalid user bob smith from 192.0.2.5 port 22 ssh2".to_owned(),
         )];
         assert!(sshd_re.search(&FailRegex::tuple_lines_buf(&sshd_inv), &sshd_inv));
-        assert_eq!(sshd_re.groups().get("user").map(String::as_str), Some("bob smith"));
+        assert_eq!(
+            sshd_re.groups().get("user").map(String::as_str),
+            Some("bob smith")
+        );
     }
 
     #[test]
@@ -1108,13 +1136,22 @@ mod tests {
             UseDns::No,
         )
         .unwrap();
-        let line = vec![(String::new(), String::new(), "foo [192.0.2.1]: SASL login failed".to_owned())];
+        let line = vec![(
+            String::new(),
+            String::new(),
+            "foo [192.0.2.1]: SASL login failed".to_owned(),
+        )];
         let mut p = p;
         assert!(p.search(&FailRegex::tuple_lines_buf(&line), &line));
 
         // `{,N}` quantifier (assp.conf / froxlor-auth.conf).
-        let q = FailRegex::new(r"^errors \(\d{,3}\) from <ADDR>$", None, false, UseDns::No).unwrap();
-        let line_q = vec![(String::new(), String::new(), "errors (12) from 198.51.100.7".to_owned())];
+        let q =
+            FailRegex::new(r"^errors \(\d{,3}\) from <ADDR>$", None, false, UseDns::No).unwrap();
+        let line_q = vec![(
+            String::new(),
+            String::new(),
+            "errors (12) from 198.51.100.7".to_owned(),
+        )];
         let mut q = q;
         assert!(q.search(&FailRegex::tuple_lines_buf(&line_q), &line_q));
 
@@ -1126,7 +1163,11 @@ mod tests {
             UseDns::No,
         )
         .unwrap();
-        let line_b = vec![(String::new(), String::new(), "from 192.0.2.9 : ABC1: error:ABC1:fail".to_owned())];
+        let line_b = vec![(
+            String::new(),
+            String::new(),
+            "from 192.0.2.9 : ABC1: error:ABC1:fail".to_owned(),
+        )];
         let mut b = b;
         assert!(b.search(&FailRegex::tuple_lines_buf(&line_b), &line_b));
     }
@@ -1140,9 +1181,16 @@ mod tests {
             UseDns::No,
         )
         .unwrap();
-        let l1 = vec![(String::new(), String::new(), "log=root ruser= host=192.0.2.2 user=alice".to_owned())];
+        let l1 = vec![(
+            String::new(),
+            String::new(),
+            "log=root ruser= host=192.0.2.2 user=alice".to_owned(),
+        )];
         assert!(alt_re.search(&FailRegex::tuple_lines_buf(&l1), &l1));
-        assert_eq!(alt_re.groups().get("user").map(String::as_str), Some("alice"));
+        assert_eq!(
+            alt_re.groups().get("user").map(String::as_str),
+            Some("alice")
+        );
 
         let mut tup_re = FailRegex::new(
             r"^\s*<F-TUPLE_ID_1>\S+</F-TUPLE_ID_1> <F-ID><ADDR>:<F-PORT/></F-ID> <F-TUPLE_ID_2>\S+</F-TUPLE_ID_2>$",
@@ -1151,7 +1199,11 @@ mod tests {
             UseDns::No,
         )
         .unwrap();
-        let l2 = vec![(String::new(), String::new(), "left [192.0.2.4]:12345 right".to_owned())];
+        let l2 = vec![(
+            String::new(),
+            String::new(),
+            "left [192.0.2.4]:12345 right".to_owned(),
+        )];
         assert!(tup_re.search(&FailRegex::tuple_lines_buf(&l2), &l2));
         assert_eq!(
             tup_re.groups().get("fid").map(String::as_str),
@@ -1168,7 +1220,11 @@ mod tests {
         let multi = vec![
             (String::new(), "t1 ".into(), " [conn1] Failed".into()),
             (String::new(), "t2 ".into(), " noise line".into()),
-            (String::new(), "t3 ".into(), " [conn1] end 192.0.2.50".into()),
+            (
+                String::new(),
+                "t3 ".into(),
+                " [conn1] end 192.0.2.50".into(),
+            ),
         ];
         assert!(skip_re.search(&FailRegex::tuple_lines_buf(&multi), &multi));
         assert_eq!(skip_re.matched_lines().len(), 2);

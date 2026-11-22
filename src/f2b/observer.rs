@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::db::Fail2BanDb;
 use crate::duration::{parse_bool, str2seconds_i64};
 use crate::error::{Error, Result};
+use crate::protocol::PickleValue;
 use crate::ticket::Ticket;
 
 /// Default exponential `bantime.formula` in Fail2Ban 1.1.1.
@@ -18,29 +19,15 @@ pub const DEFAULT_FORMULA: &str = "ban.Time * (1<<(ban.Count if ban.Count<20 els
 const MAX_EXPR_DEPTH: usize = 64;
 
 /// Per-jail `bantime.*` incremental ban configuration and evaluator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BanTimeExtra {
-    pub increment: bool,
-    pub factor: String,
-    pub formula: Option<String>,
-    pub multipliers: Vec<f64>,
-    pub maxtime: Option<i64>,
-    pub rndtime: Option<i64>,
-    pub overalljails: bool,
-}
-
-impl Default for BanTimeExtra {
-    fn default() -> Self {
-        Self {
-            increment: false,
-            factor: "1".to_owned(),
-            formula: Some(DEFAULT_FORMULA.to_owned()),
-            multipliers: Vec::new(),
-            maxtime: None,
-            rndtime: None,
-            overalljails: false,
-        }
-    }
+    increment: Option<bool>,
+    factor: Option<String>,
+    formula: Option<String>,
+    multipliers: Option<(String, Vec<i64>)>,
+    maxtime: Option<i64>,
+    rndtime: Option<i64>,
+    overalljails: Option<PickleValue>,
 }
 
 impl BanTimeExtra {
@@ -48,21 +35,31 @@ impl BanTimeExtra {
         Self::default()
     }
 
+    /// Set one `bantime.<opt>` option from a wire [`PickleValue`], preserving upstream value types.
+    pub fn set_opt_value(&mut self, opt: &str, value: &PickleValue) -> Result<()> {
+        if opt == "overalljails" {
+            self.overalljails = match value {
+                PickleValue::None => None,
+                PickleValue::Str(s) if s.is_empty() => None,
+                PickleValue::Bool(b) => Some(PickleValue::Bool(*b)),
+                PickleValue::Str(s) => Some(PickleValue::Str(s.clone())),
+                other => Some(PickleValue::Str(other.to_string_lossy())),
+            };
+            return Ok(());
+        }
+        let raw = (value != &PickleValue::None).then(|| value.to_string_lossy());
+        self.set_opt(opt, raw.as_deref())
+    }
+
     /// Set one `bantime.<opt>` option, validating syntax/durations immediately.
     pub fn set_opt(&mut self, opt: &str, value: Option<&str>) -> Result<()> {
         let val = value.map(str::trim).filter(|s| !s.is_empty());
         match opt {
             "increment" => {
-                self.increment = match val {
-                    Some(v) => parse_bool(v)?,
-                    None => false,
-                };
+                self.increment = Some(val.map(parse_bool).transpose()?.unwrap_or(false));
             }
             "overalljails" => {
-                self.overalljails = match val {
-                    Some(v) => parse_bool(v)?,
-                    None => false,
-                };
+                self.overalljails = val.map(|s| PickleValue::Str(s.to_owned()));
             }
             "factor" => {
                 if let Some(v) = val {
@@ -70,10 +67,8 @@ impl BanTimeExtra {
                     if !evaluated.is_finite() {
                         return Err(Error::config(format!("non-finite bantime.factor: {v:?}")));
                     }
-                    self.factor = v.to_owned();
-                } else {
-                    self.factor = "1".to_owned();
                 }
+                self.factor = val.map(str::to_owned);
             }
             "formula" => {
                 if let Some(v) = val {
@@ -87,23 +82,19 @@ impl BanTimeExtra {
                 }
             }
             "multipliers" => {
-                if let Some(v) = val {
-                    let mut mults = Vec::new();
-                    for part in v.split_whitespace() {
-                        let n: f64 = part.parse().map_err(|_| {
-                            Error::config(format!("invalid bantime.multipliers value {part:?}"))
-                        })?;
-                        if !n.is_finite() {
-                            return Err(Error::config(format!(
-                                "non-finite bantime.multipliers value {part:?}"
-                            )));
-                        }
-                        mults.push(n);
-                    }
-                    self.multipliers = mults;
+                self.multipliers = if let Some(v) = val {
+                    let mults: Result<Vec<i64>> = v
+                        .split(' ')
+                        .map(|part| {
+                            part.parse().map_err(|_| {
+                                Error::config(format!("invalid bantime.multipliers value {part:?}"))
+                            })
+                        })
+                        .collect();
+                    Some((v.to_owned(), mults?))
                 } else {
-                    self.multipliers.clear();
-                }
+                    None
+                };
             }
             "maxtime" => {
                 self.maxtime = match val {
@@ -126,35 +117,38 @@ impl BanTimeExtra {
         Ok(())
     }
 
-    /// Retrieve one `bantime.<opt>` option formatted as string if set.
-    pub fn get_opt(&self, opt: &str) -> Option<String> {
+    /// Retrieve a configured option in the same type Fail2Ban reports on the socket.
+    pub fn get_opt(&self, opt: &str) -> Option<PickleValue> {
+        use PickleValue::{Bool, Int, Str};
         match opt {
-            "increment" => Some(self.increment.to_string()),
-            "overalljails" => Some(self.overalljails.to_string()),
-            "factor" => Some(self.factor.clone()),
-            "formula" => self.formula.clone(),
-            "multipliers" => {
-                if self.multipliers.is_empty() {
-                    None
-                } else {
-                    Some(
-                        self.multipliers
-                            .iter()
-                            .map(|m| format_compact_f64(*m))
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    )
-                }
-            }
-            "maxtime" => self.maxtime.map(|v| v.to_string()),
-            "rndtime" => self.rndtime.map(|v| v.to_string()),
+            "increment" => self.increment.map(Bool),
+            "overalljails" => self.overalljails.clone(),
+            "factor" => self.factor.clone().map(Str),
+            "formula" => self.formula.clone().map(Str),
+            "multipliers" => self.multipliers.as_ref().map(|(raw, _)| Str(raw.clone())),
+            "maxtime" => self.maxtime.map(Int),
+            "rndtime" => self.rndtime.map(Int),
             _ => None,
+        }
+    }
+
+    pub fn increment(&self) -> bool {
+        self.increment.unwrap_or(false)
+    }
+
+    pub fn overall_jails(&self) -> bool {
+        match &self.overalljails {
+            None | Some(PickleValue::None) => false,
+            Some(PickleValue::Bool(b)) => *b,
+            Some(PickleValue::Int(n)) => *n != 0,
+            Some(PickleValue::Str(s)) => parse_bool(s).unwrap_or(!s.is_empty()),
+            Some(_) => true,
         }
     }
 
     /// Maximum ban time allowed for this jail (`Jail.getMaxBanTime`).
     pub fn max_ban_time(&self, default_ban_time: i64) -> i64 {
-        if self.increment {
+        if self.increment() {
             self.maxtime.unwrap_or(-1)
         } else {
             default_ban_time
@@ -166,15 +160,16 @@ impl BanTimeExtra {
         if base_ban_time < 0 {
             return base_ban_time;
         }
-        let ban_factor = eval_formula(&self.factor, base_ban_time, ban_count, 1.0).unwrap_or(1.0);
-        let mut val = if !self.multipliers.is_empty() {
+        let factor = self.factor.as_deref().unwrap_or("1");
+        let ban_factor = eval_formula(factor, base_ban_time, ban_count, 1.0).unwrap_or(1.0);
+        let mut val = if let Some((_, multipliers)) = &self.multipliers {
             let mult = usize::try_from(ban_count)
                 .ok()
-                .and_then(|idx| self.multipliers.get(idx))
-                .or_else(|| self.multipliers.last())
+                .and_then(|idx| multipliers.get(idx))
+                .or_else(|| multipliers.last())
                 .copied()
-                .unwrap_or(1.0);
-            (base_ban_time as f64) * ban_factor * mult
+                .unwrap_or(1);
+            (base_ban_time as f64) * ban_factor * (mult as f64)
         } else {
             let formula = self.formula.as_deref().unwrap_or(DEFAULT_FORMULA);
             let evaluated = eval_formula(formula, base_ban_time, ban_count, ban_factor)
@@ -219,14 +214,14 @@ pub fn incr_ban_time(
     base_ban_time: i64,
     ticket: &mut Ticket,
 ) -> i64 {
-    if base_ban_time <= 0 || !extra.increment {
+    if base_ban_time <= 0 || !extra.increment() {
         return base_ban_time;
     }
     let Some(db) = db else {
         return base_ban_time;
     };
     let Ok(Some((ban_count, time_of_ban, _last_ban_time))) =
-        db.get_ban(&ticket.fid, Some(jail), extra.overalljails)
+        db.get_ban(&ticket.fid, Some(jail), extra.overall_jails())
     else {
         return base_ban_time;
     };
@@ -256,7 +251,7 @@ pub fn failure_found_boost(
     ticket: &mut Ticket,
     max_retry: u64,
 ) -> u64 {
-    if !extra.increment {
+    if !extra.increment() {
         return 0;
     }
     let Some(db) = db else {
@@ -299,14 +294,6 @@ pub fn eval_formula(expr: &str, ban_time: i64, ban_count: u64, ban_factor: f64) 
         )));
     }
     Ok(out)
-}
-
-fn format_compact_f64(v: f64) -> String {
-    if v.fract() == 0.0 && v >= (i64::MIN as f64) && v <= (i64::MAX as f64) {
-        format!("{}", v as i64)
-    } else {
-        v.to_string()
-    }
 }
 
 fn random_unit_f64() -> f64 {
@@ -1161,7 +1148,8 @@ fn eval_call(func: &str, args: &[Expr], env: &EvalEnv) -> Result<Val> {
             },
             [x, nd] => {
                 let digits = nd.as_int_exact()?;
-                let digits_i32 = i32::try_from(digits).unwrap_or(if digits < 0 { -308 } else { 308 });
+                let digits_i32 =
+                    i32::try_from(digits).unwrap_or(if digits < 0 { -308 } else { 308 });
                 let scale = 10.0_f64.powi(digits_i32);
                 Ok(Val::Float((x.as_f64() * scale).round_ties_even() / scale))
             }
@@ -1341,8 +1329,8 @@ mod tests {
         let mut extra = BanTimeExtra::new();
         extra.set_opt("increment", Some("true")).unwrap();
         extra.set_opt("maxtime", Some("1d")).unwrap();
-        assert_eq!(extra.get_opt("increment").as_deref(), Some("true"));
-        assert_eq!(extra.get_opt("maxtime").as_deref(), Some("86400"));
+        assert_eq!(extra.get_opt("increment"), Some(PickleValue::Bool(true)));
+        assert_eq!(extra.get_opt("maxtime"), Some(PickleValue::Int(86400)));
 
         let seq: Vec<i64> = (1..=10)
             .map(|c| extra.calc_ban_time(600, c, false))
@@ -1387,8 +1375,8 @@ mod tests {
             .set_opt("multipliers", Some("1 2 4 8 16 32 64 128 256"))
             .unwrap();
         assert_eq!(
-            extra.get_opt("multipliers").as_deref(),
-            Some("1 2 4 8 16 32 64 128 256")
+            extra.get_opt("multipliers"),
+            Some(PickleValue::Str("1 2 4 8 16 32 64 128 256".to_owned()))
         );
 
         let seq: Vec<i64> = (1..=10)
@@ -1459,13 +1447,7 @@ mod tests {
             5.0
         );
         assert_eq!(
-            eval_formula(
-                "min(10, max(2, int(3.9), abs(-4), round(4.5)))",
-                1,
-                0,
-                1.0
-            )
-            .unwrap(),
+            eval_formula("min(10, max(2, int(3.9), abs(-4), round(4.5)))", 1, 0, 1.0).unwrap(),
             4.0
         );
         assert_eq!(
@@ -1542,5 +1524,32 @@ mod tests {
         assert_eq!(new_ban.ban_count, 4);
         assert_eq!(new_ban.ban_time, Some(80));
         assert!(!new_ban.restored);
+
+        // overalljails=false (bool or string) must not pull ban history from other jails.
+        extra
+            .set_opt_value("overalljails", &PickleValue::Bool(false))
+            .unwrap();
+        assert_eq!(
+            extra.get_opt("overalljails"),
+            Some(PickleValue::Bool(false))
+        );
+        let mut other_jail_ban = Ticket::new(TicketId::parse("192.0.2.42"), 2000.0);
+        assert_eq!(
+            incr_ban_time(&extra, Some(&db), "nginx", 10, &mut other_jail_ban),
+            10
+        );
+        extra.set_opt("overalljails", Some("false")).unwrap();
+        assert_eq!(
+            extra.get_opt("overalljails"),
+            Some(PickleValue::Str("false".to_owned()))
+        );
+        assert!(!extra.overall_jails());
+        extra.set_opt("overalljails", Some("true")).unwrap();
+        assert!(extra.overall_jails());
+        let mut cross_jail_ban = Ticket::new(TicketId::parse("192.0.2.42"), 2000.0);
+        assert_eq!(
+            incr_ban_time(&extra, Some(&db), "nginx", 10, &mut cross_jail_ban),
+            80
+        );
     }
 }

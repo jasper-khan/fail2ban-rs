@@ -87,6 +87,23 @@ impl ActionKind {
         }
     }
 
+    pub fn invalidate_ban_epoch(&mut self) {
+        if let Self::Command(a) = self {
+            a.invalidate_ban_epoch();
+        }
+    }
+
+    pub async fn execute_raw_cmd(
+        &self,
+        real_cmd: &str,
+        timeout_override: Option<std::time::Duration>,
+    ) -> Result<bool> {
+        match self {
+            Self::Command(a) => a.execute_raw_cmd(real_cmd, timeout_override).await,
+            Self::Smtp(_) => Err(Error::action("executeCmd is not supported on smtp.py")),
+        }
+    }
+
     pub fn supports_flush(&self) -> bool {
         match self {
             Self::Command(a) => a.supports_flush(),
@@ -234,7 +251,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not supported"));
-        assert!(err.to_string().contains("only built-in smtp.py is supported"));
+        assert!(
+            err.to_string()
+                .contains("only built-in smtp.py is supported")
+        );
 
         let decoy = ActionKind::from_python_spec(
             "sshd",

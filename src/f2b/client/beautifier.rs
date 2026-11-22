@@ -68,8 +68,7 @@ pub fn beautify(cmd: &[String], response: &PickleValue) -> String {
 pub fn beautify_error(_cmd: &[String], err_kind: &str, err_msg: &str) -> String {
     match err_kind {
         "UnknownJailException" => {
-            if err_msg.starts_with("Sorry but the jail '")
-                && err_msg.ends_with("' does not exist")
+            if err_msg.starts_with("Sorry but the jail '") && err_msg.ends_with("' does not exist")
             {
                 err_msg.to_owned()
             } else {
@@ -130,10 +129,12 @@ fn beautify_inner(cmd: &[String], response: &PickleValue, enc_utf: bool) -> Stri
             log_beautifier_fallback(cmd, response);
             py_str(response)
         }),
-        "stats" | "statistics" | "statistic" => format_stats(response, enc_utf).unwrap_or_else(|| {
-            log_beautifier_fallback(cmd, response);
-            py_str(response)
-        }),
+        "stats" | "statistics" | "statistic" => {
+            format_stats(response, enc_utf).unwrap_or_else(|| {
+                log_beautifier_fallback(cmd, response);
+                py_str(response)
+            })
+        }
         _ => beautify_subcommand(cmd, response),
     }
 }
@@ -386,11 +387,7 @@ fn format_status(cmd: &[String], response: &PickleValue) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-fn append_jail_stat(
-    response: &PickleValue,
-    pref: &str,
-    out: &mut Vec<String>,
-) -> Option<()> {
+fn append_jail_stat(response: &PickleValue, pref: &str, out: &mut Vec<String>) -> Option<()> {
     let sections = response.as_list()?;
     for (n, res1) in sections.iter().enumerate() {
         let pair1 = res1.as_list()?;
@@ -414,7 +411,10 @@ fn append_jail_stat(
             }
             let prefix2 = if m + 1 == sub_items.len() { "`-" } else { "|-" };
             let val = format_status_val(&pair2[1]);
-            out.push(format!("{child_pref}{prefix2} {}:\t{val}", py_str(&pair2[0])));
+            out.push(format!(
+                "{child_pref}{prefix2} {}:\t{val}",
+                py_str(&pair2[0])
+            ));
         }
     }
     Some(())
@@ -834,7 +834,10 @@ mod tests {
             beautify(&cmd(&["add"]), &PickleValue::Str("ssh".to_owned())),
             "Added jail ssh"
         );
-        assert_eq!(beautify(&cmd(&["start"]), &PickleValue::None), "Jail started");
+        assert_eq!(
+            beautify(&cmd(&["start"]), &PickleValue::None),
+            "Jail started"
+        );
         assert_eq!(
             beautify(&cmd(&["stop", "ssh"]), &PickleValue::None),
             "Jail stopped"
@@ -1027,7 +1030,10 @@ mod tests {
     fn stats_table_ascii_and_empty() {
         let mut b = Beautifier::with_cmd(cmd(&["stats"]));
         b.set_utf8(false);
-        assert_eq!(b.beautify(&PickleValue::Dict(Vec::new())), "No jails found.");
+        assert_eq!(
+            b.beautify(&PickleValue::Dict(Vec::new())),
+            "No jails found."
+        );
 
         let resp = PickleValue::Dict(vec![
             (
@@ -1087,7 +1093,10 @@ mod tests {
             "[{'sshd': ['192.0.2.1', '2001:db8::1']}, {'nginx': []}]"
         );
         assert_eq!(
-            beautify(&cmd(&["get", "sshd", "banned", "192.0.2.1"]), &PickleValue::Int(1)),
+            beautify(
+                &cmd(&["get", "sshd", "banned", "192.0.2.1"]),
+                &PickleValue::Int(1)
+            ),
             "1"
         );
         assert_eq!(
@@ -1099,7 +1108,10 @@ mod tests {
         );
 
         assert_eq!(
-            beautify(&cmd(&["get", "loglevel"]), &PickleValue::Str("INFO".to_owned())),
+            beautify(
+                &cmd(&["get", "loglevel"]),
+                &PickleValue::Str("INFO".to_owned())
+            ),
             "Current logging level is 'INFO'"
         );
         assert_eq!(
@@ -1114,7 +1126,10 @@ mod tests {
             "Current logging target is:\n`- /var/log/fail2ban.log"
         );
         assert_eq!(
-            beautify(&cmd(&["get", "syslogsocket"]), &PickleValue::Str("auto".to_owned())),
+            beautify(
+                &cmd(&["get", "syslogsocket"]),
+                &PickleValue::Str("auto".to_owned())
+            ),
             "Current syslog socket is:\n`- auto"
         );
         assert_eq!(
@@ -1137,15 +1152,24 @@ mod tests {
             "50"
         );
         assert_eq!(
-            beautify(&cmd(&["get", "sshd", "findtime"]), &PickleValue::Float(600.0)),
+            beautify(
+                &cmd(&["get", "sshd", "findtime"]),
+                &PickleValue::Float(600.0)
+            ),
             "600.0"
         );
         assert_eq!(
-            beautify(&cmd(&["get", "sshd", "ignoreself"]), &PickleValue::Bool(true)),
+            beautify(
+                &cmd(&["get", "sshd", "ignoreself"]),
+                &PickleValue::Bool(true)
+            ),
             "True"
         );
         assert_eq!(
-            beautify(&cmd(&["get", "sshd", "logpath"]), &PickleValue::List(Vec::new())),
+            beautify(
+                &cmd(&["get", "sshd", "logpath"]),
+                &PickleValue::List(Vec::new())
+            ),
             "No file is currently monitored"
         );
         assert_eq!(
@@ -1216,7 +1240,10 @@ mod tests {
         assert_eq!(
             beautify(
                 &cmd(&["get", "sshd", "banip", "--with-time"]),
-                &PickleValue::str_list(["1.2.3.4 \t2026-01-01 00:00:00 + 600 = 2026-01-01 00:10:00", "5.6.7.8 \t..."])
+                &PickleValue::str_list([
+                    "1.2.3.4 \t2026-01-01 00:00:00 + 600 = 2026-01-01 00:10:00",
+                    "5.6.7.8 \t..."
+                ])
             ),
             "1.2.3.4 \t2026-01-01 00:00:00 + 600 = 2026-01-01 00:10:00\n5.6.7.8 \t..."
         );

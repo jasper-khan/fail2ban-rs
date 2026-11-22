@@ -104,11 +104,7 @@ impl fmt::Debug for Fail2BanDb {
 
 impl Fail2BanDb {
     /// Open or create a Fail2Ban v4 SQLite database, returning `Ok(None)` when `path` is `"None"`.
-    pub fn open_optional(
-        path: &str,
-        purge_age: i64,
-        max_matches: usize,
-    ) -> Result<Option<Self>> {
+    pub fn open_optional(path: &str, purge_age: i64, max_matches: usize) -> Result<Option<Self>> {
         if path.trim().eq_ignore_ascii_case("none") {
             return Ok(None);
         }
@@ -209,8 +205,11 @@ impl Fail2BanDb {
     /// Mark a jail disabled (`enabled = 0`), matching upstream `Fail2BanDb.delJail`.
     pub fn del_jail(&self, jail: &str) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute("UPDATE jails SET enabled = 0 WHERE name = ?1", params![jail])
-            .map_err(|e| sql_error("disabling jail", &e))?;
+        conn.execute(
+            "UPDATE jails SET enabled = 0 WHERE name = ?1",
+            params![jail],
+        )
+        .map_err(|e| sql_error("disabling jail", &e))?;
         Ok(())
     }
 
@@ -257,12 +256,7 @@ impl Fail2BanDb {
     ///
     /// Returns `Some(lastfilepos)` if `(jail, path)` exists and `first_line_hash` matches
     /// the stored `firstlinemd5`. Otherwise inserts/updates the row with offset 0 and returns `None`.
-    pub fn add_log(
-        &self,
-        jail: &str,
-        path: &str,
-        first_line_hash: &str,
-    ) -> Result<Option<u64>> {
+    pub fn add_log(&self, jail: &str, path: &str, first_line_hash: &str) -> Result<Option<u64>> {
         let mut conn = self.lock_conn()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -317,6 +311,42 @@ impl Fail2BanDb {
         Ok(())
     }
 
+    /// Read the stored systemd journal timestamp from `logs` (`database.py:getJournalPos`).
+    pub fn get_journal_pos(&self, jail: &str, name: &str) -> Result<Option<f64>> {
+        let conn = self.lock_conn()?;
+        let row: Option<Option<f64>> = conn
+            .query_row(
+                "SELECT lastfilepos FROM logs WHERE jail = ?1 AND path = ?2",
+                params![jail, name],
+                |r| {
+                    let v = match r.get_ref(0)? {
+                        ValueRef::Real(f) => Some(f),
+                        ValueRef::Integer(i) => Some(i as f64),
+                        _ => None,
+                    };
+                    Ok(v)
+                },
+            )
+            .optional()
+            .map_err(|e| sql_error("reading journal position", &e))?;
+        Ok(row.flatten())
+    }
+
+    /// Persist the latest systemd journal timestamp and ISO label in `logs` (`database.py:updateJournal`).
+    pub fn update_journal(&self, jail: &str, name: &str, ts: f64, iso: &str) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sql_error("beginning update_journal transaction", &e))?;
+        tx.execute(ENSURE_JAIL, params![jail])
+            .map_err(|e| sql_error("ensuring jail for journal update", &e))?;
+        tx.execute(UPSERT_LOG, params![jail, name, iso, ts])
+            .map_err(|e| sql_error("updating journal position", &e))?;
+        tx.commit()
+            .map_err(|e| sql_error("committing update_journal", &e))?;
+        Ok(())
+    }
+
     /// Return `(path, firstlinemd5, lastfilepos)` checkpoints recorded for `jail`.
     pub fn get_logs(&self, jail: &str) -> Result<Vec<(String, String, u64)>> {
         let conn = self.lock_conn()?;
@@ -332,8 +362,12 @@ impl Fail2BanDb {
             .query_map(params![jail], |row| {
                 let path: String = row.get(0)?;
                 let hash: String = row.get(1)?;
-                let pos: i64 = row.get(2)?;
-                Ok((path, hash, u64::try_from(pos).unwrap_or(0)))
+                let pos = match row.get_ref(2)? {
+                    ValueRef::Integer(i) => u64::try_from(i).unwrap_or(0),
+                    ValueRef::Real(f) if f >= 0.0 => f as u64,
+                    _ => 0,
+                };
+                Ok((path, hash, pos))
             })
             .map_err(|e| sql_error("querying logs", &e))?;
         let mut out = Vec::new();
@@ -372,22 +406,36 @@ impl Fail2BanDb {
         Ok(())
     }
 
-    /// Remove active ban entry (or all entries for `jail`) from `bips`, keeping `bans` history.
+    /// Remove ban entries (or all entries for `jail`) from both `bips` and `bans`,
+    /// matching upstream `Fail2BanDb.delBan`.
     pub fn del_ban(&self, jail: &str, id: Option<&TicketId>) -> Result<()> {
-        let conn = self.lock_conn()?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sql_error("beginning del_ban transaction", &e))?;
         match id {
             Some(tid) => {
-                conn.execute(
+                let ip = tid.to_string();
+                tx.execute(
                     "DELETE FROM bips WHERE jail = ?1 AND ip = ?2",
-                    params![jail, tid.to_string()],
+                    params![jail, &ip],
                 )
                 .map_err(|e| sql_error("deleting active ban", &e))?;
+                tx.execute(
+                    "DELETE FROM bans WHERE jail = ?1 AND ip = ?2",
+                    params![jail, &ip],
+                )
+                .map_err(|e| sql_error("deleting ban history", &e))?;
             }
             None => {
-                conn.execute("DELETE FROM bips WHERE jail = ?1", params![jail])
+                tx.execute("DELETE FROM bips WHERE jail = ?1", params![jail])
                     .map_err(|e| sql_error("deleting all active bans for jail", &e))?;
+                tx.execute("DELETE FROM bans WHERE jail = ?1", params![jail])
+                    .map_err(|e| sql_error("deleting all ban history for jail", &e))?;
             }
         }
+        tx.commit()
+            .map_err(|e| sql_error("committing del_ban", &e))?;
         Ok(())
     }
 
@@ -536,11 +584,7 @@ impl Fail2BanDb {
 
     /// Aggregate total historical failure count and recent matched lines from `bans`
     /// for `<ipfailures>`, `<ipmatches>`, `<ipjailfailures>`, and `<ipjailmatches>`.
-    pub fn get_bans_merged(
-        &self,
-        id: &TicketId,
-        jail: Option<&str>,
-    ) -> Result<(u64, Vec<String>)> {
+    pub fn get_bans_merged(&self, id: &TicketId, jail: Option<&str>) -> Result<(u64, Vec<String>)> {
         let ip = id.to_string();
         let conn = self.lock_conn()?;
         let mut stmt = conn
@@ -608,8 +652,7 @@ impl Fail2BanDb {
             [],
         )
         .map_err(|e| sql_error("cleaning disabled jails", &e))?;
-        tx.commit()
-            .map_err(|e| sql_error("committing purge", &e))?;
+        tx.commit().map_err(|e| sql_error("committing purge", &e))?;
         Ok(del_bans + del_bips)
     }
 
@@ -687,7 +730,9 @@ fn upgrade_legacy_schema_to_v4(conn: &Connection, db_path: &str) -> Result<()> {
         return Ok(());
     }
     let version: Option<i64> = conn
-        .query_row("SELECT version FROM fail2banDb LIMIT 1", [], |row| row.get(0))
+        .query_row("SELECT version FROM fail2banDb LIMIT 1", [], |row| {
+            row.get(0)
+        })
         .optional()
         .map_err(|e| sql_error("reading fail2banDb version", &e))?;
     let Some(version) = version else {
@@ -865,7 +910,10 @@ mod tests {
         db.add_jail("sshd").unwrap();
         assert_eq!(db.get_jail_names(Some(true)).unwrap(), vec!["sshd"]);
 
-        assert_eq!(db.add_log("sshd", "/var/log/auth.log", "hash1").unwrap(), None);
+        assert_eq!(
+            db.add_log("sshd", "/var/log/auth.log", "hash1").unwrap(),
+            None
+        );
         db.update_log("sshd", "/var/log/auth.log", "hash1", 1024)
             .unwrap();
         assert_eq!(
@@ -873,7 +921,10 @@ mod tests {
             Some(1024)
         );
         // Hash mismatch indicates rotation: resets offset and returns None.
-        assert_eq!(db.add_log("sshd", "/var/log/auth.log", "hash2").unwrap(), None);
+        assert_eq!(
+            db.add_log("sshd", "/var/log/auth.log", "hash2").unwrap(),
+            None
+        );
         assert_eq!(
             db.get_logs("sshd").unwrap(),
             vec![("/var/log/auth.log".to_owned(), "hash2".to_owned(), 0)]
@@ -913,8 +964,14 @@ mod tests {
         t3.matches = vec!["m4".into()];
         db.add_ban("nginx", &t3, 600).unwrap();
 
-        assert_eq!(db.get_ban(&ip, Some("sshd"), false).unwrap(), Some((2, 2000, 1200)));
-        assert_eq!(db.get_ban(&ip, Some("nginx"), false).unwrap(), Some((1, 2500, 900)));
+        assert_eq!(
+            db.get_ban(&ip, Some("sshd"), false).unwrap(),
+            Some((2, 2000, 1200))
+        );
+        assert_eq!(
+            db.get_ban(&ip, Some("nginx"), false).unwrap(),
+            Some((1, 2500, 900))
+        );
         assert_eq!(db.get_ban(&ip, None, true).unwrap(), Some((3, 2500, 2100)));
 
         let (all_failures, all_matches) = db.get_bans_merged(&ip, None).unwrap();
@@ -930,10 +987,11 @@ mod tests {
         assert_eq!(all_failures_10, 12);
         assert_eq!(all_matches_10, vec!["m1", "m2", "m3", "m4"]);
 
-        // del_ban removes from bips while preserving bans history.
+        // del_ban removes from both bips and bans for the target jail while preserving other jails.
         db.del_ban("sshd", Some(&ip)).unwrap();
         assert_eq!(db.get_ban(&ip, Some("sshd"), false).unwrap(), None);
-        assert_eq!(db.get_bans_merged(&ip, Some("sshd")).unwrap().0, 7);
+        assert_eq!(db.get_bans_merged(&ip, Some("sshd")).unwrap().0, 0);
+        assert_eq!(db.get_bans_merged(&ip, Some("nginx")).unwrap().0, 5);
     }
 
     #[test]
@@ -1012,7 +1070,8 @@ mod tests {
         let unrelated = dir.path().join("unrelated.sqlite3");
         {
             let conn = Connection::open(&unrelated).unwrap();
-            conn.execute_batch("CREATE TABLE notes(body TEXT);").unwrap();
+            conn.execute_batch("CREATE TABLE notes(body TEXT);")
+                .unwrap();
         }
         assert!(Fail2BanDb::open(unrelated.to_str().unwrap(), 86_400, 10).is_err());
 
@@ -1065,6 +1124,30 @@ mod tests {
         assert_eq!(
             db3.get_ban(&id("192.0.2.55"), Some("sshd"), false).unwrap(),
             Some((3, 1_700_000_000, 900))
+        );
+
+        // 4. systemd-journal position persistence matches Fail2BanDb.getJournalPos/updateJournal.
+        assert_eq!(
+            db3.get_journal_pos("sshd", "systemd-journal").unwrap(),
+            None
+        );
+        db3.update_journal(
+            "sshd",
+            "systemd-journal",
+            1_715_675_415.5,
+            "2024-05-14T08:30:15.500000+00:00 ",
+        )
+        .unwrap();
+        let jpos = db3
+            .get_journal_pos("sshd", "systemd-journal")
+            .unwrap()
+            .unwrap();
+        assert!((jpos - 1_715_675_415.5).abs() < 1e-6);
+        assert!(
+            db3.get_logs("sshd")
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p == "systemd-journal")
         );
     }
 }

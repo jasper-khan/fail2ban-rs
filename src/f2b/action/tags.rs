@@ -61,8 +61,8 @@ pub fn expand(
                 "recursive CommandAction property {key:?}"
             )));
         }
-        let expanded =
-            result.map_err(|err| Error::config(format!("CommandAction property {key:?}: {err}")))?;
+        let expanded = result
+            .map_err(|err| Error::config(format!("CommandAction property {key:?}: {err}")))?;
         resolved.insert(key.clone(), expanded);
     }
 
@@ -90,7 +90,9 @@ fn static_value<'a>(
 ) -> Option<&'a String> {
     let conditional = match family {
         Family::Common => None,
-        Family::Ipv4 | Family::Ipv6 => properties.get(&format!("{name}?family={}", family.as_str())),
+        Family::Ipv4 | Family::Ipv6 => {
+            properties.get(&format!("{name}?family={}", family.as_str()))
+        }
     };
     conditional.or_else(|| properties.get(name))
 }
@@ -114,8 +116,8 @@ pub fn escape_tag(value: &str) -> String {
         match ch {
             '\n' => out.push_str(r"\n"),
             '\r' => out.push_str(r"\r"),
-            '\\' | '#' | '&' | ';' | '`' | '|' | '*' | '?' | '~' | '<' | '>' | '^' | '('
-            | ')' | '[' | ']' | '{' | '}' | '$' | '\'' | '"' => {
+            '\\' | '#' | '&' | ';' | '`' | '|' | '*' | '?' | '~' | '<' | '>' | '^' | '(' | ')'
+            | '[' | ']' | '{' | '}' | '$' | '\'' | '"' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -141,12 +143,8 @@ fn query_short_hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is a valid mutable byte array of length `buf.len()`, and
     // `gethostname` writes at most `buf.len()` bytes.
-    let rc = unsafe {
-        nix::libc::gethostname(
-            buf.as_mut_ptr().cast::<nix::libc::c_char>(),
-            buf.len(),
-        )
-    };
+    let rc =
+        unsafe { nix::libc::gethostname(buf.as_mut_ptr().cast::<nix::libc::c_char>(), buf.len()) };
     if rc == 0 {
         let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         let name = String::from_utf8_lossy(&buf[..len]).trim().to_owned();
@@ -177,9 +175,7 @@ fn query_fqdn(short: &str) -> String {
     let mut res: *mut nix::libc::addrinfo = std::ptr::null_mut();
     // SAFETY: `c_name` is a valid NUL-terminated C string, `hints` is initialized,
     // and `res` receives an allocated linked list freed below via `freeaddrinfo`.
-    let rc = unsafe {
-        nix::libc::getaddrinfo(c_name.as_ptr(), std::ptr::null(), &hints, &mut res)
-    };
+    let rc = unsafe { nix::libc::getaddrinfo(c_name.as_ptr(), std::ptr::null(), &hints, &mut res) };
     if rc == 0 && !res.is_null() {
         let pref = format!("{short}.");
         let mut first: Option<String> = None;
@@ -298,7 +294,9 @@ pub fn replace_dynamic_tags(
                 let Some(open) = tag_start.take() else {
                     continue;
                 };
-                let Some(name) = template.get(open + 1..index).filter(|part| !part.is_empty())
+                let Some(name) = template
+                    .get(open + 1..index)
+                    .filter(|part| !part.is_empty())
                 else {
                     continue;
                 };
@@ -398,7 +396,9 @@ fn resolve_dynamic_tag(
         "br" => Some("\n".to_owned()),
         "sp" => Some(" ".to_owned()),
         _ => {
-            let suffix = name.strip_prefix("F-").filter(|part| is_capture_name(part))?;
+            let suffix = name
+                .strip_prefix("F-")
+                .filter(|part| is_capture_name(part))?;
             Some(lookup_capture_escaped(&ctx.ticket.data, suffix))
         }
     }
@@ -522,7 +522,9 @@ mod tests {
         ];
         ticket.data.insert("user".to_owned(), "root;rm".to_owned());
         ticket.data.insert("fport".to_owned(), "22".to_owned());
-        ticket.data.insert("CUSTOM_KEY".to_owned(), "a&b".to_owned());
+        ticket
+            .data
+            .insert("CUSTOM_KEY".to_owned(), "a&b".to_owned());
         ticket.restored = true;
         ticket.ban_count = 3;
 

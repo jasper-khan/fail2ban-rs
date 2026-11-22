@@ -1,7 +1,7 @@
 //! Fail2Ban 1.1.1 `MyTime` duration & timestamp helpers (`str2seconds`, `seconds2str`, `time2str`).
 
-use chrono::{Local, TimeZone};
 use crate::error::{Error, Result};
+use chrono::{Local, TimeZone};
 
 const YEAR_SECONDS: f64 = ((365 * 3 + 366) as f64) * 86400.0 / 4.0; // 31_557_600.0
 const MONTH_SECONDS: f64 = YEAR_SECONDS / 12.0; // 2_629_800.0
@@ -131,9 +131,7 @@ pub fn parse_bool(raw: &str) -> Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "yes" | "true" | "on" => Ok(true),
         "0" | "no" | "false" | "off" => Ok(false),
-        _ => Err(Error::config(format!(
-            "Unable to convert {raw:?} to bool"
-        ))),
+        _ => Err(Error::config(format!("Unable to convert {raw:?} to bool"))),
     }
 }
 
@@ -337,7 +335,10 @@ mod tests {
         assert_eq!(seconds2str(86400.0 * 368.0), "1y 3d");
         assert_eq!(seconds2str(86400.0 * 365.4), "1y");
         assert_eq!(seconds2str(86400.0 * 365.5), "1y 1d");
-        assert_eq!(seconds2str(86400.0 * 2.0 + 3600.0 * 7.0 + 60.0 * 15.0), "2d 7h 15m");
+        assert_eq!(
+            seconds2str(86400.0 * 2.0 + 3600.0 * 7.0 + 60.0 * 15.0),
+            "2d 7h 15m"
+        );
         assert_eq!(seconds2str(86400.0 * 2.0 + 3599.0), "2d 1h");
         assert_eq!(seconds2str(3600.0 - 5.0), "1h");
         assert_eq!(seconds2str(3600.0 - 10.0), "59m 50s");

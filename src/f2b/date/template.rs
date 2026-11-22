@@ -34,7 +34,7 @@ enum TemplateKind {
 }
 
 /// Compiled Fail2Ban date matching template and usage counters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DateTemplate {
     /// Human-readable template name (matching Fail2Ban `DateTemplate.name`).
     pub name: String,
@@ -90,9 +90,7 @@ impl DateTemplate {
     fn new_epoch(orig_pattern: &str, line_begin: bool, long_frm: bool) -> Result<Self> {
         let num_re = if long_frm { LONG_EPOCH_RE } else { EPOCH_RE };
         let rx = if line_begin {
-            format!(
-                r"(?:^({num_re})|(?<=^\[)({num_re})(?=\]))(?=\b|\W|$)"
-            )
+            format!(r"(?:^({num_re})|(?<=^\[)({num_re})(?=\]))(?=\b|\W|$)")
         } else {
             format!(
                 r"(?:^({num_re})|(?<=^\[)({num_re})(?=\])|(?<=\baudit\()({num_re})(?=:\d+\)))(?=\b|\W|$)"
@@ -104,7 +102,12 @@ impl DateTemplate {
         } else {
             FLAG_WORD_END
         };
-        let name = if long_frm { "LEPOCH" } else { "EPOCH" }.to_owned();
+        let base = if long_frm { "LongEpoch" } else { "Epoch" };
+        let name = if line_begin {
+            format!("{{^LN-BEG}}{base}")
+        } else {
+            base.to_owned()
+        };
         Ok(Self {
             name,
             pattern: Some(orig_pattern.to_owned()),
@@ -131,8 +134,14 @@ impl DateTemplate {
             )
         };
         let compiled = CompiledRegex::compile(&rx, false)?;
+        let name = if line_begin {
+            "{^LN-BEG}TAI64N"
+        } else {
+            "TAI64N"
+        }
+        .to_owned();
         Ok(Self {
-            name: "TAI64N".to_owned(),
+            name,
             pattern: Some(orig_pattern.to_owned()),
             regex: rx,
             compiled: Some(compiled),
@@ -204,8 +213,14 @@ impl DateTemplate {
             None => TemplateKind::Pattern,
         };
 
+        let name = if line_beg_tag {
+            format!("{{^LN-BEG}}{human_name}")
+        } else {
+            human_name
+        };
+
         Ok(Self {
-            name: human_name,
+            name,
             pattern: Some(orig_pattern.to_owned()),
             regex: expanded,
             compiled: Some(compiled),
@@ -251,9 +266,9 @@ impl DateTemplate {
                 // Epoch templates may have alternative capture groups 1..3 (or group 1 in custom patterns).
                 first_present_group_span(&m).unwrap_or_else(|| (m.start(), m.end()))
             }
-            TemplateKind::Pattern | TemplateKind::Tai64n => m
-                .group_span(1)
-                .unwrap_or_else(|| (m.start(), m.end())),
+            TemplateKind::Pattern | TemplateKind::Tai64n => {
+                m.group_span(1).unwrap_or_else(|| (m.start(), m.end()))
+            }
             TemplateKind::NoneSentinel => return None,
         };
         let groups = m.named_groups(re.capture_names());
@@ -261,10 +276,7 @@ impl DateTemplate {
     }
 
     /// Search the full `line` and return `(span_start, span_end, named_groups)`.
-    pub fn match_date(
-        &self,
-        line: &str,
-    ) -> Option<(usize, usize, BTreeMap<String, String>)> {
+    pub fn match_date(&self, line: &str) -> Option<(usize, usize, BTreeMap<String, String>)> {
         self.match_date_range(line, 0, line.len())
     }
 
@@ -308,7 +320,12 @@ pub fn unbound_pattern(pattern: &str) -> String {
     if let Some(rest) = s.strip_prefix("{^LN-BEG}") {
         s = rest.to_owned();
     }
-    for prefix in [r"^(?:\W{0,2})?", r"(?:\^|\b|\W)", r"(?:^|\b|\W)", r"(^|\b|\W)"] {
+    for prefix in [
+        r"^(?:\W{0,2})?",
+        r"(?:\^|\b|\W)",
+        r"(?:^|\b|\W)",
+        r"(^|\b|\W)",
+    ] {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest.to_owned();
             break;
@@ -437,7 +454,11 @@ fn strip_double_star_bounds(pattern: &str) -> String {
     if let Some(m) = re_del_wrd_bounds().search(&s)
         && m.start() == 0
     {
-        s = format!("{}{}", m.group_str(0).unwrap_or("").replace("**", ""), &s[m.end()..]);
+        s = format!(
+            "{}{}",
+            m.group_str(0).unwrap_or("").replace("**", ""),
+            &s[m.end()..]
+        );
     }
     if let Some(rest) = s.strip_suffix("**")
         && !rest.ends_with('\\')
@@ -553,16 +574,12 @@ fn starts_with_icase_flag(pattern: &str) -> bool {
 
 fn re_no_wrd_bound_beg() -> &'static CompiledRegex {
     static RE: OnceLock<CompiledRegex> = OnceLock::new();
-    RE.get_or_init(|| {
-        compile_static_rx(r"^\(*(?:\(\?\w+\))?(?:\^|\(*\*\*|\((?:\?:)?\^)")
-    })
+    RE.get_or_init(|| compile_static_rx(r"^\(*(?:\(\?\w+\))?(?:\^|\(*\*\*|\((?:\?:)?\^)"))
 }
 
 fn re_no_wrd_bound_end() -> &'static CompiledRegex {
     static RE: OnceLock<CompiledRegex> = OnceLock::new();
-    RE.get_or_init(|| {
-        compile_static_rx(r"(?<!\\)(?:\$\)?|\\b|\\s|\*\*\)*)$")
-    })
+    RE.get_or_init(|| compile_static_rx(r"(?<!\\)(?:\$\)?|\\b|\\s|\*\*\)*)$"))
 }
 
 fn re_del_wrd_bounds() -> &'static CompiledRegex {
@@ -572,9 +589,7 @@ fn re_del_wrd_bounds() -> &'static CompiledRegex {
 
 fn re_line_bound_beg() -> &'static CompiledRegex {
     static RE: OnceLock<CompiledRegex> = OnceLock::new();
-    RE.get_or_init(|| {
-        compile_static_rx(r"^(?:\(\?\w+\))?(?:\^|\((?:\?:)?\^(?!\|))")
-    })
+    RE.get_or_init(|| compile_static_rx(r"^(?:\(\?\w+\))?(?:\^|\((?:\?:)?\^(?!\|))"))
 }
 
 fn re_line_bound_end() -> &'static CompiledRegex {
@@ -589,9 +604,11 @@ fn re_alpha_pattern() -> &'static CompiledRegex {
 
 fn compile_static_rx(pattern: &str) -> CompiledRegex {
     // Hardcoded compile-time validated helper regexes.
-    CompiledRegex::compile(pattern, false).unwrap_or_else(|_| match CompiledRegex::compile("$^", false) {
-        Ok(fallback) => fallback,
-        Err(_) => unreachable!(),
+    CompiledRegex::compile(pattern, false).unwrap_or_else(|_| {
+        match CompiledRegex::compile("$^", false) {
+            Ok(fallback) => fallback,
+            Err(_) => unreachable!(),
+        }
     })
 }
 
@@ -631,7 +648,10 @@ mod tests {
     fn epoch_and_lepoch_and_audit() {
         let t_epoch = DateTemplate::from_pattern("EPOCH").unwrap();
         let audit = "type=AVC msg=audit(1700000000.123:456): avc: denied";
-        let (ts, s, e) = t_epoch.get_date(audit, None, 0, audit.len()).unwrap().unwrap();
+        let (ts, s, e) = t_epoch
+            .get_date(audit, None, 0, audit.len())
+            .unwrap()
+            .unwrap();
         assert_eq!(&audit[s..e], "1700000000.123");
         assert!((ts - 1_700_000_000.123).abs() < 1e-6);
 
@@ -645,7 +665,12 @@ mod tests {
 
         // Must not match plain numeric word in middle of line.
         let noise = "port 1700000000 failed";
-        assert!(t_epoch.get_date(noise, None, 0, noise.len()).unwrap().is_none());
+        assert!(
+            t_epoch
+                .get_date(noise, None, 0, noise.len())
+                .unwrap()
+                .is_none()
+        );
 
         let t_lepoch = DateTemplate::from_pattern("^LEPOCH").unwrap();
         let ms = "1700000000456 event";

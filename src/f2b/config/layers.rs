@@ -309,4 +309,3 @@ fn conditional_section(name: String, mut options: Options) -> (String, Options) 
     }
     (name, options)
 }
-

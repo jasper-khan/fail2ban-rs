@@ -113,14 +113,19 @@ impl FilterSystemd {
                             }
                             match serde_json::from_str::<serde_json::Value>(trimmed) {
                                 Ok(val) => {
-                                    if let Some((formatted, preset_date)) = format_journal_entry(&val, self.encoding)
-                                        && tx.send(LogEvent::Line {
+                                    if let Some((formatted, preset_date)) = format_journal_entry(&val, self.encoding) {
+                                        if let (Some(min_ts), Some(ts)) = (self.since_epoch, preset_date)
+                                            && ts < min_ts
+                                        {
+                                            continue;
+                                        }
+                                        if tx.send(LogEvent::Line {
                                             line: formatted,
                                             preset_date,
                                             log_path: None,
-                                        }).await.is_err()
-                                    {
-                                        break;
+                                        }).await.is_err() {
+                                            break;
+                                        }
                                     }
                                 }
                                 Err(err) => {
@@ -171,22 +176,33 @@ pub fn build_journalctl_args(
         args.push("--lines=all".to_owned());
     }
 
-    if let Some(ref path) = cfg.path {
-        let is_file =
-            path.is_file() || path.extension().is_some_and(|ext| ext == "journal");
-        if is_file {
-            args.push(format!("--file={}", path.display()));
-        } else {
-            args.push(format!("--directory={}", path.display()));
+    if !cfg.files.is_empty() {
+        for file in &cfg.files {
+            args.push(format!("--file={}", file.display()));
         }
-    }
+    } else {
+        if let Some(ref ns) = cfg.namespace
+            && !ns.is_empty()
+        {
+            args.push(format!("--namespace={ns}"));
+        }
 
-    if let Some(flags) = cfg.flags {
-        if (flags & SD_JOURNAL_SYSTEM) != 0 {
-            args.push("--system".to_owned());
+        if let Some(ref path) = cfg.path {
+            let is_file = path.is_file() || path.extension().is_some_and(|ext| ext == "journal");
+            if is_file {
+                args.push(format!("--file={}", path.display()));
+            } else {
+                args.push(format!("--directory={}", path.display()));
+            }
         }
-        if (flags & SD_JOURNAL_CURRENT_USER) != 0 {
-            args.push("--user".to_owned());
+
+        if let Some(flags) = cfg.flags {
+            if (flags & SD_JOURNAL_SYSTEM) != 0 {
+                args.push("--system".to_owned());
+            }
+            if (flags & SD_JOURNAL_CURRENT_USER) != 0 {
+                args.push("--user".to_owned());
+            }
         }
     }
 
@@ -272,9 +288,15 @@ pub fn format_journal_entry(
 }
 
 fn format_journal_since(ts: f64) -> String {
-    let secs = ts.floor() as i64;
-    if let Some(dt) = DateTime::<Utc>::from_timestamp(secs, 0) {
-        dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+    let total_us = (ts * 1_000_000.0).round() as i64;
+    let secs = total_us.div_euclid(1_000_000);
+    let micros = total_us.rem_euclid(1_000_000) as u32;
+    if let Some(dt) = DateTime::<Utc>::from_timestamp(secs, micros * 1000) {
+        if micros == 0 {
+            dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+        } else {
+            format!("{} UTC", dt.format("%Y-%m-%d %H:%M:%S.%6f"))
+        }
     } else {
         format!("@{secs}")
     }
@@ -356,6 +378,8 @@ mod tests {
             ],
             flags: Some(SD_JOURNAL_SYSTEM),
             path: Some(PathBuf::from("/var/log/journal")),
+            files: Vec::new(),
+            namespace: None,
         };
 
         let tail_args = build_journalctl_args(&cfg, None, true);
@@ -379,15 +403,37 @@ mod tests {
         assert!(since_args.contains(&"--since=2024-05-14 08:30:15 UTC".to_owned()));
         assert!(!since_args.contains(&"--lines=0".to_owned()));
 
+        let subsec_args = build_journalctl_args(&cfg, Some(1_715_675_415.25), true);
+        assert!(subsec_args.contains(&"--since=2024-05-14 08:30:15.250000 UTC".to_owned()));
+
         let file_cfg = JournalConfig {
             matches: vec![],
             flags: Some(SD_JOURNAL_CURRENT_USER),
             path: Some(PathBuf::from("/tmp/system.journal")),
+            files: Vec::new(),
+            namespace: Some("myns".to_owned()),
         };
         let file_args = build_journalctl_args(&file_cfg, None, false);
         assert!(file_args.contains(&"--lines=all".to_owned()));
+        assert!(file_args.contains(&"--namespace=myns".to_owned()));
         assert!(file_args.contains(&"--file=/tmp/system.journal".to_owned()));
         assert!(file_args.contains(&"--user".to_owned()));
+
+        let multi_files_cfg = JournalConfig {
+            matches: vec![],
+            flags: Some(SD_JOURNAL_SYSTEM),
+            path: Some(PathBuf::from("/var/log/journal")),
+            files: vec![
+                PathBuf::from("/tmp/a.journal"),
+                PathBuf::from("/tmp/b.journal"),
+            ],
+            namespace: None,
+        };
+        let multi_args = build_journalctl_args(&multi_files_cfg, None, false);
+        assert!(multi_args.contains(&"--file=/tmp/a.journal".to_owned()));
+        assert!(multi_args.contains(&"--file=/tmp/b.journal".to_owned()));
+        assert!(!multi_args.contains(&"--system".to_owned()));
+        assert!(!multi_args.contains(&"--directory=/var/log/journal".to_owned()));
     }
 
     #[test]

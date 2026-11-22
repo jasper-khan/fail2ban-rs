@@ -25,14 +25,30 @@ pub enum Error {
     #[error("{0}")]
     Protocol(String),
 
-    #[error("{0}")]
+    #[error("Sorry but the jail '{0}' does not exist")]
     UnknownJail(String),
 
-    #[error("{0}")]
+    #[error("The jail '{0}' already exists")]
     DuplicateJail(String),
 
     #[error("{0}")]
     InvalidCommand(String),
+
+    #[error("{0}")]
+    Value(String),
+
+    #[error("{0}")]
+    Key(String),
+
+    #[error("{0}")]
+    Type(String),
+
+    #[error("{path}: {source}")]
+    LogPath {
+        path: std::path::PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
     #[error("{context}: {source}")]
     Io {
@@ -68,11 +84,11 @@ impl Error {
     }
 
     pub fn unknown_jail(name: &str) -> Self {
-        Self::UnknownJail(format!("Sorry but the jail '{name}' does not exist"))
+        Self::UnknownJail(name.to_owned())
     }
 
     pub fn duplicate_jail(name: &str) -> Self {
-        Self::DuplicateJail(format!("The jail '{name}' already exists"))
+        Self::DuplicateJail(name.to_owned())
     }
 
     pub fn invalid_command(msg: impl Into<String>) -> Self {

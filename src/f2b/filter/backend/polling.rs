@@ -206,6 +206,7 @@ mod tests {
             tail: false,
             resume_fingerprint: None,
             resume_offset: 0,
+            auto_seek: None,
         };
         let mut poller = FilterPoll::new(vec![cfg], LogEncoding::Utf8);
 
@@ -250,6 +251,7 @@ mod tests {
                 tail: true,
                 resume_fingerprint: Some(saved_fp),
                 resume_offset: 19,
+                auto_seek: None,
             }],
             LogEncoding::Utf8,
         );
@@ -262,13 +264,21 @@ mod tests {
         // Truncate in-place.
         fs::write(&path, b"trunc1\n").unwrap();
         let ev_tr = poller.poll_once();
-        assert!(ev_tr.iter().any(|e| matches!(e, LogEvent::Line { line, .. } if line == "trunc1")));
+        assert!(
+            ev_tr
+                .iter()
+                .any(|e| matches!(e, LogEvent::Line { line, .. } if line == "trunc1"))
+        );
 
         // Atomic rotate: move old -> create new.
         fs::rename(&path, &old).unwrap();
         fs::write(&path, b"rotated1\n").unwrap();
         let ev_rot = poller.poll_once();
-        assert!(ev_rot.iter().any(|e| matches!(e, LogEvent::Line { line, .. } if line == "rotated1")));
+        assert!(
+            ev_rot
+                .iter()
+                .any(|e| matches!(e, LogEvent::Line { line, .. } if line == "rotated1"))
+        );
 
         // Remove path and verify eviction after REMOVE_AFTER checks.
         fs::remove_file(&path).unwrap();
@@ -293,12 +303,14 @@ mod tests {
                     tail: true,
                     resume_fingerprint: None,
                     resume_offset: 0,
+                    auto_seek: None,
                 },
                 FileLogConfig {
                     path: missing.clone(),
                     tail: true,
                     resume_fingerprint: None,
                     resume_offset: 0,
+                    auto_seek: None,
                 },
             ],
             LogEncoding::Utf8,

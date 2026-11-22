@@ -123,9 +123,7 @@ impl FileIdentityState {
         }
 
         self.read_cycles += 1;
-        if (self.fingerprint.is_empty() && cur_size > 0)
-            || self.read_cycles >= HASH_INTERVAL
-        {
+        if (self.fingerprint.is_empty() && cur_size > 0) || self.read_cycles >= HASH_INTERVAL {
             self.read_cycles = 0;
             let saved_pos = self.pos;
             let cur_fp = file_first_line_sha1(file, cur_size)?;
@@ -207,12 +205,7 @@ pub fn sha1_hex(data: &[u8]) -> String {
     for chunk in padded.chunks_exact(64) {
         let mut w = [0u32; 80];
         for (i, word_bytes) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([
-                word_bytes[0],
-                word_bytes[1],
-                word_bytes[2],
-                word_bytes[3],
-            ]);
+            w[i] = u32::from_be_bytes([word_bytes[0], word_bytes[1], word_bytes[2], word_bytes[3]]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -310,9 +303,13 @@ mod tests {
         assert_eq!(resumed.pos, 6);
 
         // Resume with mismatched fingerprint resets to 0 (rotated while offline).
-        let (offline_rot, _) =
-            FileIdentityState::open(&path, true, Some("0000000000000000000000000000000000000000"), 6)
-                .unwrap();
+        let (offline_rot, _) = FileIdentityState::open(
+            &path,
+            true,
+            Some("0000000000000000000000000000000000000000"),
+            6,
+        )
+        .unwrap();
         assert_eq!(offline_rot.pos, 0);
 
         // Tail mode without checkpoint jumps to end.

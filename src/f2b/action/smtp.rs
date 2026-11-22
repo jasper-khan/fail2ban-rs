@@ -127,9 +127,7 @@ impl SmtpAction {
             "matches" => self.set_matches(non_empty(value).as_deref())?,
             "norestored" => self.norestored = parse_bool(value)?,
             _ => {
-                return Err(Error::action(format!(
-                    "unknown smtp.py property {key:?}"
-                )));
+                return Err(Error::action(format!("unknown smtp.py property {key:?}")));
             }
         }
         Ok(())
@@ -167,14 +165,15 @@ impl SmtpAction {
 
     pub fn property_names(&self) -> Vec<String> {
         [
-            "dest",
+            "fromaddr",
+            "fromname",
             "host",
             "matches",
+            "message_values",
             "norestored",
             "password",
-            "sender",
-            "sendername",
             "ssl",
+            "toaddr",
             "user",
         ]
         .into_iter()
@@ -355,11 +354,24 @@ impl SmtpAction {
             self.user.as_deref().filter(|s| !s.is_empty()),
             self.password.as_deref().filter(|s| !s.is_empty()),
         ) {
-            smtp_auth(&mut reader, &mut writer, user, pass, &ehlo_text, self.timeout).await?;
+            smtp_auth(
+                &mut reader,
+                &mut writer,
+                user,
+                pass,
+                &ehlo_text,
+                self.timeout,
+            )
+            .await?;
         }
 
         // MAIL FROM
-        send_line(&mut writer, &format!("MAIL FROM:<{from_addr}>"), self.timeout).await?;
+        send_line(
+            &mut writer,
+            &format!("MAIL FROM:<{from_addr}>"),
+            self.timeout,
+        )
+        .await?;
         expect_code(&mut reader, &[250], "MAIL FROM", self.timeout).await?;
 
         // RCPT TO for every recipient
@@ -399,13 +411,8 @@ impl SmtpAction {
         send_line(&mut writer, "DATA", self.timeout).await?;
         expect_code(&mut reader, &[354], "DATA", self.timeout).await?;
 
-        let message_bytes = build_rfc2822_message(
-            subject,
-            &self.sendername,
-            &from_addr,
-            &self.dest,
-            body,
-        );
+        let message_bytes =
+            build_rfc2822_message(subject, &self.sendername, &from_addr, &self.dest, body);
         tokio::time::timeout(self.timeout, writer.write_all(&message_bytes))
             .await
             .map_err(|_| Error::action("timed out writing SMTP DATA body"))?
@@ -573,7 +580,9 @@ async fn read_smtp_reply<R: tokio::io::AsyncRead + Unpin>(
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.len() < 3 {
-            return Err(Error::action(format!("malformed SMTP reply line: {trimmed:?}")));
+            return Err(Error::action(format!(
+                "malformed SMTP reply line: {trimmed:?}"
+            )));
         }
         let code: u16 = trimmed[..3]
             .parse()
@@ -679,7 +688,9 @@ fn parse_host_port(raw: &str) -> Result<(String, u16)> {
         if let Some(host) = rest.strip_suffix(']') {
             return Ok((host.to_owned(), 25));
         }
-        return Err(Error::action(format!("invalid bracketed SMTP host {raw:?}")));
+        return Err(Error::action(format!(
+            "invalid bracketed SMTP host {raw:?}"
+        )));
     }
     if let Some((host, port_part)) = s.rsplit_once(':')
         && !host.contains(':')
@@ -703,7 +714,9 @@ fn parse_recipients(dest: &str) -> Result<Vec<String>> {
         .map(str::to_owned)
         .collect();
     if rcpts.is_empty() {
-        return Err(Error::action("smtp dest must contain at least one recipient"));
+        return Err(Error::action(
+            "smtp dest must contain at least one recipient",
+        ));
     }
     Ok(rcpts)
 }
@@ -757,8 +770,7 @@ fn json_as_bool(key: &str, v: &serde_json::Value) -> Result<bool> {
 
 /// Pure-Rust RFC 4648 Base64 encoder (used for SMTP `AUTH PLAIN` / `AUTH LOGIN`).
 pub fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     if input.is_empty() {
         return String::new();
     }
@@ -852,12 +864,9 @@ mod tests {
 
     #[tokio::test]
     async fn ssl_true_returns_clear_error() {
-        let mut act = SmtpAction::from_json(
-            "sshd".to_owned(),
-            "smtp".to_owned(),
-            r#"{"ssl":"true"}"#,
-        )
-        .unwrap();
+        let mut act =
+            SmtpAction::from_json("sshd".to_owned(), "smtp".to_owned(), r#"{"ssl":"true"}"#)
+                .unwrap();
         let err = act.start().await.unwrap_err();
         assert!(err.to_string().contains("TLS"));
     }

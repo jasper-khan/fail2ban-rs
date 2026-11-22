@@ -36,7 +36,8 @@ struct InotifyFd(RawFd);
 impl InotifyFd {
     fn open() -> io::Result<Self> {
         // SAFETY: `inotify_init1` takes integer flags and returns a new fd or -1 with errno set.
-        let fd = unsafe { nix::libc::inotify_init1(nix::libc::IN_NONBLOCK | nix::libc::IN_CLOEXEC) };
+        let fd =
+            unsafe { nix::libc::inotify_init1(nix::libc::IN_NONBLOCK | nix::libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -44,8 +45,9 @@ impl InotifyFd {
     }
 
     fn add_watch(&self, path: &Path, mask: u32) -> io::Result<i32> {
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains interior NUL"))?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path contains interior NUL")
+        })?;
         // SAFETY: `self.0` is a valid open inotify fd and `c_path.as_ptr()` is a valid NUL-terminated string.
         let wd = unsafe { nix::libc::inotify_add_watch(self.0, c_path.as_ptr(), mask) };
         if wd < 0 {
@@ -144,8 +146,7 @@ impl FilterPyinotify {
             return Ok(());
         }
 
-        let inotify_fd = InotifyFd::open()
-            .map_err(|err| Error::io("inotify_init1 failed", err))?;
+        let inotify_fd = InotifyFd::open().map_err(|err| Error::io("inotify_init1 failed", err))?;
         let async_fd = AsyncFd::new(inotify_fd)
             .map_err(|err| Error::io("AsyncFd registration failed", err))?;
 
@@ -330,7 +331,10 @@ impl FilterPyinotify {
                         self.path_to_file_wd.remove(&path);
                     }
                 }
-                touched_paths.insert((path, (ev.mask & (nix::libc::IN_DELETE_SELF | nix::libc::IN_MOVE_SELF)) != 0));
+                touched_paths.insert((
+                    path,
+                    (ev.mask & (nix::libc::IN_DELETE_SELF | nix::libc::IN_MOVE_SELF)) != 0,
+                ));
                 continue;
             }
             if let Some(dir) = self.dir_wds.get(&ev.wd)
@@ -342,8 +346,7 @@ impl FilterPyinotify {
                     .get(dir)
                     .is_some_and(|children| children.contains(&candidate))
                 {
-                    let created =
-                        (ev.mask & (nix::libc::IN_CREATE | nix::libc::IN_MOVED_TO)) != 0;
+                    let created = (ev.mask & (nix::libc::IN_CREATE | nix::libc::IN_MOVED_TO)) != 0;
                     touched_paths.insert((candidate, created));
                 }
             }
@@ -512,12 +515,14 @@ mod tests {
                     tail: false,
                     resume_fingerprint: None,
                     resume_offset: 0,
+                    auto_seek: None,
                 },
                 FileLogConfig {
                     path: late_path.clone(),
                     tail: true,
                     resume_fingerprint: None,
                     resume_offset: 0,
+                    auto_seek: None,
                 },
             ],
             LogEncoding::Utf8,

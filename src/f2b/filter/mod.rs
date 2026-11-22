@@ -24,6 +24,40 @@ use self::regex::FailRegex;
 const DEFAULT_MLFID_MAX_COUNT: usize = 100;
 const DEFAULT_MLFID_MAX_TIME: Duration = Duration::from_secs(300);
 
+fn remove_regex(regexes: &mut Vec<FailRegex>, hits: &mut Vec<usize>, index: Option<i64>) {
+    let Some(index) = index else {
+        regexes.clear();
+        hits.clear();
+        return;
+    };
+    let offset = if index < 0 {
+        usize::try_from(index.unsigned_abs())
+            .ok()
+            .and_then(|n| regexes.len().checked_sub(n))
+    } else {
+        usize::try_from(index).ok()
+    };
+    if let Some(offset) = offset.filter(|&i| i < regexes.len()) {
+        regexes.remove(offset);
+        if offset < hits.len() {
+            hits.remove(offset);
+        }
+    } else {
+        log_msg(
+            LogLevel::Error,
+            "fail2ban.filter",
+            &format!("Cannot remove regular expression. Index {index} is not valid"),
+        );
+    }
+}
+
+const CP1252_HIGH: [char; 32] = [
+    '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}', '\u{017D}', '\u{FFFD}',
+    '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+];
+
 /// Supported log character encodings matching Fail2Ban's `logencoding` option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogEncoding {
@@ -32,16 +66,26 @@ pub enum LogEncoding {
     Utf8,
     Latin1,
     Ascii,
+    Cp1252,
+    Utf16Le,
+    Utf16Be,
+    Utf16,
 }
 
 impl LogEncoding {
-    /// Parse a Fail2Ban `logencoding` string (`auto`, `utf-8`, `latin1`, `ascii`).
+    /// Parse a Fail2Ban `logencoding` string (`auto`, `utf-8`, `latin1`, `ascii`, `cp1252`, `utf-16*`).
     pub fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" | "" => Ok(Self::Auto),
-            "utf-8" | "utf8" => Ok(Self::Utf8),
-            "latin1" | "latin-1" | "iso-8859-1" | "iso8859-1" | "iso_8859_1" => Ok(Self::Latin1),
-            "ascii" | "us-ascii" => Ok(Self::Ascii),
+            "utf-8" | "utf8" | "utf_8" => Ok(Self::Utf8),
+            "latin1" | "latin-1" | "latin_1" | "iso-8859-1" | "iso8859-1" | "iso_8859_1" => {
+                Ok(Self::Latin1)
+            }
+            "ascii" | "us-ascii" | "us_ascii" => Ok(Self::Ascii),
+            "cp1252" | "windows-1252" | "windows_1252" => Ok(Self::Cp1252),
+            "utf-16le" | "utf16le" | "utf_16_le" => Ok(Self::Utf16Le),
+            "utf-16be" | "utf16be" | "utf_16_be" => Ok(Self::Utf16Be),
+            "utf-16" | "utf16" | "utf_16" => Ok(Self::Utf16),
             _ => Err(Error::config(format!("Unsupported logencoding {raw:?}"))),
         }
     }
@@ -52,6 +96,73 @@ impl LogEncoding {
             Self::Utf8 => "utf-8",
             Self::Latin1 => "latin1",
             Self::Ascii => "ascii",
+            Self::Cp1252 => "cp1252",
+            Self::Utf16Le => "utf-16le",
+            Self::Utf16Be => "utf-16be",
+            Self::Utf16 => "utf-16",
+        }
+    }
+
+    pub const fn is_utf16(self) -> bool {
+        matches!(self, Self::Utf16Le | Self::Utf16Be | Self::Utf16)
+    }
+
+    /// Resolve a `Utf16` BOM prefix if present, returning `(resolved_encoding, bom_bytes)`.
+    pub fn resolve_bom(self, bytes: &[u8]) -> (Self, usize) {
+        if self == Self::Utf16 && bytes.len() >= 2 {
+            match (bytes[0], bytes[1]) {
+                (0xFE, 0xFF) => (Self::Utf16Be, 2),
+                (0xFF, 0xFE) => (Self::Utf16Le, 2),
+                _ => (Self::Utf16Le, 0),
+            }
+        } else {
+            (self, 0)
+        }
+    }
+
+    /// Locate the first line terminator in `buf` without splitting multi-byte code units
+    /// containing `0x0A` (e.g. U+020A in UTF-16LE/BE). Returns `(line_end_no_crlf, next_start)`.
+    pub fn split_line(self, buf: &[u8]) -> Option<(usize, usize)> {
+        match self {
+            Self::Auto | Self::Utf8 | Self::Latin1 | Self::Ascii | Self::Cp1252 => {
+                let nl = memchr::memchr(b'\n', buf)?;
+                let line_end = if nl > 0 && buf[nl - 1] == b'\r' {
+                    nl - 1
+                } else {
+                    nl
+                };
+                Some((line_end, nl + 1))
+            }
+            Self::Utf16Le | Self::Utf16 => {
+                let mut i = 0usize;
+                while i + 1 < buf.len() {
+                    if buf[i] == b'\n' && buf[i + 1] == 0 {
+                        let line_end = if i >= 2 && buf[i - 2] == b'\r' && buf[i - 1] == 0 {
+                            i - 2
+                        } else {
+                            i
+                        };
+                        return Some((line_end, i + 2));
+                    }
+                    i += 2;
+                }
+                None
+            }
+            Self::Utf16Be => {
+                let mut i = 0usize;
+                while i + 1 < buf.len() {
+                    if buf[i] == 0 && buf[i + 1] == b'\n' {
+                        let line_end = if i >= 2 && buf[i - 2] == 0 && buf[i - 1] == b'\r' {
+                            i - 2
+                        } else {
+                            i
+                        };
+                        return Some((line_end, i + 2));
+                    }
+                    i += 2;
+                }
+                None
+            }
         }
     }
 
@@ -62,10 +173,47 @@ impl LogEncoding {
             Self::Latin1 => bytes.iter().map(|&b| char::from(b)).collect(),
             Self::Ascii => bytes
                 .iter()
-                .map(|&b| if b.is_ascii() { char::from(b) } else { '\u{FFFD}' })
+                .map(|&b| {
+                    if b.is_ascii() {
+                        char::from(b)
+                    } else {
+                        '\u{FFFD}'
+                    }
+                })
                 .collect(),
+            Self::Cp1252 => bytes
+                .iter()
+                .map(|&b| {
+                    if (0x80..=0x9F).contains(&b) {
+                        CP1252_HIGH[(b - 0x80) as usize]
+                    } else {
+                        char::from(b)
+                    }
+                })
+                .collect(),
+            Self::Utf16Le => decode_utf16_bytes(bytes, false),
+            Self::Utf16Be => decode_utf16_bytes(bytes, true),
+            Self::Utf16 => {
+                let (resolved, skip) = self.resolve_bom(bytes);
+                decode_utf16_bytes(&bytes[skip..], resolved == Self::Utf16Be)
+            }
         }
     }
+}
+
+fn decode_utf16_bytes(bytes: &[u8], big_endian: bool) -> String {
+    let mut units = Vec::with_capacity(bytes.len().div_ceil(2));
+    for pair in bytes.chunks_exact(2) {
+        units.push(if big_endian {
+            u16::from_be_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_le_bytes([pair[0], pair[1]])
+        });
+    }
+    if bytes.len() % 2 == 1 {
+        units.push(0xFFFD);
+    }
+    String::from_utf16_lossy(&units)
 }
 
 /// Single failure detection emitted by [`Filter::process_line`].
@@ -95,6 +243,7 @@ pub struct ProcessLineStats {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LineProcessResult {
     pub results: Vec<MatchResult>,
+    pub(crate) pref_groups: Option<BTreeMap<String, String>>,
     pub date_matched: bool,
     pub date_time: Option<f64>,
     pub ignored_by_regex: Vec<usize>,
@@ -192,6 +341,7 @@ pub struct Filter {
     max_lines: usize,
     use_dns: UseDns,
     log_encoding: LogEncoding,
+    log_encoding_name: String,
     log_timezone: Option<String>,
     find_time: f64,
     check_find_time: bool,
@@ -225,6 +375,7 @@ impl Filter {
             max_lines: 1,
             use_dns: UseDns::Warn,
             log_encoding: LogEncoding::Auto,
+            log_encoding_name: "UTF-8".to_owned(),
             log_timezone: None,
             find_time: 600.0,
             check_find_time: true,
@@ -293,13 +444,26 @@ impl Filter {
         self.log_encoding
     }
 
+    pub fn log_encoding_name(&self) -> &str {
+        &self.log_encoding_name
+    }
+
     pub fn set_log_encoding(&mut self, encoding: LogEncoding) {
+        let name = if encoding == LogEncoding::Auto {
+            "UTF-8"
+        } else {
+            encoding.as_str()
+        };
+        self.log_encoding_name = name.to_owned();
         self.log_encoding = encoding;
     }
 
     pub fn set_log_encoding_str(&mut self, raw: &str) -> Result<LogEncoding> {
         let enc = LogEncoding::parse(raw)?;
-        self.log_encoding = enc;
+        self.set_log_encoding(enc);
+        if enc != LogEncoding::Auto {
+            self.log_encoding_name = raw.to_owned();
+        }
         Ok(enc)
     }
 
@@ -452,7 +616,7 @@ impl Filter {
     }
 
     pub fn prefregex(&self) -> Option<&str> {
-        self.prefregex.as_ref().map(FailRegex::raw_pattern)
+        self.prefregex.as_ref().map(FailRegex::regex)
     }
 
     pub fn set_prefregex(&mut self, pattern: Option<&str>) -> Result<()> {
@@ -470,7 +634,7 @@ impl Filter {
     pub fn fail_regexes(&self) -> Vec<String> {
         self.failregex
             .iter()
-            .map(|r| r.raw_pattern().to_owned())
+            .map(|r| r.regex().to_owned())
             .collect()
     }
 
@@ -486,28 +650,14 @@ impl Filter {
         Ok(self.failregex.len())
     }
 
-    pub fn del_fail_regex(&mut self, index: Option<usize>) -> Result<()> {
-        match index {
-            None => {
-                self.failregex.clear();
-                self.stats.regex_hits.clear();
-                Ok(())
-            }
-            Some(i) if i < self.failregex.len() => {
-                self.failregex.remove(i);
-                if i < self.stats.regex_hits.len() {
-                    self.stats.regex_hits.remove(i);
-                }
-                Ok(())
-            }
-            Some(i) => Err(Error::regex(format!("Cannot remove failregex index {i}"))),
-        }
+    pub fn del_fail_regex(&mut self, index: Option<i64>) {
+        remove_regex(&mut self.failregex, &mut self.stats.regex_hits, index);
     }
 
     pub fn ignore_regexes(&self) -> Vec<String> {
         self.ignoreregex
             .iter()
-            .map(|r| r.raw_pattern().to_owned())
+            .map(|r| r.regex().to_owned())
             .collect()
     }
 
@@ -518,22 +668,12 @@ impl Filter {
         Ok(self.ignoreregex.len())
     }
 
-    pub fn del_ignore_regex(&mut self, index: Option<usize>) -> Result<()> {
-        match index {
-            None => {
-                self.ignoreregex.clear();
-                self.stats.ignoreregex_hits.clear();
-                Ok(())
-            }
-            Some(i) if i < self.ignoreregex.len() => {
-                self.ignoreregex.remove(i);
-                if i < self.stats.ignoreregex_hits.len() {
-                    self.stats.ignoreregex_hits.remove(i);
-                }
-                Ok(())
-            }
-            Some(i) => Err(Error::regex(format!("Cannot remove ignoreregex index {i}"))),
-        }
+    pub fn del_ignore_regex(&mut self, index: Option<i64>) {
+        remove_regex(
+            &mut self.ignoreregex,
+            &mut self.stats.ignoreregex_hits,
+            index,
+        );
     }
 
     pub fn last_date(&self) -> f64 {
@@ -621,7 +761,7 @@ impl Filter {
             self.line_buffer.drain(..excess);
         }
 
-        let Some(event_time) = time_opt else {
+        let Some(event_time) = time_opt.or_else(|| (!self.check_find_time).then_some(now)) else {
             // Even without a parsed timestamp, probe failregex for missed-date diagnostics.
             let org_lines = self.line_buffer.clone();
             let buf = FailRegex::tuple_lines_buf(&org_lines);
@@ -750,6 +890,9 @@ impl Filter {
                 return;
             }
             pref_groups = pref.groups();
+            if !self.check_find_time {
+                out.pref_groups = Some(pref_groups.clone());
+            }
             if let Some(content) = pref_groups.remove("content") {
                 work_lines = if org_lines.len() == 1 && !content.contains('\n') {
                     // Keep the full original line tuple when single-line prefregex strips prefix.
@@ -820,13 +963,8 @@ impl Filter {
                 continue;
             };
 
-            let produced = self.build_results_from_match(
-                idx,
-                event_time,
-                merged_lines,
-                fail_data,
-                out,
-            );
+            let produced =
+                self.build_results_from_match(idx, event_time, merged_lines, fail_data, out);
 
             if produced {
                 if let Some(slot) = self.stats.regex_hits.get_mut(idx) {
@@ -885,8 +1023,7 @@ impl Filter {
                 if let Some(u) = fail.get("user") {
                     entry.users.insert(u.clone());
                 }
-                if entry.data.remove("nofail").is_some()
-                    || entry.data.remove("mlfgained").is_some()
+                if entry.data.remove("nofail").is_some() || entry.data.remove("mlfgained").is_some()
                 {
                     nfflgs |= 4;
                 }
@@ -1153,9 +1290,15 @@ mod tests {
             .unwrap();
 
         // Scenario A: Connection line carries IP with NOFAIL -> buffered silently; Failed line triggers using cached IP.
-        let r1 = f.process_line("2024-05-14 08:30:01 h1 sshd[100]: Connection from 198.51.100.10 port 4444", None);
+        let r1 = f.process_line(
+            "2024-05-14 08:30:01 h1 sshd[100]: Connection from 198.51.100.10 port 4444",
+            None,
+        );
         assert!(r1.is_empty());
-        let r2 = f.process_line("2024-05-14 08:30:02 h1 sshd[100]: Failed password for alice", None);
+        let r2 = f.process_line(
+            "2024-05-14 08:30:02 h1 sshd[100]: Failed password for alice",
+            None,
+        );
         assert_eq!(r2.len(), 1);
         assert_eq!(r2[0].ip, Some(TicketId::parse("198.51.100.10")));
         assert_eq!(r2[0].data.get("user").map(String::as_str), Some("alice"));
@@ -1173,7 +1316,10 @@ mod tests {
         assert!(benign.is_empty());
 
         // Scenario B: Failure arrives BEFORE IP (`mlfpending`), then `mlfgained` supplies IP.
-        let p1 = f.process_line("2024-05-14 08:31:01 h1 sshd[200]: Failed password for bob", None);
+        let p1 = f.process_line(
+            "2024-05-14 08:31:01 h1 sshd[200]: Failed password for bob",
+            None,
+        );
         assert!(p1.is_empty());
         let p2 = f.process_line(
             "2024-05-14 08:31:02 h1 sshd[200]: Received disconnect from 198.51.100.20",
@@ -1194,7 +1340,11 @@ mod tests {
         f.add_fail_regex(r"^bad login from <HOST>$").unwrap();
 
         // Line older than findtime is skipped.
-        let expired = f.process_line_at("2024-05-14 08:00:00 bad login from 192.0.2.1", None, 1_715_675_000.0);
+        let expired = f.process_line_at(
+            "2024-05-14 08:00:00 bad login from 192.0.2.1",
+            None,
+            1_715_675_000.0,
+        );
         assert!(expired.date_matched);
         assert!(expired.results.is_empty());
 
@@ -1218,19 +1368,52 @@ mod tests {
         f.set_check_find_time(false);
         f.set_ignore_self(false);
         f.set_max_lines(2).unwrap();
-        f.add_fail_regex(r"user=(?P<user>\S+)\n.*from=<HOST>").unwrap();
+        f.add_fail_regex(r"user=(?P<user>\S+)\n.*from=<HOST>")
+            .unwrap();
 
-        assert!(f.process_line("2024-05-14 08:30:00 user=bob", None).is_empty());
+        assert!(
+            f.process_line("2024-05-14 08:30:00 user=bob", None)
+                .is_empty()
+        );
         let res = f.process_line("2024-05-14 08:30:00 from=203.0.113.77", None);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].matches.len(), 2);
         assert_eq!(res[0].ip, Some(TicketId::parse("203.0.113.77")));
 
         // Verify next line doesn't re-trigger the already consumed line.
-        assert!(f.process_line("2024-05-14 08:30:01 unrelated", None).is_empty());
+        assert!(
+            f.process_line("2024-05-14 08:30:01 unrelated", None)
+                .is_empty()
+        );
 
-        assert_eq!(LogEncoding::Latin1.decode(&[b'o', b'k', 0xE9]), "ok\u{00E9}");
+        assert_eq!(
+            LogEncoding::Latin1.decode(&[b'o', b'k', 0xE9]),
+            "ok\u{00E9}"
+        );
         assert_eq!(LogEncoding::Ascii.decode(&[b'a', 0xFF]), "a\u{FFFD}");
+        assert_eq!(LogEncoding::Cp1252.decode(&[0x80, b'5']), "\u{20AC}5");
+
+        // Upstream filtertestcase.py:1867 — U+020A embeds 0x0A byte in both UTF-16BE & UTF-16LE.
+        let sample = "Test\u{020A} ok\nLine2\n";
+        let be: Vec<u8> = sample.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let (end_be, next_be) = LogEncoding::Utf16Be.split_line(&be).unwrap();
+        assert_eq!(
+            LogEncoding::Utf16Be.decode(&be[..end_be]),
+            "Test\u{020A} ok"
+        );
+        assert_eq!(LogEncoding::Utf16Be.decode(&be[next_be..]), "Line2\n");
+
+        let le: Vec<u8> = sample.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let (end_le, next_le) = LogEncoding::Utf16Le.split_line(&le).unwrap();
+        assert_eq!(
+            LogEncoding::Utf16Le.decode(&le[..end_le]),
+            "Test\u{020A} ok"
+        );
+        assert_eq!(LogEncoding::Utf16Le.decode(&le[next_le..]), "Line2\n");
+
+        let mut with_bom = vec![0xFE, 0xFF];
+        with_bom.extend_from_slice(&be[..end_be]);
+        assert_eq!(LogEncoding::Utf16.decode(&with_bom), "Test\u{020A} ok");
     }
 
     #[test]
@@ -1250,10 +1433,16 @@ mod tests {
             .unwrap();
 
         assert!(
-            f.process_line("2024-05-14 09:00:01 h1 sshd[300]: Connection from 198.51.100.30 port 99", None)
-                .is_empty()
+            f.process_line(
+                "2024-05-14 09:00:01 h1 sshd[300]: Connection from 198.51.100.30 port 99",
+                None
+            )
+            .is_empty()
         );
-        let hits = f.process_line("2024-05-14 09:00:02 h1 sshd[300]: Failed publickey for carol", None);
+        let hits = f.process_line(
+            "2024-05-14 09:00:02 h1 sshd[300]: Failed publickey for carol",
+            None,
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].ip, Some(TicketId::parse("198.51.100.30")));
 

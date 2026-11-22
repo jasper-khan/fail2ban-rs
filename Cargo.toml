@@ -25,6 +25,10 @@ path = "src/bin/fail2ban-client.rs"
 name = "fail2ban-regex"
 path = "src/bin/fail2ban-regex.rs"
 
+[[bin]]
+name = "apache-fakegooglebot"
+path = "src/bin/apache-fakegooglebot.rs"
+
 [[test]]
 name = "f2b_parity"
 path = "tests/f2b_parity.rs"
@@ -34,7 +38,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fancy-regex = "0.14"
 ipnet = "2"
 memchr = "2"
-nix = { version = "0.29", default-features = false, features = ["net", "signal", "socket", "user"] }
+nix = { version = "0.29", default-features = false, features = ["fs", "net", "process", "signal", "socket", "user"] }
 regex = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

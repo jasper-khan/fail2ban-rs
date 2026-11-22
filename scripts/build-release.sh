@@ -1,96 +1,63 @@
-#!/bin/bash
-# Build release artifacts for Linux targets.
-# Usage: ./scripts/build-release.sh 0.1.0
-#
-# Prerequisites:
-#   brew install zig             (macOS cross-compilation)
-#   cargo install cargo-zigbuild
-#   rustup target add x86_64-unknown-linux-musl
-#   rustup target add aarch64-unknown-linux-musl
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
-
-VERSION="${1:-}"
-
-if [ -z "$VERSION" ]; then
-    echo "Usage: $0 <version>"
-    echo "Example: $0 0.1.0"
+cd "$(dirname "$0")/.."
+version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+if [[ "${1:-}" != "$version" || $# -gt 2 ]]; then
+    echo "Usage: $0 $version [x86_64-unknown-linux-musl|aarch64-unknown-linux-musl]" >&2
     exit 1
 fi
 
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Error: Version must be in format X.Y.Z"
-    exit 1
+targets=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
+if [[ $# -eq 2 ]]; then
+    targets=("$2")
+fi
+checksum=(sha256sum)
+if ! command -v sha256sum >/dev/null; then
+    checksum=(shasum -a 256)
 fi
 
-# Check Cargo.toml version matches
-CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-if [ "$CARGO_VERSION" != "$VERSION" ]; then
-    echo "Error: Version $VERSION does not match Cargo.toml version $CARGO_VERSION"
-    exit 1
+output="dist/v$version"
+mkdir -p "$output"
+reference=f60978618a101427b06924fc932b44350fec2b63
+reference_archive="$output/fail2ban-1.1.1-source.tar.gz"
+reference_sha=0a089e14d452e90a62f9f9fd1b7414d8bfb38f2997a11fee971cfd6d491fa48c
+if [[ ! -f "$reference_archive" ]]; then
+    curl --fail --silent --show-error --location \
+        "https://codeload.github.com/fail2ban/fail2ban/tar.gz/$reference" \
+        --output "$reference_archive"
 fi
+printf '%s  %s\n' "$reference_sha" "$reference_archive" | "${checksum[@]}" -c -
 
-echo "Building fail2ban-rs v$VERSION"
-echo "================================"
+for target in "${targets[@]}"; do
+    case "$target" in
+        x86_64-unknown-linux-musl) arch=amd64 ;;
+        aarch64-unknown-linux-musl) arch=arm64 ;;
+        *) echo "Unsupported target: $target" >&2; exit 1 ;;
+    esac
+    cargo zigbuild --release --locked --bins --target "$target"
 
-DIST_DIR="dist/v$VERSION"
-rm -rf "$DIST_DIR"
-mkdir -p "$DIST_DIR"
+    name="fail2ban-rs-$version-linux-$arch"
+    package="$output/$name"
+    mkdir -p "$package/bin"
+    for binary in fail2ban-server fail2ban-client fail2ban-regex; do
+        install -m 0755 "${CARGO_TARGET_DIR:-target}/$target/release/$binary" "$package/bin/$binary"
+    done
+    path="fail2ban-$reference"
+    tar -xzf "$reference_archive" --strip-components=1 -C "$package" \
+        "$path/config" "$path/COPYING" \
+        "$path/man/fail2ban.1" "$path/man/fail2ban-server.1" \
+        "$path/man/fail2ban-client.1" "$path/man/fail2ban-regex.1" \
+        "$path/man/jail.conf.5"
+    install -m 0755 "${CARGO_TARGET_DIR:-target}/$target/release/apache-fakegooglebot" \
+        "$package/config/filter.d/ignorecommands/apache-fakegooglebot"
+    cp dist/fail2ban.service dist/fail2ban.socket scripts/install.sh LICENSE README.md "$package/"
+    install -D -m 0644 docs/MIGRATION_AND_ROLLBACK.md "$package/docs/MIGRATION_AND_ROLLBACK.md"
 
-TARGETS=(
-    "x86_64-unknown-linux-musl:linux-amd64"
-    "aarch64-unknown-linux-musl:linux-arm64"
-)
-
-for target_pair in "${TARGETS[@]}"; do
-    RUST_TARGET="${target_pair%%:*}"
-    LABEL="${target_pair##*:}"
-
-    echo ""
-    echo "Building for $LABEL ($RUST_TARGET)..."
-
-    cargo zigbuild --release --target "$RUST_TARGET"
-
-    BINARY="target/$RUST_TARGET/release/fail2ban-rs"
-
-    if [ ! -f "$BINARY" ]; then
-        echo "Error: Binary not found at $BINARY"
-        exit 1
-    fi
-
-    # Strip binary
-    if command -v llvm-strip &> /dev/null; then
-        llvm-strip "$BINARY"
-    elif command -v strip &> /dev/null; then
-        strip "$BINARY" 2>/dev/null || true
-    fi
-
-    # Package
-    ARCHIVE_NAME="fail2ban-rs-${VERSION}-${LABEL}"
-    ARCHIVE_DIR="$DIST_DIR/$ARCHIVE_NAME"
-
-    mkdir -p "$ARCHIVE_DIR"
-    cp "$BINARY" "$ARCHIVE_DIR/fail2ban-rs"
-    cp dist/fail2ban-rs.service "$ARCHIVE_DIR/"
-    cp config/default.toml "$ARCHIVE_DIR/config.toml"
-    cp LICENSE "$ARCHIVE_DIR/" 2>/dev/null || true
-    cp README.md "$ARCHIVE_DIR/" 2>/dev/null || true
-
-    (cd "$DIST_DIR" && tar -czf "$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME")
-    rm -rf "$ARCHIVE_DIR"
-
-    # Checksum
-    (cd "$DIST_DIR" && shasum -a 256 "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.tar.gz.sha256")
-
-    echo "Created: $ARCHIVE_NAME.tar.gz"
+    (
+        cd "$output"
+        tar -czf "$name.tar.gz" "$name"
+        "${checksum[@]}" "$name.tar.gz" > "$name.tar.gz.sha256"
+    )
+    echo "Created $output/$name.tar.gz"
 done
-
-echo ""
-echo "================================"
-echo "Build complete! Artifacts in $DIST_DIR:"
-echo ""
-ls -la "$DIST_DIR"
-
-echo ""
-echo "To release:"
-echo "  git tag v$VERSION && git push origin main --tags"

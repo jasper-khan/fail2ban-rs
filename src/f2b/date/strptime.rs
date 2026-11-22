@@ -5,8 +5,8 @@
 //! rollover and `default_tz` support.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone};
 
@@ -599,14 +599,16 @@ pub(crate) fn re_group_dict_strptime_at(
                 );
             }
             "B" => {
-                month = Some(parse_full_month(val).ok_or_else(|| {
-                    Error::date(format!("invalid month name {val:?}"))
-                })?);
+                month = Some(
+                    parse_full_month(val)
+                        .ok_or_else(|| Error::date(format!("invalid month name {val:?}")))?,
+                );
             }
             "b" => {
-                month = Some(parse_abbr_month(val).ok_or_else(|| {
-                    Error::date(format!("invalid month abbreviation {val:?}"))
-                })?);
+                month =
+                    Some(parse_abbr_month(val).ok_or_else(|| {
+                        Error::date(format!("invalid month abbreviation {val:?}"))
+                    })?);
             }
             "d" => {
                 day = Some(
@@ -666,14 +668,16 @@ pub(crate) fn re_group_dict_strptime_at(
                 }
             }
             "A" => {
-                weekday = Some(parse_full_weekday(val).ok_or_else(|| {
-                    Error::date(format!("invalid weekday name {val:?}"))
-                })?);
+                weekday = Some(
+                    parse_full_weekday(val)
+                        .ok_or_else(|| Error::date(format!("invalid weekday name {val:?}")))?,
+                );
             }
             "a" => {
-                weekday = Some(parse_abbr_weekday(val).ok_or_else(|| {
-                    Error::date(format!("invalid weekday abbreviation {val:?}"))
-                })?);
+                weekday =
+                    Some(parse_abbr_weekday(val).ok_or_else(|| {
+                        Error::date(format!("invalid weekday abbreviation {val:?}"))
+                    })?);
             }
             "w" => {
                 let mut w: i32 = val
@@ -749,8 +753,12 @@ pub(crate) fn re_group_dict_strptime_at(
     let final_month = month.ok_or_else(|| Error::date("missing month in date"))?;
     let final_day = day.ok_or_else(|| Error::date("missing day in date"))?;
 
-    let naive_date = NaiveDate::from_ymd_opt(final_year, final_month, final_day)
-        .ok_or_else(|| Error::date(format!("invalid date {final_year}-{final_month}-{final_day}")))?;
+    let naive_date =
+        NaiveDate::from_ymd_opt(final_year, final_month, final_day).ok_or_else(|| {
+            Error::date(format!(
+                "invalid date {final_year}-{final_month}-{final_day}"
+            ))
+        })?;
     let naive_time = NaiveTime::from_hms_micro_opt(hour, minute, second, fraction)
         .ok_or_else(|| Error::date(format!("invalid time {hour}:{minute}:{second}.{fraction}")))?;
     let mut dt = NaiveDateTime::new(naive_date, naive_time);
@@ -907,7 +915,10 @@ mod tests {
         assert!(rx.contains("(?P<S>[0-5]?\\d|6[0-1])"));
 
         assert_eq!(build_ex_year_regex(2026, 2001), "(?P<Y>20[012]\\d)");
-        assert_eq!(build_ex_year_regex(2026, 1970), "(?P<Y>(?:19[6789]|20[012])\\d)");
+        assert_eq!(
+            build_ex_year_regex(2026, 1970),
+            "(?P<Y>(?:19[6789]|20[012])\\d)"
+        );
         assert!(expand_date_pattern("%Q").is_err());
     }
 

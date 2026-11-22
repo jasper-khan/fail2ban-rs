@@ -207,7 +207,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("f2b_poll_{name}_{}_{nanos}.log", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "f2b_poll_{name}_{}_{nanos}.log",
+            std::process::id()
+        ))
     }
 
     #[test]

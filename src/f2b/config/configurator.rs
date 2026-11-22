@@ -297,14 +297,8 @@ impl FilterReader {
                 self.file
             )));
         };
-        self.resolved = resolve_definition_init(
-            cfg,
-            FILTER_OPTIONS,
-            jail_opts,
-            &self.init_opts,
-            all,
-            &[],
-        )?;
+        self.resolved =
+            resolve_definition_init(cfg, FILTER_OPTIONS, jail_opts, &self.init_opts, all, &[])?;
         Ok(())
     }
 
@@ -318,7 +312,12 @@ impl FilterReader {
 
     pub fn convert(&self) -> Vec<PickleValue> {
         let mut stream = Vec::new();
-        fill_filter_stream(&mut stream, &self.resolved.options, self.resolved.maxlines, &self.jail_name);
+        fill_filter_stream(
+            &mut stream,
+            &self.resolved.options,
+            self.resolved.maxlines,
+            &self.jail_name,
+        );
         stream
     }
 }
@@ -404,7 +403,8 @@ impl ActionReader {
         flatten_conditional_sections(&mut merged_cfg);
 
         // Include action conditional keys in the list of Definition keys to extract.
-        let mut def_keys: Vec<String> = ACTION_CONFIG_OPTS.iter().map(|s| (*s).to_owned()).collect();
+        let mut def_keys: Vec<String> =
+            ACTION_CONFIG_OPTS.iter().map(|s| (*s).to_owned()).collect();
         if let Some(def) = merged_cfg.sections.get("Definition") {
             for k in def.keys() {
                 if k != "__name__" && !def_keys.contains(k) {
@@ -619,7 +619,11 @@ impl JailReader {
         self.config_error.is_some() || self.runtime_error.is_some()
     }
 
-    pub fn get_options(&mut self, shared_config: &LayeredConfig, add_opts: Option<&Options>) -> bool {
+    pub fn get_options(
+        &mut self,
+        shared_config: &LayeredConfig,
+        add_opts: Option<&Options>,
+    ) -> bool {
         let mut cfg = shared_config.clone();
         cfg.defaults
             .insert("fail2ban_version".to_owned(), FAIL2BAN_VERSION.to_owned());
@@ -650,8 +654,10 @@ impl JailReader {
         }
 
         // First pass: enabled, backend, filter
-        let enabled = get_opt(cfg, &self.name, "enabled", None)?.unwrap_or_else(|| "false".to_owned());
-        let backend = get_opt(cfg, &self.name, "backend", None)?.unwrap_or_else(|| "auto".to_owned());
+        let enabled =
+            get_opt(cfg, &self.name, "enabled", None)?.unwrap_or_else(|| "false".to_owned());
+        let backend =
+            get_opt(cfg, &self.name, "backend", None)?.unwrap_or_else(|| "auto".to_owned());
         let filter_expr = get_opt(cfg, &self.name, "filter", None)?.unwrap_or_default();
         self.opts.insert("enabled".to_owned(), enabled);
         self.opts.insert("backend".to_owned(), backend);
@@ -683,7 +689,11 @@ impl JailReader {
                     parsed.name
                 )));
             }
-            let backend_val = self.opts.get("backend").cloned().unwrap_or_else(|| "auto".to_owned());
+            let backend_val = self
+                .opts
+                .get("backend")
+                .cloned()
+                .unwrap_or_else(|| "auto".to_owned());
             reader.apply_auto_options(&backend_val);
             reader.get_options(&self.opts, true)?;
             // Merge filter combined options as `known/<k>` into jail section
@@ -709,12 +719,8 @@ impl JailReader {
         self.opts
             .entry("backend".to_owned())
             .or_insert_with(|| "auto".to_owned());
-        self.opts
-            .entry("filter".to_owned())
-            .or_default();
-        self.opts
-            .entry("action".to_owned())
-            .or_default();
+        self.opts.entry("filter".to_owned()).or_default();
+        self.opts.entry("action".to_owned()).or_default();
         if let Some(add) = add_opts {
             for (k, v) in add {
                 self.opts.insert(k.clone(), v.clone());
@@ -767,7 +773,11 @@ impl JailReader {
         Ok(())
     }
 
-    pub fn convert(&mut self, allow_no_files: bool, systemd_if_nologs: bool) -> Result<Vec<PickleValue>> {
+    pub fn convert(
+        &mut self,
+        allow_no_files: bool,
+        systemd_if_nologs: bool,
+    ) -> Result<Vec<PickleValue>> {
         if let Some(err) = &self.config_error {
             return Ok(vec![PickleValue::str_list([
                 "config-error",
@@ -903,10 +913,7 @@ impl JailReader {
             }
         }
 
-        stream.insert(
-            0,
-            PickleValue::str_list(["add", &self.name, &backend]),
-        );
+        stream.insert(0, PickleValue::str_list(["add", &self.name, &backend]));
         Ok(stream)
     }
 }
@@ -983,7 +990,11 @@ impl JailsReader {
         Ok((ignore_wrong && ok_any) || !err_any)
     }
 
-    pub fn convert(&mut self, allow_no_files: bool, systemd_if_nologs: bool) -> Result<Vec<PickleValue>> {
+    pub fn convert(
+        &mut self,
+        allow_no_files: bool,
+        systemd_if_nologs: bool,
+    ) -> Result<Vec<PickleValue>> {
         let mut stream = Vec::new();
         for jail in &mut self.jails {
             stream.extend(jail.convert(allow_no_files, systemd_if_nologs)?);
@@ -1171,9 +1182,7 @@ fn resolve_definition_init(
         }
     }
 
-    if all
-        && let Some(definition) = config.sections.get("Definition")
-    {
+    if all && let Some(definition) = config.sections.get("Definition") {
         for key in definition.keys() {
             if key != "__name__"
                 && !options.contains_key(key)
@@ -1298,10 +1307,7 @@ fn fill_filter_stream(
             }
             "usedns" | "prefregex" => {
                 let idx = if key == "usedns" { 0 } else { prio0_idx };
-                stream.insert(
-                    idx,
-                    PickleValue::str_list(["set", jail_name, key, value]),
-                );
+                stream.insert(idx, PickleValue::str_list(["set", jail_name, key, value]));
                 prio0_idx += 1;
             }
             "datepattern" => {
@@ -1443,7 +1449,7 @@ pub fn shlex_split(input: &str) -> Vec<String> {
 }
 
 /// Pure-Rust filesystem glob matching `JailReader._glob` (skips dangling symlinks).
-fn glob_existing(pattern: &str) -> Vec<String> {
+pub(crate) fn glob_existing(pattern: &str) -> Vec<String> {
     if !pattern.contains(['*', '?', '[']) {
         let p = Path::new(pattern);
         return if p.exists() {

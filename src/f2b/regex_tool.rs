@@ -14,8 +14,8 @@ use crate::VERSION;
 use crate::config::{FilterReader, JailReader, layers, shlex_split, spec};
 use crate::date::strptime::set_alternate_year;
 use crate::error::{Error, Result};
-use crate::filter::backend::JournalConfig;
 use crate::filter::backend::systemd::{build_journalctl_args, format_journal_entry};
+use crate::filter::backend::{JournalConfig, expand_journal_files};
 use crate::filter::ipdns::UseDns;
 use crate::filter::regex::FailRegex;
 use crate::filter::{Filter, LogEncoding, MatchResult};
@@ -83,9 +83,11 @@ impl Default for RegexCliOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegexCliAction {
     Help,
-    Version { short: bool },
+    Version {
+        short: bool,
+    },
     Run {
-        opts: RegexCliOptions,
+        opts: Box<RegexCliOptions>,
         log: String,
         regex: String,
         ignore_regex: Option<String>,
@@ -146,7 +148,7 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
                 "maxlines" => {
                     let raw = take_long_val(name, inline_val, args, &mut idx)?;
                     opts.maxlines = raw.trim().parse::<usize>().map_err(|_| {
-                        Error::invalid_command(format!("option --maxlines invalid integer: {raw:?}"))
+                        Error::Value(format!("option --maxlines: invalid integer value: {raw:?}"))
                     })?;
                 }
                 "journalmatch" => {
@@ -158,8 +160,8 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
                 "verbosity" => {
                     let raw = take_long_val(name, inline_val, args, &mut idx)?;
                     opts.verbose = raw.trim().parse::<i32>().map_err(|_| {
-                        Error::invalid_command(format!(
-                            "option --verbosity invalid integer: {raw:?}"
+                        Error::Value(format!(
+                            "option --verbosity: invalid integer value: {raw:?}"
                         ))
                     })?;
                 }
@@ -167,7 +169,7 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
                     opts.out = Some(take_long_val(name, inline_val, args, &mut idx)?);
                 }
                 _ => {
-                    return Err(Error::invalid_command(format!("no such option: --{name}")));
+                    return Err(Error::Value(format!("no such option: --{name}")));
                 }
             }
             idx += 1;
@@ -176,8 +178,7 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
 
         if !after_double_dash && arg.starts_with('-') && arg != "-" {
             let rest = &arg[1..];
-            let mut chars = rest.char_indices();
-            while let Some((byte_off, ch)) = chars.next() {
+            for (byte_off, ch) in rest.char_indices() {
                 match ch {
                     'h' => return Ok(RegexCliAction::Help),
                     'V' => return Ok(RegexCliAction::Version { short: true }),
@@ -193,7 +194,7 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
                         } else {
                             idx += 1;
                             args.get(idx).cloned().ok_or_else(|| {
-                                Error::invalid_command(format!("-{ch} option requires an argument"))
+                                Error::Value(format!("-{ch} option requires 1 argument"))
                             })?
                         };
                         match ch {
@@ -202,8 +203,8 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
                             'e' => opts.encoding = val,
                             'L' => {
                                 opts.maxlines = val.trim().parse::<usize>().map_err(|_| {
-                                    Error::invalid_command(format!(
-                                        "option -L invalid integer: {val:?}"
+                                    Error::Value(format!(
+                                        "option -L: invalid integer value: {val:?}"
                                     ))
                                 })?;
                             }
@@ -215,7 +216,7 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
                         break;
                     }
                     _ => {
-                        return Err(Error::invalid_command(format!("no such option: -{ch}")));
+                        return Err(Error::Value(format!("no such option: -{ch}")));
                     }
                 }
             }
@@ -246,7 +247,7 @@ pub fn parse_cli(args: &[String]) -> Result<RegexCliAction> {
     let ignore_regex = positional.into_iter().next();
 
     Ok(RegexCliAction::Run {
-        opts,
+        opts: Box::new(opts),
         log,
         regex,
         ignore_regex,
@@ -263,9 +264,9 @@ fn take_long_val(
         return Ok(v.to_owned());
     }
     *idx += 1;
-    args.get(*idx).cloned().ok_or_else(|| {
-        Error::invalid_command(format!("--{name} option requires an argument"))
-    })
+    args.get(*idx)
+        .cloned()
+        .ok_or_else(|| Error::Value(format!("--{name} option requires 1 argument")))
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +304,6 @@ pub struct LineStats {
 pub struct Fail2banRegex {
     opts: RegexCliOptions,
     filter: Filter,
-    prefregex_tracker: Option<FailRegex>,
     pref_matched: usize,
     pref_groups: Vec<BTreeMap<String, String>>,
     fail_stats: Vec<RegexStat>,
@@ -311,7 +311,7 @@ pub struct Fail2banRegex {
     line_stats: LineStats,
     journal_matches: Vec<Vec<String>>,
     backend: String,
-    encoding: FileEncoding,
+    encoding: LogEncoding,
     display_maxlines: usize,
     maxlines_set: bool,
     datepattern_set: bool,
@@ -319,44 +319,19 @@ pub struct Fail2banRegex {
     header_lines: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum FileEncoding {
-    Filter(LogEncoding),
-    Utf16Be,
-    Utf16Le,
-}
-
-impl FileEncoding {
-    fn parse(raw: &str) -> Result<Self> {
-        let lower = raw.trim().to_ascii_lowercase();
-        match lower.as_str() {
-            "utf-16be" | "utf16be" | "utf_16_be" => Ok(Self::Utf16Be),
-            "utf-16le" | "utf16le" | "utf_16_le" => Ok(Self::Utf16Le),
-            _ => Ok(Self::Filter(LogEncoding::parse(raw)?)),
-        }
-    }
-
-    fn filter_encoding(self) -> LogEncoding {
-        match self {
-            Self::Filter(enc) => enc,
-            Self::Utf16Be | Self::Utf16Le => LogEncoding::Utf8,
-        }
-    }
-}
-
 impl Fail2banRegex {
     pub fn new(opts: RegexCliOptions) -> Result<Self> {
         // Upstream calls MyTime.setAlternateNow(0) so %ExY/%Exy match historical log dates.
         set_alternate_year(Some(1970));
 
-        let file_enc = FileEncoding::parse(&opts.encoding)?;
+        let file_enc = LogEncoding::parse(&opts.encoding)?;
         let mut filter = Filter::new("fail2ban-regex");
         filter.set_check_find_time(false);
         filter.set_ignore_self(false);
         filter.set_return_raw_host(opts.raw);
         filter.set_check_all_regex(opts.check_all_regex && opts.out.is_none());
         filter.set_ignore_pending(opts.out.is_some());
-        filter.set_log_encoding(file_enc.filter_encoding());
+        filter.set_log_encoding(file_enc);
 
         if let Some(ref tz) = opts.timezone {
             filter.set_log_timezone(Some(tz))?;
@@ -385,9 +360,7 @@ impl Fail2banRegex {
                 .map_err(|e| Error::config(format!("Failed to set datepattern: {e}")))?;
             datepattern_set = true;
             if opts.out.is_none() {
-                let desc = filter
-                    .date_pattern()
-                    .map_or_else(String::new, |(_, d)| d);
+                let desc = filter.date_pattern().map_or_else(String::new, |(_, d)| d);
                 header_lines.push(format!("Use      datepattern : {dp} : {desc}"));
             }
         }
@@ -400,7 +373,6 @@ impl Fail2banRegex {
         Ok(Self {
             opts,
             filter,
-            prefregex_tracker: None,
             pref_matched: 0,
             pref_groups: Vec::new(),
             fail_stats: Vec::new(),
@@ -458,7 +430,10 @@ impl Fail2banRegex {
         if !self.maxlines_set {
             self.filter.set_max_lines(maxlines)?;
             self.maxlines_set = true;
-            self.push_header(format!("Use         maxlines : {}", self.filter.max_lines()));
+            self.push_header(format!(
+                "Use         maxlines : {}",
+                self.filter.max_lines()
+            ));
         }
         Ok(())
     }
@@ -500,8 +475,7 @@ impl Fail2banRegex {
                 reader_cmds = Some(jail.convert(true, true)?);
             }
 
-            if !loaded_jail
-                && let Some(flt_file) = resolve_filter_file(&self.opts.config, flt_name)
+            if !loaded_jail && let Some(flt_file) = resolve_filter_file(&self.opts.config, flt_name)
             {
                 let (base_dir, stem, inside_conf) =
                     classify_filter_file(&self.opts.config, flt_name, &flt_file);
@@ -518,8 +492,7 @@ impl Fail2banRegex {
                     self.push_header(format!("Use   filter options : {flt_opt:?}"));
                 }
                 let mut reader = if inside_conf {
-                    let mut r =
-                        FilterReader::new(&base_dir, &stem, "fail2ban-regex-jail", flt_opt);
+                    let mut r = FilterReader::new(&base_dir, &stem, "fail2ban-regex-jail", flt_opt);
                     if !r.read()? {
                         return Err(Error::config(format!("failed to load filter {value}")));
                     }
@@ -533,8 +506,7 @@ impl Fail2banRegex {
                             .map(|d| d.join(&flt_file))
                             .unwrap_or_else(|_| flt_file.clone())
                     };
-                    let mut r =
-                        FilterReader::new(parent, &stem, "fail2ban-regex-jail", flt_opt);
+                    let mut r = FilterReader::new(parent, &stem, "fail2ban-regex-jail", flt_opt);
                     if !r.read_path(&abs_file)? {
                         return Err(Error::config(format!("failed to load filter {value}")));
                     }
@@ -545,7 +517,7 @@ impl Fail2banRegex {
                 reader_cmds = Some(reader.convert());
             }
         } else if !is_fail && !self.ignore_stats.is_empty() {
-            self.filter.del_ignore_regex(None)?;
+            self.filter.del_ignore_regex(None);
             self.ignore_stats.clear();
         }
 
@@ -644,14 +616,6 @@ impl Fail2banRegex {
             }
         }
 
-        if let Some(pref_pat) = self.filter.prefregex().map(str::to_owned) {
-            self.prefregex_tracker = Some(FailRegex::compile_filter_regex(
-                &pref_pat,
-                self.filter.max_lines() > 1,
-                self.filter.use_dns(),
-            )?);
-        }
-
         Ok(())
     }
 
@@ -676,30 +640,15 @@ impl Fail2banRegex {
                 raw_line
             };
 
-            let mut res = self.filter.process_line_with_info(&line, preset_date);
-
-            // Track prefregex matches separately for summary output.
-            if !is_out
-                && res.date_matched
-                && let Some(ref mut pref) = self.prefregex_tracker
-            {
-                let tuple_line = [(String::new(), String::new(), line.clone())];
-                let buf = FailRegex::tuple_lines_buf(&tuple_line);
-                if pref.search(&buf, &tuple_line) {
-                    self.pref_matched += 1;
-                    if self.opts.verbose > 0 && self.pref_groups.len() < self.display_maxlines {
-                        self.pref_groups.push(pref.groups());
-                    }
+            let res = self.filter.process_line_with_info(&line, preset_date);
+            if !is_out && let Some(groups) = res.pref_groups {
+                self.pref_matched += 1;
+                if self.opts.verbose > 0 && self.pref_groups.len() < self.display_maxlines {
+                    self.pref_groups.push(groups);
                 }
             }
 
             if is_out {
-                // When --out is used on a line without a valid timestamp, Filter::process_line_at
-                // returned missed=true with empty results; match failregex on the raw line so --out emits it.
-                if res.missed && res.results.is_empty() && max_lines <= 1 {
-                    res.results = self.fallback_match_no_date(&line);
-                }
-
                 let ignored = !res.ignored_by_regex.is_empty() || res.ignored_by_ip;
                 let active: Vec<MatchResult> = res
                     .results
@@ -728,7 +677,8 @@ impl Fail2banRegex {
             }
 
             let dbg_line = if self.opts.debuggex {
-                if res.date_matched
+                if max_lines > 1
+                    && res.date_matched
                     && let Some(dt) = self.filter.last_time_text()
                     && let Some(pos) = line.find(dt)
                 {
@@ -792,11 +742,20 @@ impl Fail2banRegex {
                     {
                         self.line_stats.missed = self.line_stats.missed.saturating_sub(1);
                         self.line_stats.matched += 1;
-                        if let Some(mpos) = self.line_stats.missed_lines.iter().position(|s| s == &prev_raw) {
+                        if let Some(mpos) = self
+                            .line_stats
+                            .missed_lines
+                            .iter()
+                            .position(|s| s == &prev_raw)
+                        {
                             self.line_stats.missed_lines.remove(mpos);
                         }
                         if self.opts.debuggex
-                            && let Some(dpos) = self.line_stats.missed_lines_debuggex.iter().position(|s| s == &prev_dbg)
+                            && let Some(dpos) = self
+                                .line_stats
+                                .missed_lines_debuggex
+                                .iter()
+                                .position(|s| s == &prev_dbg)
                         {
                             self.line_stats.missed_lines_debuggex.remove(dpos);
                         }
@@ -844,69 +803,6 @@ impl Fail2banRegex {
         self.elapsed_secs = Some(start.elapsed().as_secs_f64());
     }
 
-    fn fallback_match_no_date(&self, line: &str) -> Vec<MatchResult> {
-        let mut work_lines = vec![(String::new(), String::new(), line.to_owned())];
-        let mut work_buf = FailRegex::tuple_lines_buf(&work_lines);
-        let mut pref_groups = BTreeMap::new();
-
-        if let Some(pref_pat) = self.filter.prefregex()
-            && let Ok(mut pref) =
-                FailRegex::compile_filter_regex(pref_pat, false, self.filter.use_dns())
-        {
-            if !pref.search(&work_buf, &work_lines) {
-                return Vec::new();
-            }
-            pref_groups = pref.groups();
-            if let Some(content) = pref_groups.remove("content") {
-                work_lines = vec![(String::new(), String::new(), content)];
-                work_buf = FailRegex::tuple_lines_buf(&work_lines);
-            }
-        }
-
-        for ig_pat in self.filter.ignore_regexes() {
-            if let Ok(mut ig) =
-                FailRegex::compile_filter_regex(&ig_pat, false, self.filter.use_dns())
-                && ig.search(&work_buf, &work_lines)
-            {
-                return Vec::new();
-            }
-        }
-
-        for (idx, pat) in self.filter.fail_regexes().into_iter().enumerate() {
-            if let Ok(mut rx) = FailRegex::compile_filter_regex(&pat, false, self.filter.use_dns())
-                && rx.search(&work_buf, &work_lines)
-            {
-                let mut data = pref_groups;
-                for (k, v) in rx.groups() {
-                    data.insert(k, v);
-                }
-                if data.contains_key("nofail") {
-                    return Vec::new();
-                }
-                let fid = data
-                    .get("fid")
-                    .or_else(|| data.get("ip4"))
-                    .or_else(|| data.get("ip6"))
-                    .or_else(|| data.get("dns"))
-                    .map(|s| crate::ticket::TicketId::parse(s));
-                let ip = data
-                    .get("ip4")
-                    .or_else(|| data.get("ip6"))
-                    .or_else(|| data.get("dns"))
-                    .map(|s| crate::ticket::TicketId::parse(s));
-                return vec![MatchResult {
-                    regex_idx: idx,
-                    fid,
-                    ip,
-                    time: self.filter.last_date(),
-                    matches: vec![line.to_owned()],
-                    data,
-                }];
-            }
-        }
-        Vec::new()
-    }
-
     fn emit_out_results(&self, results: &[MatchResult], emit: &mut dyn FnMut(&str)) {
         let Some(ofmt) = self.opts.out.as_deref() else {
             return;
@@ -924,14 +820,13 @@ impl Fail2banRegex {
                     emit(&s);
                 }
                 "ip" => {
-                    let s = m
-                        .ip
-                        .as_ref()
-                        .or(m.fid.as_ref())
-                        .map(ToString::to_string)
-                        .or_else(|| m.data.get("ip4").cloned())
-                        .or_else(|| m.data.get("ip6").cloned())
-                        .unwrap_or_default();
+                    let s =
+                        m.ip.as_ref()
+                            .or(m.fid.as_ref())
+                            .map(ToString::to_string)
+                            .or_else(|| m.data.get("ip4").cloned())
+                            .or_else(|| m.data.get("ip6").cloned())
+                            .unwrap_or_default();
                     emit(&s);
                 }
                 "msg" => {
@@ -960,19 +855,6 @@ impl Fail2banRegex {
                     );
                     emit(&row);
                 }
-                "json" => {
-                    let obj = serde_json::json!({
-                        "regex_idx": m.regex_idx,
-                        "fid": m.fid.as_ref().map(ToString::to_string),
-                        "ip": m.ip.as_ref().map(ToString::to_string),
-                        "time": m.time,
-                        "matches": m.matches,
-                        "data": m.data,
-                    });
-                    if let Ok(line) = serde_json::to_string(&obj) {
-                        emit(&line);
-                    }
-                }
                 _ if ofmt.contains('<') => {
                     for line in format_out_tags(ofmt, m) {
                         emit(&line);
@@ -982,7 +864,10 @@ impl Fail2banRegex {
                     let val = if other == "matches" {
                         m.matches.join("\n")
                     } else {
-                        m.data.get(other).cloned().unwrap_or_else(|| "None".to_owned())
+                        m.data
+                            .get(other)
+                            .cloned()
+                            .unwrap_or_else(|| "None".to_owned())
                     };
                     emit(&val);
                 }
@@ -995,11 +880,12 @@ impl Fail2banRegex {
         if self.opts.out.is_some() {
             return String::new();
         }
-        let mut lines = Vec::new();
-        lines.push(String::new());
-        lines.push("Running tests".to_owned());
-        lines.push("=============".to_owned());
-        lines.push(String::new());
+        let mut lines = vec![
+            String::new(),
+            "Running tests".to_owned(),
+            "=============".to_owned(),
+            String::new(),
+        ];
         lines.extend(self.header_lines.iter().cloned());
         lines.push(String::new());
 
@@ -1020,7 +906,12 @@ impl Fail2banRegex {
         }
 
         render_regex_section("Failregex", &self.fail_stats, self.opts.verbose, &mut lines);
-        render_regex_section("Ignoreregex", &self.ignore_stats, self.opts.verbose, &mut lines);
+        render_regex_section(
+            "Ignoreregex",
+            &self.ignore_stats,
+            self.opts.verbose,
+            &mut lines,
+        );
 
         let templates = self.filter.date_detector().templates_info();
         lines.push(String::new());
@@ -1150,12 +1041,7 @@ impl Fail2banRegex {
     }
 
     /// Execute the full `fail2ban-regex` run against `<LOG>`, `<REGEX>`, and optional `[IGNOREREGEX]`.
-    pub fn run(
-        &mut self,
-        log_arg: &str,
-        regex_arg: &str,
-        ignore_arg: Option<&str>,
-    ) -> Result<()> {
+    pub fn run(&mut self, log_arg: &str, regex_arg: &str, ignore_arg: Option<&str>) -> Result<()> {
         if log_arg.starts_with("systemd-journal") {
             self.set_backend("systemd");
         }
@@ -1167,7 +1053,10 @@ impl Fail2banRegex {
 
         let entries: Vec<(String, Option<f64>)> = if Path::new(log_arg).is_file() {
             self.push_header(format!("Use         log file : {log_arg}"));
-            self.push_header(format!("Use         encoding : {}", self.opts.encoding));
+            self.push_header(format!(
+                "Use         encoding : {}",
+                self.filter.log_encoding_name()
+            ));
             read_log_file_lines(Path::new(log_arg), self.encoding)?
                 .into_iter()
                 .map(|l| (l, None))
@@ -1177,7 +1066,10 @@ impl Fail2banRegex {
                 self.filter.date_detector_mut().clear();
             }
             self.push_header("Use         systemd journal".to_owned());
-            self.push_header(format!("Use         encoding : {}", self.opts.encoding));
+            self.push_header(format!(
+                "Use         encoding : {}",
+                self.filter.log_encoding_name()
+            ));
             let jcfg = build_journal_config(log_arg, &self.journal_matches)?;
             if !jcfg.matches.is_empty() {
                 let joined = jcfg
@@ -1188,7 +1080,7 @@ impl Fail2banRegex {
                     .join(" + ");
                 self.push_header(format!("Use    journal match : {joined}"));
             }
-            read_journal_entries(&jcfg, self.encoding.filter_encoding())?
+            read_journal_entries(&jcfg, self.encoding)?
         } else if self.filter.max_lines() <= 1 && !log_arg.contains('\n') {
             self.push_header(format!(
                 "Use      single line : {}",
@@ -1197,10 +1089,7 @@ impl Fail2banRegex {
             vec![(log_arg.to_owned(), None)]
         } else {
             let split: Vec<String> = log_arg.split('\n').map(str::to_owned).collect();
-            self.push_header(format!(
-                "Use      multi line : {} line(s)",
-                split.len()
-            ));
+            self.push_header(format!("Use      multi line : {} line(s)", split.len()));
             for (i, l) in split.iter().enumerate() {
                 if i >= 5 {
                     self.push_header("| ...".to_owned());
@@ -1224,10 +1113,17 @@ impl Fail2banRegex {
     }
 }
 
-/// Entrypoint called by `src/bin/fail2ban-regex.rs` (returns exit code `0` or `255`).
+/// Entrypoint called by `src/bin/fail2ban-regex.rs` (returns exit code `0`, `2`, or `255`).
 pub fn run_cli(args: Vec<String>) -> i32 {
     let action = match parse_cli(&args) {
         Ok(a) => a,
+        Err(Error::Value(e)) => {
+            let _ = writeln!(
+                io::stderr(),
+                "Usage: fail2ban-regex [OPTIONS] <LOG> <REGEX> [IGNOREREGEX]\n\nfail2ban-regex: error: {e}"
+            );
+            return 2;
+        }
         Err(e) => {
             disp_help();
             let _ = writeln!(io::stderr(), "\n{e}");
@@ -1257,7 +1153,7 @@ pub fn run_cli(args: Vec<String>) -> i32 {
             if let Ok(lvl) = LogLevel::parse(&opts.log_level) {
                 set_level(lvl);
             }
-            let mut runner = match Fail2banRegex::new(opts) {
+            let mut runner = match Fail2banRegex::new(*opts) {
                 Ok(r) => r,
                 Err(e) => {
                     output(&format!("ERROR: {e}"));
@@ -1265,6 +1161,12 @@ pub fn run_cli(args: Vec<String>) -> i32 {
                 }
             };
             if let Err(e) = runner.run(&log, &regex, ignore_regex.as_deref()) {
+                if runner.opts.out.is_none() && !runner.header_lines.is_empty() {
+                    output("\nRunning tests\n=============\n");
+                    for line in &runner.header_lines {
+                        output(line);
+                    }
+                }
                 output(&format!("ERROR: {e}"));
                 return 255;
             }
@@ -1321,7 +1223,8 @@ fn looks_like_filter_spec(value: &str) -> bool {
     if value.contains('[') && !value.trim_end().ends_with(']') {
         return false;
     }
-    let without_slashes = head.strip_prefix("///")
+    let without_slashes = head
+        .strip_prefix("///")
         .or_else(|| head.strip_prefix("//"))
         .or_else(|| head.strip_prefix('/'))
         .unwrap_or(head);
@@ -1332,11 +1235,7 @@ fn looks_like_filter_spec(value: &str) -> bool {
 }
 
 fn resolve_filter_file(config_dir: &Path, flt_name: &str) -> Option<PathBuf> {
-    let has_ext = flt_name
-        .chars()
-        .rev()
-        .take(6)
-        .any(|c| c == '.');
+    let has_ext = flt_name.chars().rev().take(6).any(|c| c == '.');
     let candidates: Vec<String> = if has_ext {
         vec![flt_name.to_owned()]
     } else {
@@ -1367,9 +1266,14 @@ fn resolve_filter_file(config_dir: &Path, flt_name: &str) -> Option<PathBuf> {
     None
 }
 
-fn classify_filter_file(config_dir: &Path, flt_name: &str, flt_file: &Path) -> (PathBuf, String, bool) {
+fn classify_filter_file(
+    config_dir: &Path,
+    flt_name: &str,
+    flt_file: &Path,
+) -> (PathBuf, String, bool) {
     let is_filter_d = config_dir.file_name().is_some_and(|n| n == "filter.d");
-    let no_slash_short = !flt_name.contains('/') && !flt_name.ends_with(".conf") && !flt_name.ends_with(".local");
+    let no_slash_short =
+        !flt_name.contains('/') && !flt_name.ends_with(".conf") && !flt_name.ends_with(".local");
     let under_filter_d = flt_file
         .parent()
         .is_some_and(|p| p == config_dir.join("filter.d") || (is_filter_d && p == config_dir));
@@ -1424,6 +1328,8 @@ fn build_journal_config(log_arg: &str, matches: &[Vec<String>]) -> Result<Journa
         matches: matches.to_vec(),
         flags: None,
         path: None,
+        files: Vec::new(),
+        namespace: None,
     };
     if log_arg.contains('[') {
         let parsed = spec::parse(log_arg)?;
@@ -1432,6 +1338,15 @@ fn build_journal_config(log_arg: &str, matches: &[Vec<String>]) -> Result<Journa
         }
         if let Some(path_str) = parsed.parameters.get("journalpath") {
             cfg.path = Some(PathBuf::from(path_str));
+        }
+        if let Some(files_str) = parsed.parameters.get("journalfiles") {
+            cfg.files = expand_journal_files(files_str);
+        }
+        if let Some(ns_str) = parsed.parameters.get("namespace") {
+            let ns = ns_str.trim();
+            if !ns.is_empty() {
+                cfg.namespace = Some(ns.to_owned());
+            }
         }
         if cfg.matches.is_empty()
             && let Some(jm) = parsed.parameters.get("journalmatch")
@@ -1442,7 +1357,10 @@ fn build_journal_config(log_arg: &str, matches: &[Vec<String>]) -> Result<Journa
     Ok(cfg)
 }
 
-fn read_journal_entries(cfg: &JournalConfig, encoding: LogEncoding) -> Result<Vec<(String, Option<f64>)>> {
+fn read_journal_entries(
+    cfg: &JournalConfig,
+    encoding: LogEncoding,
+) -> Result<Vec<(String, Option<f64>)>> {
     let mut args = build_journalctl_args(cfg, None, false);
     args.retain(|a| a != "--follow");
     let out = Command::new("journalctl")
@@ -1470,49 +1388,39 @@ fn read_journal_entries(cfg: &JournalConfig, encoding: LogEncoding) -> Result<Ve
     Ok(entries)
 }
 
-fn read_log_file_lines(path: &Path, encoding: FileEncoding) -> Result<Vec<String>> {
-    let mut file = File::open(path).map_err(|e| Error::io(format!("opening {}", path.display()), e))?;
-    match encoding {
-        FileEncoding::Filter(enc) => {
-            let mut reader = BufReader::new(file);
-            let mut buf = Vec::new();
-            let mut lines = Vec::new();
-            loop {
-                buf.clear();
-                let n = reader
-                    .read_until(b'\n', &mut buf)
-                    .map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
-                if n == 0 {
-                    break;
-                }
-                if buf.ends_with(b"\n") {
-                    buf.pop();
-                }
-                if buf.ends_with(b"\r") {
-                    buf.pop();
-                }
-                lines.push(enc.decode(&buf));
-            }
-            Ok(lines)
-        }
-        FileEncoding::Utf16Be | FileEncoding::Utf16Le => {
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)
+fn read_log_file_lines(path: &Path, encoding: LogEncoding) -> Result<Vec<String>> {
+    let mut file =
+        File::open(path).map_err(|e| Error::io(format!("opening {}", path.display()), e))?;
+    if !encoding.is_utf16() {
+        let mut reader = BufReader::new(file);
+        let mut buf = Vec::new();
+        let mut lines = Vec::new();
+        loop {
+            buf.clear();
+            let n = reader
+                .read_until(b'\n', &mut buf)
                 .map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
-            let units: Vec<u16> = raw
-                .chunks_exact(2)
-                .map(|pair| match encoding {
-                    FileEncoding::Utf16Be => u16::from_be_bytes([pair[0], pair[1]]),
-                    FileEncoding::Utf16Le => u16::from_le_bytes([pair[0], pair[1]]),
-                    FileEncoding::Filter(_) => 0,
-                })
-                .collect();
-            let text = String::from_utf16_lossy(&units);
-            Ok(text
-                .split('\n')
-                .map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned())
-                .collect())
+            if n == 0 {
+                break;
+            }
+            if buf.ends_with(b"\n") {
+                buf.pop();
+            }
+            if buf.ends_with(b"\r") {
+                buf.pop();
+            }
+            lines.push(encoding.decode(&buf));
         }
+        Ok(lines)
+    } else {
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
+        let text = encoding.decode(&raw);
+        Ok(text
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned())
+            .collect())
     }
 }
 
@@ -1562,11 +1470,7 @@ fn substitute_tags(template: &str, m: &MatchResult, has_msg_multiline: &mut bool
     out
 }
 
-fn resolve_out_tag(
-    name: &str,
-    m: &MatchResult,
-    has_msg_multiline: &mut bool,
-) -> Option<String> {
+fn resolve_out_tag(name: &str, m: &MatchResult, has_msg_multiline: &mut bool) -> Option<String> {
     let target = m.ip.as_ref().or(m.fid.as_ref());
     match name {
         "ip" | "IP" => Some(target.map_or_else(String::new, ToString::to_string)),
@@ -1602,9 +1506,9 @@ fn resolve_out_tag(
         _ => {
             let suffix = name.strip_prefix("F-")?;
             if suffix.is_empty()
-                || !suffix
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+                || !suffix.bytes().all(|b| {
+                    b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
+                })
             {
                 return None;
             }
@@ -1625,12 +1529,7 @@ fn resolve_out_tag(
     }
 }
 
-fn render_regex_section(
-    title: &str,
-    stats: &[RegexStat],
-    verbose: i32,
-    out: &mut Vec<String>,
-) {
+fn render_regex_section(title: &str, stats: &[RegexStat], verbose: i32, out: &mut Vec<String>) {
     let mut total = 0usize;
     let mut items = Vec::new();
     for (idx, st) in stats.iter().enumerate() {
@@ -1641,7 +1540,11 @@ fn render_regex_section(
         if verbose > 0 {
             for (id, ts, multi) in &st.matches {
                 let ts_str = format_ctime(*ts);
-                let suffix = if *multi { " (multiple regex matched)" } else { "" };
+                let suffix = if *multi {
+                    " (multiple regex matched)"
+                } else {
+                    ""
+                };
                 items.push(format!("    {id}  {ts_str}{suffix}"));
             }
         }
@@ -1698,7 +1601,9 @@ fn disp_help() {
     output("");
     output("REGEX:");
     output("  string                a string representing a 'failregex'");
-    output("  filter                name of jail or filter, optionally with options (sshd[mode=aggressive])");
+    output(
+        "  filter                name of jail or filter, optionally with options (sshd[mode=aggressive])",
+    );
     output("  filename              path to a filter file (filter.d/sshd.conf)");
     output("");
     output("IGNOREREGEX:");
@@ -1730,7 +1635,9 @@ fn disp_help() {
     output("  --verbose-date, --VD  Verbose date patterns/regex in output");
     output("  -D, --debuggex        Produce debuggex.com urls for debugging there");
     output("  --no-check-all        Disable check for all regex's");
-    output("  -o OUT, --out=OUT     Set token to print failure information only (row, id, ip, msg, host, ip4, ip6, dns, matches, ...)");
+    output(
+        "  -o OUT, --out=OUT     Set token to print failure information only (row, id, ip, msg, host, ip4, ip6, dns, matches, ...)",
+    );
     output("  -i, --invert          Invert the sense of matching, to output non-matching lines.");
     output("  --print-no-missed     Do not print any missed lines");
     output("  --print-no-ignored    Do not print any ignored lines");
@@ -1738,7 +1645,9 @@ fn disp_help() {
     output("  --print-all-missed    Print all missed lines, no matter how many");
     output("  --print-all-ignored   Print all ignored lines, no matter how many");
     output("  -t, --log-traceback   Enrich log-messages with compressed tracebacks");
-    output("  --full-traceback      Either to make the tracebacks full, not compressed (as by default)");
+    output(
+        "  --full-traceback      Either to make the tracebacks full, not compressed (as by default)",
+    );
     output("");
     output("Report bugs to https://github.com/fail2ban/fail2ban/issues");
 }
@@ -1805,16 +1714,26 @@ mod tests {
             parse_cli(&argv(&["-V"])).unwrap(),
             RegexCliAction::Version { short: true }
         );
-        assert!(parse_cli(&argv(&["--print-no-missed", "--print-all-missed", "a", "b"])).is_err());
+        assert!(
+            parse_cli(&argv(&[
+                "--print-no-missed",
+                "--print-all-missed",
+                "a",
+                "b"
+            ]))
+            .is_err()
+        );
         assert!(parse_cli(&argv(&["only-one"])).is_err());
     }
 
     #[test]
     fn inline_regex_stats_ignore_and_report() {
-        let mut opts = RegexCliOptions::default();
-        opts.datepattern = Some(r"^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?".to_owned());
-        opts.print_all_matched = true;
-        opts.print_all_ignored = true;
+        let opts = RegexCliOptions {
+            datepattern: Some(r"^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?".to_owned()),
+            print_all_matched: true,
+            print_all_ignored: true,
+            ..RegexCliOptions::default()
+        };
 
         let mut runner = Fail2banRegex::new(opts).unwrap();
         let logs = concat!(
@@ -1848,11 +1767,18 @@ mod tests {
     }
 
     #[test]
-    fn out_modes_tags_row_json_and_invert() {
-        let mut opts = RegexCliOptions::default();
-        opts.out = Some("<ip>, <F-USER>, <family>".to_owned());
+    fn out_modes_tags_row_unknown_and_invert() {
+        let opts = RegexCliOptions {
+            out: Some("<ip>, <F-USER>, <family>".to_owned()),
+            ..RegexCliOptions::default()
+        };
         let mut runner = Fail2banRegex::new(opts).unwrap();
-        runner.read_regex(r"Authentication failure for <F-USER>.*?</F-USER> from <ADDR>$", true).unwrap();
+        runner
+            .read_regex(
+                r"Authentication failure for <F-USER>.*?</F-USER> from <ADDR>$",
+                true,
+            )
+            .unwrap();
 
         let mut emitted = Vec::new();
         runner.process_entries(
@@ -1864,12 +1790,17 @@ mod tests {
         );
         assert_eq!(emitted, vec!["192.0.2.0, kevin, inet4"]);
 
-        let mut inv_opts = RegexCliOptions::default();
-        inv_opts.out = Some("msg".to_owned());
-        inv_opts.invert = true;
+        let inv_opts = RegexCliOptions {
+            out: Some("msg".to_owned()),
+            invert: true,
+            ..RegexCliOptions::default()
+        };
         let mut inv_runner = Fail2banRegex::new(inv_opts).unwrap();
         inv_runner
-            .read_regex(r"Authentication failure for <F-USER>.*?</F-USER> from <ADDR>$", true)
+            .read_regex(
+                r"Authentication failure for <F-USER>.*?</F-USER> from <ADDR>$",
+                true,
+            )
             .unwrap();
         let mut inv_out = Vec::new();
         inv_runner.process_entries(
@@ -1881,8 +1812,11 @@ mod tests {
         );
         assert_eq!(inv_out, vec!["Dec 31 12:00:00 [sshd] ok line"]);
 
-        let mut json_opts = RegexCliOptions::default();
-        json_opts.out = Some("json".to_owned());
+        // Upstream 1.1.1 has no special `--out=json` branch; unknown keys print `None`.
+        let json_opts = RegexCliOptions {
+            out: Some("json".to_owned()),
+            ..RegexCliOptions::default()
+        };
         let mut json_runner = Fail2banRegex::new(json_opts).unwrap();
         json_runner.read_regex(r"from <HOST>$", true).unwrap();
         let mut json_out = Vec::new();
@@ -1890,8 +1824,7 @@ mod tests {
             vec![("Dec 31 11:59:59 bad from 192.0.2.5".to_owned(), None)],
             &mut |s| json_out.push(s.to_owned()),
         );
-        let parsed: serde_json::Value = serde_json::from_str(&json_out[0]).unwrap();
-        assert_eq!(parsed["ip"], "192.0.2.5");
+        assert_eq!(json_out, vec!["None"]);
     }
 
     #[test]
@@ -1901,47 +1834,56 @@ mod tests {
         std::fs::create_dir_all(&filter_d).unwrap();
         std::fs::write(
             filter_d.join("demo.conf"),
-            "[Definition]\nmode = normal\nfailregex = ^\\s*bad <mode> from <HOST>$\nignoreregex = ^\\s*bad .* from 192\\.0\\.2\\.99$\n",
+            "[Definition]\nmode = normal\nprefregex = ^\\s*<F-CONTENT>bad .+</F-CONTENT>$\nfailregex = ^\\s*bad <mode> from <HOST>$\nignoreregex = ^\\s*bad .* from 192\\.0\\.2\\.99$\n",
         )
         .unwrap();
 
-        let mut opts = RegexCliOptions::default();
-        opts.config = dir.path().to_path_buf();
-        opts.datepattern = Some("EPOCH".to_owned());
-        opts.debuggex = true;
-        opts.print_all_matched = true;
+        let opts = RegexCliOptions {
+            config: dir.path().to_path_buf(),
+            datepattern: Some("EPOCH".to_owned()),
+            debuggex: true,
+            print_all_matched: true,
+            ..RegexCliOptions::default()
+        };
 
         let log_path = dir.path().join("demo.log");
         std::fs::write(
             &log_path,
-            "1700000000 bad strict from 192.0.2.1\n1700000001 bad strict from 192.0.2.99\n1700000002 benign\n",
+            "1700000000 bad strict from 192.0.2.1\n1700000001 bad strict from 192.0.2.99\n1700000002 benign\nbad strict from 192.0.2.2\n",
         )
         .unwrap();
 
         let mut runner = Fail2banRegex::new(opts).unwrap();
         runner
-            .run(
-                log_path.to_str().unwrap(),
-                "demo[mode=strict]",
-                None,
-            )
+            .run(log_path.to_str().unwrap(), "demo[mode=strict]", None)
             .unwrap();
 
-        assert_eq!(runner.stats().tested, 3);
-        assert_eq!(runner.stats().matched, 1);
+        assert_eq!(runner.stats().tested, 4);
+        assert_eq!(runner.stats().matched, 2);
         assert_eq!(runner.stats().ignored, 1);
         assert_eq!(runner.stats().missed, 1);
+        assert!(runner.render_report().contains("Prefregex: 3 total"));
 
-        let url = debuggex_url("bad strict from 192.0.2.1", "^bad strict from <HOST>$", false, UseDns::No);
+        let url = debuggex_url(
+            "bad strict from 192.0.2.1",
+            "^bad strict from <HOST>$",
+            false,
+            UseDns::No,
+        );
         assert!(url.starts_with("https://www.debuggex.com/?re="));
         assert!(url.contains("&flavor=python"));
-        assert!(runner.render_report().contains("https://www.debuggex.com/?"));
+        assert!(
+            runner
+                .render_report()
+                .contains("https://www.debuggex.com/?")
+        );
     }
 
     #[test]
     fn multiline_skiplines_backcredits_missed_and_out_row_formats() {
         let dp = Some(r"^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?".to_owned());
-        let rx = r"\[sshd\] step1 user=<F-USER>\S+</F-USER><SKIPLINES>\s*\[sshd\] step2 from <HOST>$";
+        let rx =
+            r"\[sshd\] step1 user=<F-USER>\S+</F-USER><SKIPLINES>\s*\[sshd\] step2 from <HOST>$";
         let logs = concat!(
             "Dec 31 11:59:59 [sshd] step1 user=bob\n",
             "Dec 31 11:59:59 [sshd] noise in middle\n",
@@ -1949,11 +1891,13 @@ mod tests {
             "Dec 31 11:59:59 [sshd] step2 from 192.0.2.55\n",
         );
 
-        let mut opts = RegexCliOptions::default();
-        opts.datepattern = dp.clone();
-        opts.maxlines = 5;
-        opts.debuggex = true;
-        opts.print_all_matched = true;
+        let opts = RegexCliOptions {
+            datepattern: dp.clone(),
+            maxlines: 5,
+            debuggex: true,
+            print_all_matched: true,
+            ..RegexCliOptions::default()
+        };
 
         let mut runner = Fail2banRegex::new(opts).unwrap();
         runner.run(logs, rx, None).unwrap();
@@ -1968,14 +1912,17 @@ mod tests {
         assert!(report.contains("[sshd] step1 user=bob"));
         assert!(report.contains("[sshd] step2 from 192.0.2.55"));
 
-        let mut row_opts = RegexCliOptions::default();
-        row_opts.datepattern = dp;
-        row_opts.maxlines = 5;
-        row_opts.out = Some("row".to_owned());
+        let row_opts = RegexCliOptions {
+            datepattern: dp,
+            maxlines: 5,
+            out: Some("row".to_owned()),
+            ..RegexCliOptions::default()
+        };
 
         let mut row_runner = Fail2banRegex::new(row_opts).unwrap();
         row_runner.read_regex(rx, true).unwrap();
-        let entries: Vec<(String, Option<f64>)> = logs.lines().map(|l| (l.to_owned(), None)).collect();
+        let entries: Vec<(String, Option<f64>)> =
+            logs.lines().map(|l| (l.to_owned(), None)).collect();
         let mut emitted = Vec::new();
         row_runner.process_entries(entries, &mut |s| emitted.push(s.to_owned()));
 

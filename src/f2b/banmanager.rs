@@ -144,7 +144,13 @@ impl BanManager {
         let mut items: Vec<(&TicketId, f64, u64)> = self
             .ban_list
             .iter()
-            .map(|(id, entry)| (id, comparison_end(&entry.ticket, self.ban_time), entry.insertion))
+            .map(|(id, entry)| {
+                (
+                    id,
+                    comparison_end(&entry.ticket, self.ban_time),
+                    entry.insertion,
+                )
+            })
             .collect();
         if ordered {
             items.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
@@ -376,7 +382,10 @@ mod tests {
         assert_eq!(bm.add_ban_ticket(tb, 60.0), AddBanOutcome::Added);
         assert_eq!(bm.add_ban_ticket(tc, 70.0), AddBanOutcome::Added);
 
-        assert_eq!(bm.get_ban_list(false), vec![a.clone(), b.clone(), c.clone()]);
+        assert_eq!(
+            bm.get_ban_list(false),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
         assert_eq!(bm.get_ban_list(true), vec![b.clone(), a.clone(), c.clone()]);
 
         let ext = bm.get_ban_list_extended(true);
@@ -420,7 +429,10 @@ mod tests {
 
         let removed_subnet = bm.remove_matching(&id("192.0.2.0/24"));
         assert_eq!(
-            removed_subnet.into_iter().map(|t| t.fid).collect::<Vec<_>>(),
+            removed_subnet
+                .into_iter()
+                .map(|t| t.fid)
+                .collect::<Vec<_>>(),
             vec![ip1, ip2]
         );
         assert_eq!(bm.size(), 1);

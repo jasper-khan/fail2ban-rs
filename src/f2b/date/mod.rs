@@ -76,7 +76,7 @@ pub struct TemplateInfo {
 }
 
 /// Adaptive date detector matching Fail2Ban 1.1.1 `DateDetector`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DateDetector {
     templates: Vec<DateTemplate>,
     default_tz: Option<i32>,
@@ -138,6 +138,9 @@ impl DateDetector {
     /// primary pattern representation (matching `get datepattern`).
     pub fn date_pattern(&self) -> Option<(Option<String>, String)> {
         let pat = self.pattern.as_ref()?;
+        if self.templates.len() > 2 {
+            return Some((None, "Default Detectors".to_owned()));
+        }
         let desc = self
             .templates
             .first()
@@ -184,6 +187,10 @@ impl DateDetector {
                 self.add_default_template()?;
                 continue;
             }
+            if trimmed == "{^LN-BEG}" {
+                self.add_builtin_templates(true)?;
+                continue;
+            }
             if trimmed.contains("{DATE}") {
                 self.append_date_macro_templates(raw_line)?;
                 continue;
@@ -201,6 +208,10 @@ impl DateDetector {
     /// (`weight = 100.0`) followed by 14 unanchored copies (`weight = 0.0`).
     /// Calling this when defaults are already loaded is a no-op.
     pub fn add_default_template(&mut self) -> Result<()> {
+        self.add_builtin_templates(false)
+    }
+
+    fn add_builtin_templates(&mut self, line_begin_only: bool) -> Result<()> {
         if self.has_defaults {
             return Ok(());
         }
@@ -211,23 +222,28 @@ impl DateDetector {
             let already_anchored = raw.starts_with("{^LN-BEG}") || raw.starts_with('^');
             if already_anchored {
                 let mut tmpl = DateTemplate::from_pattern(raw)?;
-                tmpl.weight = LINE_BEGIN_WEIGHT;
-                anchored.push(tmpl);
+                if line_begin_only {
+                    tmpl.weight = LINE_BEGIN_WEIGHT;
+                    anchored.push(tmpl);
+                } else {
+                    unanchored.push(tmpl);
+                }
             } else {
                 let ln_pat = format!("{{^LN-BEG}}{raw}");
                 let mut ln_tmpl = DateTemplate::from_pattern(&ln_pat)?;
                 ln_tmpl.weight = LINE_BEGIN_WEIGHT;
                 anchored.push(ln_tmpl);
 
-                let unb_tmpl = DateTemplate::from_pattern(raw)?;
-                unanchored.push(unb_tmpl);
+                if !line_begin_only {
+                    unanchored.push(DateTemplate::from_pattern(raw)?);
+                }
             }
         }
 
         self.templates.extend(anchored);
         self.templates.extend(unanchored);
         self.sort_templates_stable();
-        self.has_defaults = true;
+        self.has_defaults = !line_begin_only;
         Ok(())
     }
 
@@ -248,7 +264,7 @@ impl DateDetector {
                 if let Some(rest) = u.strip_prefix('^') {
                     u = rest.to_owned();
                 }
-                format!("({u})")
+                u
             };
 
             let expanded = wrapper.replace("{DATE}", &sub_body);
@@ -448,7 +464,7 @@ mod tests {
         let line = "[tag] 2024-05-14 08:30:15 message";
         let (ts, s, e) = dd.get_time(line).unwrap();
         assert!(ts > 1_715_000_000.0);
-        assert!(line[s..e].contains("2024-05-14 08:30:15"));
+        assert_eq!(&line[s..e], "[tag] 2024-05-14 08:30:15");
 
         let mut dd_none = DateDetector::new();
         dd_none.append_template("{NONE}").unwrap();
@@ -459,6 +475,17 @@ mod tests {
         let mut dd_def = DateDetector::new();
         dd_def.append_template("{DEFAULT}").unwrap();
         assert_eq!(dd_def.len(), 31);
+
+        let mut anchored = DateDetector::new();
+        anchored.append_template("{^LN-BEG}").unwrap();
+        let line = "2012/04/09 11:53:29 [error] nginx";
+        let (_, start, end) = anchored.get_time(line).unwrap();
+        assert_eq!(&line[start..end], "2012/04/09 11:53:29");
+        assert!(
+            anchored
+                .get_time("prefix 2012/04/09 11:53:29 [error]")
+                .is_none()
+        );
     }
 
     #[test]

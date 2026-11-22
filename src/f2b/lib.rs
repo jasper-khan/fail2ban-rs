@@ -14,6 +14,7 @@ pub mod logging;
 pub mod observer;
 pub mod protocol;
 pub mod regex_tool;
+pub mod server;
 pub mod ticket;
 
 pub const VERSION: &str = "1.1.1";

@@ -1,292 +1,124 @@
-#!/bin/bash
-# fail2ban-rs installer
-#
-# Downloads a prebuilt binary from GitHub Releases and installs it as a
-# systemd service. Must be run as root.
-#
-# Install:
-#   curl -sSfL https://raw.githubusercontent.com/aejimmi/fail2ban-rs/main/scripts/install.sh | bash
-#
-# Install specific version:
-#   curl -sSfL https://raw.githubusercontent.com/aejimmi/fail2ban-rs/main/scripts/install.sh | FAIL2BAN_VERSION=0.1.0 bash
-#
-# Uninstall:
-#   curl -sSfL https://raw.githubusercontent.com/aejimmi/fail2ban-rs/main/scripts/install.sh | bash -s -- --uninstall
-#
-# Environment:
-#   FAIL2BAN_VERSION         — version to install (default: latest release)
-#   FAIL2BAN_SKIP_CHECKSUM   — set to 1 to skip checksum verification
-
+#!/usr/bin/env bash
 set -euo pipefail
 
-REPO="aejimmi/fail2ban-rs"
-BINARY_NAME="fail2ban-rs"
-INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/fail2ban-rs"
-SERVICE_NAME="fail2ban-rs"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+die() { printf '%s\n' "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-error() { echo -e "${RED}error:${NC} $1" >&2; exit 1; }
-warn()  { echo -e "${YELLOW}warning:${NC} $1"; }
-info()  { echo -e "${GREEN}::${NC} $1"; }
-bold()  { echo -e "${BOLD}$1${NC}"; }
-
-cleanup() {
-    [ -n "${WORK_DIR:-}" ] && rm -rf "$WORK_DIR"
-}
-
-# ---------------------------------------------------------------------------
-# Checks
-# ---------------------------------------------------------------------------
-
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        error "This installer must be run as root. Use: sudo bash install.sh"
-    fi
-}
-
-check_linux() {
-    case "$(uname -s)" in
-        Linux) ;;
-        *) error "fail2ban-rs only supports Linux (got: $(uname -s))" ;;
-    esac
-}
-
-check_deps() {
-    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-        error "curl or wget is required"
-    fi
-    if ! command -v tar &>/dev/null; then
-        error "tar is required"
-    fi
-    if ! command -v systemctl &>/dev/null; then
-        error "systemd is required (systemctl not found)"
-    fi
-}
-
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64)   echo "amd64" ;;
-        aarch64|arm64)  echo "arm64" ;;
-        *) error "Unsupported architecture: $(uname -m). Supported: x86_64, aarch64" ;;
-    esac
-}
-
-check_firewall() {
-    if command -v nft &>/dev/null; then
-        info "Detected firewall backend: nftables"
-    elif command -v iptables &>/dev/null; then
-        warn "nftables not found — you may need to set backend = \"iptables\" in config"
-    else
-        warn "Neither nft nor iptables found — firewall commands will fail"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Version detection
-# ---------------------------------------------------------------------------
-
-get_version() {
-    if [ -n "${FAIL2BAN_VERSION:-}" ]; then
-        echo "$FAIL2BAN_VERSION"
-        return
-    fi
-
-    local version
-    if command -v curl &>/dev/null; then
-        version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-    else
-        version=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-    fi
-
-    if [ -z "$version" ]; then
-        error "Failed to determine latest version. Set FAIL2BAN_VERSION=x.y.z and retry."
-    fi
-    if ! echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-        error "Parsed invalid version '$version'. Set FAIL2BAN_VERSION=x.y.z and retry."
-    fi
-    echo "$version"
-}
-
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
-
-download() {
-    local url="$1" dest="$2"
-    if command -v curl &>/dev/null; then
-        curl -fSL --progress-bar -o "$dest" "$url"
-    else
-        wget --show-progress -qO "$dest" "$url"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Uninstall
-# ---------------------------------------------------------------------------
-
-do_uninstall() {
-    check_root
-    bold "Uninstalling fail2ban-rs..."
-
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        info "Stopping service..."
-        systemctl stop "$SERVICE_NAME"
-    fi
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-        systemctl disable "$SERVICE_NAME"
-    fi
-
-    [ -f "$SERVICE_FILE" ] && rm -f "$SERVICE_FILE" && info "Removed $SERVICE_FILE"
-    [ -f "${INSTALL_DIR}/${BINARY_NAME}" ] && rm -f "${INSTALL_DIR}/${BINARY_NAME}" && info "Removed ${INSTALL_DIR}/${BINARY_NAME}"
-
-    systemctl daemon-reload 2>/dev/null || true
-
-    echo ""
-    info "Binary and service removed."
-    info "Config and state preserved (remove manually if desired):"
-    echo "  rm -rf $CONFIG_DIR"
-    echo "  rm -rf /var/lib/fail2ban-rs"
-}
-
-# ---------------------------------------------------------------------------
-# Install / Upgrade
-# ---------------------------------------------------------------------------
-
-do_install() {
-    check_linux
-    check_root
-    check_deps
-
-    local arch
-    arch=$(detect_arch)
-
-    echo ""
-    bold "fail2ban-rs installer"
-    echo ""
-
-    local version
-    version=$(get_version)
-    info "Version: $version"
-    info "Arch:    linux-$arch"
-    echo ""
-
-    # Download
-    local artifact="fail2ban-rs-${version}-linux-${arch}.tar.gz"
-    local url="https://github.com/${REPO}/releases/download/v${version}/${artifact}"
-    local checksum_url="${url}.sha256"
-
-    WORK_DIR=$(mktemp -d)
-    trap cleanup EXIT
-
-    info "Downloading from GitHub Releases..."
-    download "$url" "${WORK_DIR}/${artifact}" || error "Download failed. Check the version exists: v${version}"
-
-    # Verify checksum
-    if download "$checksum_url" "${WORK_DIR}/${artifact}.sha256" 2>/dev/null; then
-        info "Verifying checksum..."
-        (cd "$WORK_DIR" && sha256sum -c "${artifact}.sha256" --quiet) || error "Checksum verification failed"
-    elif [ "${FAIL2BAN_SKIP_CHECKSUM:-}" = "1" ]; then
-        warn "Checksum not available, skipping (FAIL2BAN_SKIP_CHECKSUM=1)"
-    else
-        error "Checksum not available. Set FAIL2BAN_SKIP_CHECKSUM=1 to skip."
-    fi
-
-    # Extract
-    tar --no-same-owner -xzf "${WORK_DIR}/${artifact}" -C "$WORK_DIR"
-    local extracted="${WORK_DIR}/fail2ban-rs-${version}-linux-${arch}"
-
-    if [ ! -f "${extracted}/fail2ban-rs" ]; then
-        error "Binary not found in archive"
-    fi
-
-    # Detect upgrade vs fresh install
-    local upgrade=false
-    local was_running=false
-    if [ -f "${INSTALL_DIR}/${BINARY_NAME}" ]; then
-        upgrade=true
-        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            was_running=true
-            info "Stopping running service..."
-            systemctl stop "$SERVICE_NAME"
-        fi
-    fi
-
-    # Install binary
-    install -m 755 "${extracted}/fail2ban-rs" "${INSTALL_DIR}/${BINARY_NAME}"
-    info "Installed ${INSTALL_DIR}/${BINARY_NAME}"
-
-    # Install service file (always update — safe, no user data)
-    install -m 644 "${extracted}/fail2ban-rs.service" "$SERVICE_FILE"
-    systemctl daemon-reload
-    info "Installed systemd service"
-
-    # Install config (only on fresh install — never overwrite user config)
-    if [ ! -f "${CONFIG_DIR}/config.toml" ]; then
-        mkdir -p "${CONFIG_DIR}/config.d"
-        install -m 644 "${extracted}/config.toml" "${CONFIG_DIR}/config.toml"
-        info "Installed default config to ${CONFIG_DIR}/config.toml"
-    else
-        info "Config exists, not overwriting: ${CONFIG_DIR}/config.toml"
-    fi
-
-    # Check firewall availability
-    check_firewall
-
-    # Print status
-    echo ""
-    bold "---"
-    echo ""
-
-    if [ "$upgrade" = true ]; then
-        if [ "$was_running" = true ]; then
-            systemctl start "$SERVICE_NAME"
-            info "Service restarted."
-        else
-            info "Upgrade complete. Start with: systemctl start $SERVICE_NAME"
-        fi
-    else
-        echo "  Installed to:  ${INSTALL_DIR}/${BINARY_NAME}"
-        echo "  Config:        ${CONFIG_DIR}/config.toml"
-        echo "  Service:       $SERVICE_FILE"
-        echo ""
-        bold "Next steps:"
-        echo "  1. Edit config:     nano ${CONFIG_DIR}/config.toml"
-        echo "  2. Enable service:  systemctl enable $SERVICE_NAME"
-        echo "  3. Start service:   systemctl start $SERVICE_NAME"
-        echo "  4. Check status:    $BINARY_NAME status"
-        echo "  5. View logs:       journalctl -u $SERVICE_NAME -f"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+root="${DESTDIR:-}"
+bin="$root/usr/local/bin"
+units="$root/usr/local/lib/systemd/system"
+config="$root/etc/fail2ban"
+man="$root/usr/local/share/man"
 
 case "${1:-}" in
-    --uninstall|-u)
-        do_uninstall
-        ;;
-    --help|-h)
-        echo "Usage: sudo bash install.sh [--uninstall]"
-        echo ""
-        echo "Environment:"
-        echo "  FAIL2BAN_VERSION=x.y.z          Install a specific version (default: latest)"
-        echo "  FAIL2BAN_SKIP_CHECKSUM=1        Skip checksum verification"
-        ;;
-    *)
-        do_install
+    -h|--help)
+        echo "Usage: bash install.sh [archive.tar.gz|--uninstall]"
+        exit 0
         ;;
 esac
+[[ -n "$root" || $(id -u) -eq 0 ]] || die "Run this installer as root."
+[[ $(uname -s) == Linux ]] || die "Fail2Ban requires Linux."
+
+if [[ "${1:-}" == --uninstall ]]; then
+    if [[ -z "$root" && -f "$units/fail2ban.service" ]]; then
+        systemctl disable --now fail2ban.socket fail2ban.service
+    fi
+    rm -f -- "$bin/fail2ban-server"
+    rm -f -- "$bin/fail2ban-client"
+    rm -f -- "$bin/fail2ban-regex"
+    rm -f -- "$units/fail2ban.service"
+    rm -f -- "$units/fail2ban.socket"
+    rm -f -- "$man/man1/fail2ban.1"
+    rm -f -- "$man/man1/fail2ban-server.1"
+    rm -f -- "$man/man1/fail2ban-client.1"
+    rm -f -- "$man/man1/fail2ban-regex.1"
+    rm -f -- "$man/man5/jail.conf.5"
+    if [[ -z "$root" ]]; then
+        systemctl daemon-reload
+    fi
+    exit 0
+fi
+
+[[ $# -le 1 ]] || die "Usage: bash install.sh [archive.tar.gz|--uninstall]"
+if [[ -z "$root" ]] && {
+    systemctl is-active --quiet fail2ban.service ||
+        systemctl is-active --quiet fail2ban.socket
+}; then
+    die "Stop fail2ban.service and fail2ban.socket before replacing the binaries."
+fi
+
+version="${FAIL2BAN_VERSION:-1.1.1}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid Fail2Ban version."
+case "$(uname -m)" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) die "Unsupported architecture $(uname -m)." ;;
+esac
+name="fail2ban-rs-$version-linux-$arch"
+work=$(mktemp -d)
+cleanup() {
+    rm -f -- "$work/archive"
+    rm -f -- "$work/checksum"
+    rm -f -- "$work/members"
+    rm -f -- "$work/member"
+    rmdir -- "$work"
+}
+trap cleanup EXIT
+if [[ $# -eq 0 ]]; then
+    url="https://github.com/jasper-khan/fail2ban-rs/releases/download/v$version/$name.tar.gz"
+    curl --fail --location --output "$work/archive" "$url"
+    curl --fail --location --output "$work/checksum" "$url.sha256"
+    archive="$work/archive"
+    checksum="$work/checksum"
+else
+    archive="$1"
+    checksum="$1.sha256"
+fi
+read -r digest _ < "$checksum"
+[[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || die "Invalid release checksum."
+printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
+tar -tzf "$archive" > "$work/members"
+mkdir -p "$config/fail2ban.d" "$config/jail.d" "$root/var/lib/fail2ban"
+
+install_member() {
+    tar -xOzf "$archive" "$name/$1" > "$work/member"
+    install -D -m "$2" "$work/member" "$3"
+}
+for binary in fail2ban-server fail2ban-client fail2ban-regex; do
+    install_member "bin/$binary" 0755 "$bin/$binary"
+done
+install_member fail2ban.service 0644 "$units/fail2ban.service"
+install_member fail2ban.socket 0644 "$units/fail2ban.socket"
+for page in fail2ban fail2ban-server fail2ban-client fail2ban-regex; do
+    install_member "man/$page.1" 0644 "$man/man1/$page.1"
+done
+install_member man/jail.conf.5 0644 "$man/man5/jail.conf.5"
+
+while IFS= read -r member; do
+    case "$member" in
+        "$name/config/"|"$name/config/"*/) continue ;;
+        "$name/config/"*)
+            relative="${member#"$name/config/"}"
+            case "/$relative/" in */../*) die "Invalid config archive member." ;; esac
+            dest="$config/$relative"
+            if [[ -L "$dest" ]]; then
+                continue
+            fi
+            mode=0644
+            if [[ "$relative" == filter.d/ignorecommands/apache-fakegooglebot ]]; then
+                mode=0755
+                if [[ -f "$dest" ]] && printf '%s  %s\n' \
+                    0069a4f1828849673a23841e5b796bfd88e2fcdf1f4f5854f9723e7f3989f9da "$dest" | sha256sum --status -c -; then
+                    install_member "config/$relative" "$mode" "$dest"
+                fi
+            fi
+            if [[ ! -e "$dest" ]]; then
+                install_member "config/$relative" "$mode" "$dest"
+            fi
+            ;;
+    esac
+done < "$work/members"
+
+if [[ -z "$root" ]]; then
+    systemctl daemon-reload
+    echo 'Start Fail2Ban with systemctl enable --now fail2ban.service.'
+fi

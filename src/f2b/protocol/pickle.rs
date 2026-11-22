@@ -192,6 +192,10 @@ fn write_val(out: &mut Vec<u8>, val: &PickleValue) {
                 "ValueError" => ("builtins", "ValueError"),
                 "RuntimeError" => ("builtins", "RuntimeError"),
                 "KeyError" => ("builtins", "KeyError"),
+                "FileNotFoundError" => ("builtins", "FileNotFoundError"),
+                "PermissionError" => ("builtins", "PermissionError"),
+                "IsADirectoryError" => ("builtins", "IsADirectoryError"),
+                "OSError" => ("builtins", "OSError"),
                 _ => ("builtins", "Exception"),
             };
             out.push(b'c');
@@ -518,7 +522,11 @@ pub fn decode_pickle(bytes: &[u8]) -> Result<PickleValue> {
             b'.' => {
                 let val = match stack.pop() {
                     Some(StackEntry::Val(v)) if stack.is_empty() => v,
-                    _ => return Err(Error::protocol("pickle did not terminate with single value")),
+                    _ => {
+                        return Err(Error::protocol(
+                            "pickle did not terminate with single value",
+                        ));
+                    }
                 };
                 check_depth(&val, 0)?;
                 return Ok(val);
@@ -705,7 +713,9 @@ mod tests {
                         ]),
                         PickleValue::Tuple(vec![
                             PickleValue::Str("File list".to_owned()),
-                            PickleValue::List(vec![PickleValue::Str("/var/log/auth.log".to_owned())]),
+                            PickleValue::List(vec![PickleValue::Str(
+                                "/var/log/auth.log".to_owned(),
+                            )]),
                         ]),
                     ]),
                 ]),

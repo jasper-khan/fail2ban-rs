@@ -58,34 +58,13 @@ jobs:
           prefix-key: "release-${{ matrix.os_arch }}"
 
       - name: Build
-        run: cargo zigbuild --release --target ${{ matrix.rust_target }}
-
-      - name: Strip binary
-        run: |
-          if command -v llvm-strip >/dev/null 2>&1; then
-            llvm-strip target/${{ matrix.rust_target }}/release/fail2ban-rs
-          elif command -v strip >/dev/null 2>&1; then
-            strip target/${{ matrix.rust_target }}/release/fail2ban-rs
-          fi
-
-      - name: Package
-        run: |
-          ARTIFACT="fail2ban-rs-${VERSION}-${{ matrix.os_arch }}"
-          mkdir -p dist/${ARTIFACT}
-          cp target/${{ matrix.rust_target }}/release/fail2ban-rs dist/${ARTIFACT}/
-          cp dist/fail2ban-rs.service dist/${ARTIFACT}/
-          cp config/default.toml dist/${ARTIFACT}/config.toml
-          cp LICENSE dist/${ARTIFACT}/ 2>/dev/null || true
-          cp README.md dist/${ARTIFACT}/ 2>/dev/null || true
-          cd dist
-          tar -czf ${ARTIFACT}.tar.gz ${ARTIFACT}
-          sha256sum ${ARTIFACT}.tar.gz > ${ARTIFACT}.tar.gz.sha256
+        run: bash scripts/build-release.sh "$VERSION" "${{ matrix.rust_target }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.os_arch }}
-          path: dist/fail2ban-rs-${{ env.VERSION }}-${{ matrix.os_arch }}.tar.gz*
+          path: dist/v${{ env.VERSION }}/fail2ban-rs-${{ env.VERSION }}-${{ matrix.os_arch }}.tar.gz*
 
   release:
     name: Create GitHub Release

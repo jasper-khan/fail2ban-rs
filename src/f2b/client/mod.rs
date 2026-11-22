@@ -164,7 +164,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliAction> {
                     return Ok(CliAction::Str2Sec(v));
                 }
                 _ => {
-                    return Err(Error::invalid_command(format!("option --{name} not recognized")));
+                    return Err(Error::invalid_command(format!(
+                        "option --{name} not recognized"
+                    )));
                 }
             }
             idx += 1;
@@ -208,7 +210,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliAction> {
                     break;
                 }
                 _ => {
-                    return Err(Error::invalid_command(format!("option -{ch} not recognized")));
+                    return Err(Error::invalid_command(format!(
+                        "option -{ch} not recognized"
+                    )));
                 }
             }
         }
@@ -237,9 +241,9 @@ fn take_long_val(
         return Ok(v.to_owned());
     }
     *idx += 1;
-    args.get(*idx).cloned().ok_or_else(|| {
-        Error::invalid_command(format!("option --{name} requires argument"))
-    })
+    args.get(*idx)
+        .cloned()
+        .ok_or_else(|| Error::invalid_command(format!("option --{name} requires argument")))
 }
 
 /// Parse `reload [--restart] [--unban] [--if-exists] [--all | <jail>]` arguments.
@@ -426,9 +430,10 @@ impl Fail2banClient {
             "start" if args.len() == 1 => self.cmd_start(),
             "restart" => self.cmd_restart(args),
             "reload" => self.cmd_reload(args),
-            "configure" if args.len() == 1 => self.cmd_configure(),
             "ping" if args.len() > 1 => match args[1].trim().parse::<f64>() {
-                Ok(secs) if secs.is_finite() && (secs >= 0.0 || (secs + 1.0).abs() < f64::EPSILON) => {
+                Ok(secs)
+                    if secs.is_finite() && (secs >= 0.0 || (secs + 1.0).abs() < f64::EPSILON) =>
+                {
                     let tout = if (secs + 1.0).abs() < f64::EPSILON {
                         None
                     } else {
@@ -455,17 +460,6 @@ impl Fail2banClient {
             },
             _ => self.send_single(args, true, None),
         }
-    }
-
-    fn cmd_configure(&mut self) -> bool {
-        let stream = match self.read_config(None, false) {
-            Ok(s) => s,
-            Err(e) => {
-                log_msg(LogLevel::Error, "fail2ban", &e.to_string());
-                return false;
-            }
-        };
-        self.send_config_stream(stream)
     }
 
     fn send_config_stream(&mut self, stream: Vec<PickleValue>) -> bool {
@@ -776,7 +770,10 @@ impl Fail2banClient {
                                 log_msg(
                                     LogLevel::Error,
                                     "fail2ban",
-                                    &format!("NOK: ({},)", beautifier::py_repr(&PickleValue::Str(message.clone()))),
+                                    &format!(
+                                        "NOK: ({},)",
+                                        beautifier::py_repr(&PickleValue::Str(message.clone()))
+                                    ),
                                 );
                                 if show_ret {
                                     self.beautifier.set_input_cmd(cmd_strs.clone());
@@ -801,7 +798,10 @@ impl Fail2banClient {
                     log_msg(
                         LogLevel::Error,
                         "fail2ban",
-                        &format!("Unexpected server response: {}", beautifier::py_repr(&other)),
+                        &format!(
+                            "Unexpected server response: {}",
+                            beautifier::py_repr(&other)
+                        ),
                     );
                     return false;
                 }
@@ -843,18 +843,24 @@ impl Fail2banClient {
 
 /// Entrypoint called by `src/bin/fail2ban-client.rs` (returns process exit code `0` or `255`).
 pub fn run_cli(args: Vec<String>) -> i32 {
+    run_cli_as(args, false)
+}
+
+/// Shared CLI entrypoint for `fail2ban-client` (`is_server = false`) and
+/// `fail2ban-server` (`is_server = true`).
+pub fn run_cli_as(args: Vec<String>, is_server: bool) -> i32 {
     let action = match parse_cli(&args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("ERROR: {e}");
-            disp_usage();
+            disp_usage(is_server);
             return 255;
         }
     };
 
     match action {
         CliAction::Help => {
-            disp_usage();
+            disp_usage(is_server);
             0
         }
         CliAction::Version { short } => {
@@ -867,11 +873,7 @@ pub fn run_cli(args: Vec<String>) -> i32 {
         }
         CliAction::Str2Sec(expr) => match str2seconds(&expr) {
             Ok(secs) => {
-                if secs == 0.0 {
-                    output("0");
-                } else {
-                    output(&format!("{secs}"));
-                }
+                output(&format_str2sec(&expr, secs));
                 0
             }
             Err(e) => {
@@ -881,12 +883,9 @@ pub fn run_cli(args: Vec<String>) -> i32 {
         },
         CliAction::Run(opts, cmd_args) => {
             configure_client_logging(opts.verbose);
-            if cmd_args.is_empty()
-                && !opts.interactive
-                && !opts.test
-                && opts.dump == DumpMode::None
+            if cmd_args.is_empty() && !opts.interactive && !opts.test && opts.dump == DumpMode::None
             {
-                disp_usage();
+                disp_usage(is_server);
                 return 255;
             }
             let mut client = Fail2banClient::new(opts);
@@ -908,7 +907,9 @@ pub fn run_cli(args: Vec<String>) -> i32 {
                     }
                     Err(e) => {
                         log_msg(LogLevel::Error, "fail2ban", &e.to_string());
-                        output("ERROR: The configuration stream failed because of the invalid syntax.");
+                        output(
+                            "ERROR: The configuration stream failed because of the invalid syntax.",
+                        );
                         false
                     }
                 };
@@ -936,7 +937,11 @@ pub fn run_cli(args: Vec<String>) -> i32 {
                     return 255;
                 }
                 if !ok {
-                    log_msg(LogLevel::Error, "fail2ban", "ERROR: test configuration failed");
+                    log_msg(
+                        LogLevel::Error,
+                        "fail2ban",
+                        "ERROR: test configuration failed",
+                    );
                     return 255;
                 }
             }
@@ -945,11 +950,11 @@ pub fn run_cli(args: Vec<String>) -> i32 {
                 if !cmd_args.is_empty() && !client.execute_command(&cmd_args) {
                     return 255;
                 }
-                run_interactive(&mut client);
+                run_interactive(&mut client, is_server);
                 0
             } else {
                 if cmd_args.is_empty() {
-                    disp_usage();
+                    disp_usage(is_server);
                     return 255;
                 }
                 if client.execute_command(&cmd_args) {
@@ -962,7 +967,21 @@ pub fn run_cli(args: Vec<String>) -> i32 {
     }
 }
 
-fn run_interactive(client: &mut Fail2banClient) {
+fn format_str2sec(expr: &str, secs: f64) -> String {
+    if secs.fract() != 0.0 {
+        return secs.to_string();
+    }
+    let has_float_syntax = expr.contains('.') || expr.contains('/');
+    if has_float_syntax {
+        format!("{secs:.1}")
+    } else if secs == 0.0 {
+        "0".to_owned()
+    } else {
+        format!("{}", secs as i64)
+    }
+}
+
+fn run_interactive(client: &mut Fail2banClient, is_server: bool) {
     output(&format!(
         "Fail2Ban v{VERSION} reads log file that contains password failure report"
     ));
@@ -975,7 +994,9 @@ fn run_interactive(client: &mut Fail2banClient) {
     loop {
         {
             let mut stdout = io::stdout().lock();
-            if let Err(e) = stdout.write_all(PROMPT.as_bytes()).and_then(|()| stdout.flush())
+            if let Err(e) = stdout
+                .write_all(PROMPT.as_bytes())
+                .and_then(|()| stdout.flush())
                 && e.kind() == io::ErrorKind::BrokenPipe
             {
                 return;
@@ -993,7 +1014,7 @@ fn run_interactive(client: &mut Fail2banClient) {
                     return;
                 }
                 if trimmed == "help" {
-                    disp_usage();
+                    disp_usage(is_server);
                 } else if !trimmed.is_empty() {
                     let parts = shlex_split(trimmed);
                     if !parts.is_empty() {
@@ -1033,7 +1054,7 @@ fn dump_config(stream: &[PickleValue], pretty: bool) {
 fn command_requires_config(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
-        Some("start" | "reload" | "restart" | "configure")
+        Some("start" | "reload" | "restart")
     )
 }
 
@@ -1093,8 +1114,12 @@ fn output(s: &str) {
     let _ = stdout.flush();
 }
 
-fn disp_usage() {
-    output("Usage: fail2ban-client [OPTIONS] <COMMAND>");
+fn disp_usage(is_server: bool) {
+    if is_server {
+        output("Usage: fail2ban-server [OPTIONS]");
+    } else {
+        output("Usage: fail2ban-client [OPTIONS] <COMMAND>");
+    }
     output("");
     output(&format!(
         "Fail2Ban v{VERSION} reads log file that contains password failure report"
@@ -1105,27 +1130,43 @@ fn disp_usage() {
     output("    -c, --conf <DIR>        configuration directory");
     output("    -s, --socket <FILE>     socket path");
     output("    -p, --pidfile <FILE>    pidfile path");
-    output("    --pname <NAME>          name of the process (main thread) to identify instance (default fail2ban-server)");
+    output(
+        "    --pname <NAME>          name of the process (main thread) to identify instance (default fail2ban-server)",
+    );
     output("    --loglevel <LEVEL>      logging level");
-    output("    --logtarget <TARGET>    logging target, use file-name or stdout, stderr, syslog or sysout.");
+    output(
+        "    --logtarget <TARGET>    logging target, use file-name or stdout, stderr, syslog or sysout.",
+    );
     output("    --syslogsocket auto|<FILE>");
     output("    -d                      dump configuration. For debugging");
-    output("    --dp, --dump-pretty     dump the configuration using more human readable representation");
-    output("    -t, --test              test configuration (can be also specified with start parameters)");
+    output(
+        "    --dp, --dump-pretty     dump the configuration using more human readable representation",
+    );
+    output(
+        "    -t, --test              test configuration (can be also specified with start parameters)",
+    );
     output("    -i                      interactive mode");
     output("    -v                      increase verbosity");
     output("    -q                      decrease verbosity");
     output("    -x                      force execution of the server (remove socket file)");
     output("    -b                      start server in background (default)");
     output("    -f                      start server in foreground");
-    output("    --async                 start server in async mode (for internal usage only, don't read configuration)");
-    output("    --timeout               timeout to wait for the server (for internal usage only, don't read configuration)");
+    output(
+        "    --async                 start server in async mode (for internal usage only, don't read configuration)",
+    );
+    output(
+        "    --timeout               timeout to wait for the server (for internal usage only, don't read configuration)",
+    );
     output("    --str2sec <STRING>      convert time abbreviation format to seconds");
     output("    -h, --help              display this help message");
-    output("    -V, --version           print the version (-V returns machine-readable short format)");
-    output("");
-    output("Command:");
-    print_protocol_formatted();
+    output(
+        "    -V, --version           print the version (-V returns machine-readable short format)",
+    );
+    if !is_server {
+        output("");
+        output("Command:");
+        print_protocol_formatted();
+    }
     output("");
     output("Report bugs to https://github.com/fail2ban/fail2ban/issues");
 }
@@ -1147,8 +1188,14 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "reloads the jail <JAIL>, or restarts it (if option '--restart' specified)",
     ),
     ("stop", "stops all jails and terminate the server"),
-    ("unban --all", "unbans all IP addresses (in all jails and database)"),
-    ("unban <IP> ... <IP>", "unbans <IP> (in all jails and database)"),
+    (
+        "unban --all",
+        "unbans all IP addresses (in all jails and database)",
+    ),
+    (
+        "unban <IP> ... <IP>",
+        "unbans <IP> (in all jails and database)",
+    ),
     ("banned", "return jails with banned IPs as dictionary"),
     (
         "banned <IP> ... <IP>]",
@@ -1159,9 +1206,15 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "status --all [FLAVOR]",
         "gets the current status of all jails, with optional output style [FLAVOR]. Flavors: 'basic' (default), 'cymru', 'short', 'stats'",
     ),
-    ("stat[istic]s", "gets the current statistics of all jails as table"),
+    (
+        "stat[istic]s",
+        "gets the current statistics of all jails as table",
+    ),
     ("ping", "tests if the server is alive"),
-    ("echo", "for internal usage, returns back and outputs a given string"),
+    (
+        "echo",
+        "for internal usage, returns back and outputs a given string",
+    ),
     ("version", "return the server version"),
     ("", "LOGGING"),
     (
@@ -1188,7 +1241,10 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "set dbfile <FILE>",
         "set the location of fail2ban persistent datastore. Set to \"None\" to disable",
     ),
-    ("get dbfile", "get the location of fail2ban persistent datastore"),
+    (
+        "get dbfile",
+        "get the location of fail2ban persistent datastore",
+    ),
     (
         "set dbmaxmatches <INT>",
         "sets the max number of matches stored in database per ticket",
@@ -1227,8 +1283,14 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "set <JAIL> delignoreip <IP>",
         "removes <IP> from the ignore list of <JAIL>",
     ),
-    ("set <JAIL> ignorecommand <VALUE>", "sets ignorecommand of <JAIL>"),
-    ("set <JAIL> ignorecache <VALUE>", "sets ignorecache of <JAIL>"),
+    (
+        "set <JAIL> ignorecommand <VALUE>",
+        "sets ignorecommand of <JAIL>",
+    ),
+    (
+        "set <JAIL> ignorecache <VALUE>",
+        "sets ignorecache of <JAIL>",
+    ),
     (
         "set <JAIL> addlogpath <FILE> ['tail']",
         "adds <FILE> to the monitoring list of <JAIL>, optionally starting at the 'tail' of the file (default 'head').",
@@ -1277,7 +1339,10 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "set <JAIL> datepattern <PATTERN>",
         "sets the <PATTERN> used to match date/times for <JAIL>",
     ),
-    ("set <JAIL> usedns <VALUE>", "sets the usedns mode for <JAIL>"),
+    (
+        "set <JAIL> usedns <VALUE>",
+        "sets the usedns mode for <JAIL>",
+    ),
     (
         "set <JAIL> attempt <IP> [<failure1> ... <failureN>]",
         "manually notify about <IP> failure",
@@ -1306,7 +1371,10 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "set <JAIL> addaction <ACT>[ <PYTHONFILE> <JSONKWARGS>]",
         "adds a new action named <ACT> for <JAIL>. Optionally for a Python based action, a <PYTHONFILE> and <JSONKWARGS> can be specified, else will be a Command Action",
     ),
-    ("set <JAIL> delaction <ACT>", "removes the action <ACT> from <JAIL>"),
+    (
+        "set <JAIL> delaction <ACT>",
+        "removes the action <ACT> from <JAIL>",
+    ),
     ("", "COMMAND ACTION CONFIGURATION"),
     (
         "set <JAIL> action <ACT> actionstart <CMD>",
@@ -1347,7 +1415,10 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "get <JAIL> banned <IP> ... <IP>]",
         "return 1 if IP is banned in <JAIL> otherwise 0, or a list of 1/0 for multiple IPs",
     ),
-    ("get <JAIL> logpath", "gets the list of the monitored files for <JAIL>"),
+    (
+        "get <JAIL> logpath",
+        "gets the list of the monitored files for <JAIL>",
+    ),
     (
         "get <JAIL> logencoding",
         "gets the encoding of the log files for <JAIL>",
@@ -1377,7 +1448,10 @@ const PROTOCOL_HELP: &[(&str, &str)] = &[
         "get <JAIL> findtime",
         "gets the time for which the filter will look back for failures for <JAIL>",
     ),
-    ("get <JAIL> bantime", "gets the time a host is banned for <JAIL>"),
+    (
+        "get <JAIL> bantime",
+        "gets the time a host is banned for <JAIL>",
+    ),
     (
         "get <JAIL> datepattern",
         "gets the pattern used to match date/times for <JAIL>",
@@ -1478,6 +1552,13 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         } else if cur.len() + 1 + word.len() <= width {
             cur.push(' ');
             cur.push_str(word);
+        } else if let Some(rest) = word.strip_prefix("'--")
+            && cur.len() + 2 <= width
+        {
+            cur.push_str(" '");
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str("--");
+            cur.push_str(rest);
         } else {
             lines.push(std::mem::take(&mut cur));
             cur.push_str(word);

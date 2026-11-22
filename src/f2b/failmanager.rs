@@ -10,7 +10,7 @@ use crate::ticket::{Ticket, TicketId};
 
 const DEFAULT_MAX_RETRY: u64 = 3;
 const DEFAULT_MAX_TIME: f64 = 600.0;
-const DEFAULT_MAX_MATCHES: usize = 50;
+const DEFAULT_MAX_MATCHES: usize = 5;
 
 #[derive(Debug)]
 struct FailEntry {
@@ -264,11 +264,20 @@ mod tests {
         fm.set_max_time(10.0);
         let subj = id("192.0.2.10");
 
-        assert_eq!(fm.add_failure(Ticket::new(subj.clone(), 100.0), 1, false), 1);
-        assert_eq!(fm.add_failure(Ticket::new(subj.clone(), 110.0), 1, false), 2);
+        assert_eq!(
+            fm.add_failure(Ticket::new(subj.clone(), 100.0), 1, false),
+            1
+        );
+        assert_eq!(
+            fm.add_failure(Ticket::new(subj.clone(), 110.0), 1, false),
+            2
+        );
         assert_eq!(fm.get_ticket(&subj).unwrap().first_time, 100.0);
 
-        assert_eq!(fm.add_failure(Ticket::new(subj.clone(), 111.0), 1, false), 3);
+        assert_eq!(
+            fm.add_failure(Ticket::new(subj.clone(), 111.0), 1, false),
+            3
+        );
         assert_eq!(fm.get_ticket(&subj).unwrap().first_time, 101.0);
 
         assert_eq!(fm.add_failure(Ticket::new(subj.clone(), 80.0), 1, false), 4);
@@ -378,8 +387,14 @@ mod tests {
         let plain = id("192.0.2.25");
         let net = id("198.51.100.0/24");
 
-        assert_eq!(fm.add_failure(Ticket::new(mapped.clone(), 100.0), 1, false), 1);
-        assert_eq!(fm.add_failure(Ticket::new(plain.clone(), 101.0), 1, false), 2);
+        assert_eq!(
+            fm.add_failure(Ticket::new(mapped.clone(), 100.0), 1, false),
+            1
+        );
+        assert_eq!(
+            fm.add_failure(Ticket::new(plain.clone(), 101.0), 1, false),
+            2
+        );
         assert_eq!(fm.to_ban(Some(&mapped)).unwrap().fid, plain);
 
         assert_eq!(fm.add_failure(Ticket::new(net.clone(), 102.0), 2, false), 2);

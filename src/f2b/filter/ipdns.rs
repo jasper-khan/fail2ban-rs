@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::net::{IpAddr, TcpListener, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -472,9 +472,8 @@ fn system_hostnames() -> (String, String) {
     let mut buf = [0u8; 256];
     let mut short = String::new();
     // SAFETY: `buf` is a writable byte buffer of `buf.len()` bytes for `gethostname`.
-    let rc = unsafe {
-        nix::libc::gethostname(buf.as_mut_ptr().cast::<nix::libc::c_char>(), buf.len())
-    };
+    let rc =
+        unsafe { nix::libc::gethostname(buf.as_mut_ptr().cast::<nix::libc::c_char>(), buf.len()) };
     if rc == 0 {
         let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         short = String::from_utf8_lossy(&buf[..len]).trim().to_owned();
@@ -509,9 +508,7 @@ fn query_fqdn(short: &str) -> String {
     hints.ai_flags = nix::libc::AI_CANONNAME;
     let mut res: *mut nix::libc::addrinfo = std::ptr::null_mut();
     // SAFETY: `c_name` is NUL-terminated, `hints` is initialized, and `res` is freed below.
-    let rc = unsafe {
-        nix::libc::getaddrinfo(c_name.as_ptr(), std::ptr::null(), &hints, &mut res)
-    };
+    let rc = unsafe { nix::libc::getaddrinfo(c_name.as_ptr(), std::ptr::null(), &hints, &mut res) };
     if rc == 0 && !res.is_null() {
         let pref = format!("{short}.");
         let mut first: Option<String> = None;
@@ -1005,7 +1002,11 @@ fn resolve_ignore_tag(
             TicketId::Net(net) => net.to_string(),
             TicketId::Raw(s) => maybe_escape(s.clone()),
         }),
-        "cidr" => Some(target_ip.prefix_len().map_or_else(String::new, |p| p.to_string())),
+        "cidr" => Some(
+            target_ip
+                .prefix_len()
+                .map_or_else(String::new, |p| p.to_string()),
+        ),
         "mask" => Some(target_ip.netmask()),
         "fq-hostname" => Some(system_hostnames().0),
         "sh-hostname" => Some(system_hostnames().1),
@@ -1025,7 +1026,9 @@ fn resolve_ignore_tag(
                 .or_else(|| data.get(lower.as_str()))
                 .or_else(|| {
                     data.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(mapped) || k.eq_ignore_ascii_case(&lower))
+                        .find(|(k, _)| {
+                            k.eq_ignore_ascii_case(mapped) || k.eq_ignore_ascii_case(&lower)
+                        })
                         .map(|(_, v)| v)
                 })
                 .cloned()
@@ -1041,8 +1044,8 @@ fn escape_shell_tag(value: &str) -> String {
         match ch {
             '\n' => out.push_str(r"\n"),
             '\r' => out.push_str(r"\r"),
-            '\\' | '#' | '&' | ';' | '`' | '|' | '*' | '?' | '~' | '<' | '>' | '^' | '('
-            | ')' | '[' | ']' | '{' | '}' | '$' | '\'' | '"' => {
+            '\\' | '#' | '&' | ';' | '`' | '|' | '*' | '?' | '~' | '<' | '>' | '^' | '(' | ')'
+            | '[' | ']' | '{' | '}' | '$' | '\'' | '"' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -1050,6 +1053,242 @@ fn escape_shell_tag(value: &str) -> String {
         }
     }
     out
+}
+
+/// Team Cymru DNS TXT lookup result for `status <jail> cymru`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CymruInfo {
+    pub asns: Vec<String>,
+    pub countries: Vec<String>,
+    pub rirs: Vec<String>,
+}
+
+/// Query Team Cymru DNS TXT (`origin.asn.cymru.com` / `origin6.asn.cymru.com`)
+/// for banned IPs, matching `BanManager.getBanListExtendedCymruInfo`.
+pub fn lookup_cymru_info(ips: &[TicketId]) -> CymruInfo {
+    if ips.is_empty() {
+        return CymruInfo::default();
+    }
+    let servers = system_dns_servers();
+    lookup_cymru_info_with_servers(ips, &servers, Duration::from_secs(5))
+}
+
+/// Query Team Cymru DNS TXT records using explicit DNS servers and per-query timeout.
+pub fn lookup_cymru_info_with_servers(
+    ips: &[TicketId],
+    servers: &[SocketAddr],
+    timeout: Duration,
+) -> CymruInfo {
+    let mut info = CymruInfo::default();
+    if ips.is_empty() || servers.is_empty() {
+        return info;
+    }
+    for (idx, tid) in ips.iter().enumerate() {
+        let Some(ip) = tid.ip() else {
+            continue;
+        };
+        let suffix = if ip.is_ipv4() {
+            "origin.asn.cymru.com"
+        } else {
+            "origin6.asn.cymru.com"
+        };
+        let qname = format!("{}{suffix}", tid.ip_rev());
+        let txid = ((std::process::id() as u16).wrapping_add(idx as u16)).wrapping_mul(0x9e37);
+        match query_dns_txt(&qname, txid, servers, timeout) {
+            DnsTxtOutcome::Records(records) if !records.is_empty() => {
+                let mut asns = BTreeSet::new();
+                let mut countries = BTreeSet::new();
+                let mut rirs = BTreeSet::new();
+                for rec in records {
+                    let parts: Vec<&str> = rec
+                        .split('|')
+                        .map(|s| {
+                            s.trim_matches(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                        })
+                        .collect();
+                    if parts.len() == 5 {
+                        let norm = |s: &str| if s.is_empty() { "unknown" } else { s }.to_owned();
+                        asns.insert(norm(parts[0]));
+                        countries.insert(norm(parts[2]));
+                        rirs.insert(norm(parts[3]));
+                    }
+                }
+                if asns.is_empty() {
+                    break;
+                }
+                info.asns
+                    .push(asns.into_iter().collect::<Vec<_>>().join(", "));
+                info.countries
+                    .push(countries.into_iter().collect::<Vec<_>>().join(", "));
+                info.rirs
+                    .push(rirs.into_iter().collect::<Vec<_>>().join(", "));
+            }
+            DnsTxtOutcome::NxDomain => {
+                info.asns.push("nxdomain".to_owned());
+                info.countries.push("nxdomain".to_owned());
+                info.rirs.push("nxdomain".to_owned());
+            }
+            DnsTxtOutcome::Records(_) | DnsTxtOutcome::Error => {
+                log_msg(
+                    LogLevel::Error,
+                    "fail2ban.banmanager",
+                    &format!("Failure querying Cymru for {qname} TXT"),
+                );
+                break;
+            }
+        }
+    }
+    info
+}
+
+enum DnsTxtOutcome {
+    Records(Vec<String>),
+    NxDomain,
+    Error,
+}
+
+fn system_dns_servers() -> Vec<SocketAddr> {
+    let Ok(text) = fs::read_to_string("/etc/resolv.conf") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let line = line.split('#').next()?.trim();
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "nameserver" {
+                return None;
+            }
+            let ip: IpAddr = parts.next()?.parse().ok()?;
+            Some(SocketAddr::new(ip, 53))
+        })
+        .collect()
+}
+
+fn encode_dns_txt_query(qname: &str, txid: u16) -> Option<Vec<u8>> {
+    let mut pkt = Vec::with_capacity(qname.len() + 20);
+    pkt.extend_from_slice(&txid.to_be_bytes());
+    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    for label in qname.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&16_u16.to_be_bytes()); // TXT
+    pkt.extend_from_slice(&1_u16.to_be_bytes()); // IN
+    Some(pkt)
+}
+
+fn skip_dns_name(pkt: &[u8], mut off: usize) -> Option<usize> {
+    let mut hops = 0usize;
+    while off < pkt.len() {
+        let len = pkt[off];
+        if len == 0 {
+            return Some(off + 1);
+        }
+        if len & 0xc0 == 0xc0 {
+            return (off + 2 <= pkt.len()).then_some(off + 2);
+        }
+        if len & 0xc0 != 0 || hops > 128 {
+            return None;
+        }
+        off = off.checked_add(1 + usize::from(len))?;
+        hops += 1;
+    }
+    None
+}
+
+fn parse_dns_txt_response(pkt: &[u8], txid: u16) -> DnsTxtOutcome {
+    if pkt.len() < 12 || pkt[0..2] != txid.to_be_bytes() || (pkt[2] & 0x80) == 0 {
+        return DnsTxtOutcome::Error;
+    }
+    let rcode = pkt[3] & 0x0f;
+    if rcode == 3 {
+        return DnsTxtOutcome::NxDomain;
+    }
+    if rcode != 0 {
+        return DnsTxtOutcome::Error;
+    }
+    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+    let ancount = u16::from_be_bytes([pkt[6], pkt[7]]);
+    let mut off = 12usize;
+    for _ in 0..qdcount {
+        let Some(next) = skip_dns_name(pkt, off) else {
+            return DnsTxtOutcome::Error;
+        };
+        if next + 4 > pkt.len() {
+            return DnsTxtOutcome::Error;
+        }
+        off = next + 4;
+    }
+    let mut records = Vec::new();
+    for _ in 0..ancount {
+        let Some(next) = skip_dns_name(pkt, off) else {
+            return DnsTxtOutcome::Error;
+        };
+        if next + 10 > pkt.len() {
+            return DnsTxtOutcome::Error;
+        }
+        let rtype = u16::from_be_bytes([pkt[next], pkt[next + 1]]);
+        let rclass = u16::from_be_bytes([pkt[next + 2], pkt[next + 3]]);
+        let rdlen = usize::from(u16::from_be_bytes([pkt[next + 8], pkt[next + 9]]));
+        let rdata_start = next + 10;
+        let Some(rdata_end) = rdata_start.checked_add(rdlen) else {
+            return DnsTxtOutcome::Error;
+        };
+        if rdata_end > pkt.len() {
+            return DnsTxtOutcome::Error;
+        }
+        if rtype == 16 && rclass == 1 {
+            let mut cursor = rdata_start;
+            let mut text = String::new();
+            while cursor < rdata_end {
+                let seg_len = usize::from(pkt[cursor]);
+                cursor += 1;
+                if cursor + seg_len > rdata_end {
+                    return DnsTxtOutcome::Error;
+                }
+                text.push_str(&String::from_utf8_lossy(&pkt[cursor..cursor + seg_len]));
+                cursor += seg_len;
+            }
+            records.push(text);
+        }
+        off = rdata_end;
+    }
+    DnsTxtOutcome::Records(records)
+}
+
+fn query_dns_txt(
+    qname: &str,
+    txid: u16,
+    servers: &[SocketAddr],
+    timeout: Duration,
+) -> DnsTxtOutcome {
+    let Some(query) = encode_dns_txt_query(qname, txid) else {
+        return DnsTxtOutcome::Error;
+    };
+    let mut buf = [0u8; 2048];
+    for &server in servers {
+        let bind_addr = if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let Ok(sock) = UdpSocket::bind(bind_addr) else {
+            continue;
+        };
+        let _ = sock.set_read_timeout(Some(timeout));
+        let _ = sock.set_write_timeout(Some(timeout));
+        if sock.send_to(&query, server).is_err() {
+            continue;
+        }
+        if let Ok((n, _)) = sock.recv_from(&mut buf) {
+            return parse_dns_txt_response(&buf[..n], txid);
+        }
+    }
+    DnsTxtOutcome::Error
 }
 
 #[cfg(test)]
@@ -1109,7 +1348,8 @@ mod tests {
         assert!(cfg.is_ignored(&TicketId::parse("2001:db8::9"), None, "sshd"));
         assert!(!cfg.is_ignored(&TicketId::parse("198.51.100.1"), None, "sshd"));
 
-        cfg.ignore_cache = IgnoreCache::parse(r#"key="<F-USER>@<ip>", max-count=10, max-time=5m"#).unwrap();
+        cfg.ignore_cache =
+            IgnoreCache::parse(r#"key="<F-USER>@<ip>", max-count=10, max-time=5m"#).unwrap();
         cfg.ignore_command =
             Some(r#"if [ "<F-USER>" = "trusted" ] && [ "<jail.name>" = "sshd" ]; then exit 0; fi; exit 1"#.to_owned());
 
@@ -1125,5 +1365,59 @@ mod tests {
         let mut t_inj = Ticket::new(TicketId::parse("198.51.100.1"), 100.0);
         t_inj.data.insert("user".into(), "$(exit 0)".into());
         assert!(!cfg.is_ignored(&t_inj.fid, Some(&t_inj), "sshd"));
+    }
+
+    #[test]
+    fn cymru_dns_txt_lookup_parses_records_blank_and_nxdomain() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = server.recv_from(&mut buf).unwrap();
+                let mut labels = Vec::new();
+                let mut off = 12;
+                while off < n && buf[off] != 0 {
+                    let len = usize::from(buf[off]);
+                    labels.push(String::from_utf8_lossy(&buf[off + 1..off + 1 + len]).into_owned());
+                    off += 1 + len;
+                }
+                let qname = labels.join(".");
+                let qend = off + 5;
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&buf[0..2]);
+                if qname.starts_with("1.2.0.192.") {
+                    // NOERROR with 1 TXT answer ("15169 | 192.0.2.0/24 |  | arin | 2020-01-01")
+                    resp.extend_from_slice(&[
+                        0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                    ]);
+                    resp.extend_from_slice(&buf[12..qend]);
+                    let txt = b"15169 | 192.0.2.0/24 |  | arin | 2020-01-01";
+                    resp.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c,
+                    ]);
+                    let rdlen = (txt.len() + 1) as u16;
+                    resp.extend_from_slice(&rdlen.to_be_bytes());
+                    resp.push(txt.len() as u8);
+                    resp.extend_from_slice(txt);
+                } else {
+                    // NXDOMAIN (RCODE = 3)
+                    resp.extend_from_slice(&[
+                        0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    ]);
+                    resp.extend_from_slice(&buf[12..qend]);
+                }
+                server.send_to(&resp, peer).unwrap();
+            }
+        });
+
+        let ips = [TicketId::parse("192.0.2.1"), TicketId::parse("2001:db8::1")];
+        let info = lookup_cymru_info_with_servers(&ips, &[addr], Duration::from_secs(2));
+        handle.join().unwrap();
+
+        assert_eq!(info.asns, vec!["15169", "nxdomain"]);
+        assert_eq!(info.countries, vec!["unknown", "nxdomain"]);
+        assert_eq!(info.rirs, vec!["arin", "nxdomain"]);
+        assert_eq!(lookup_cymru_info(&[]), CymruInfo::default());
     }
 }
