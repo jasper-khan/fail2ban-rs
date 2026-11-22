@@ -536,6 +536,7 @@ mod tests {
             ip_jail_failures: 7,
             ip_matches: vec!["m1".to_owned(), "m2$x".to_owned()],
             ip_jail_matches: vec!["jm1".to_owned()],
+            jail_stats: Default::default(),
         };
 
         let rdns_calls = std::cell::Cell::new(0usize);
@@ -591,6 +592,7 @@ mod tests {
             ip_jail_failures: 1,
             ip_matches: vec![],
             ip_jail_matches: vec![],
+            jail_stats: Default::default(),
         };
         let rendered = replace_dynamic_tags(
             "<fid>|<ip>|<ip-rev>|<subnet>|<cidr>|<bantime>|<time>|<restored>",

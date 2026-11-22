@@ -285,4 +285,14 @@ pub struct ActionContext {
     pub ip_matches: Vec<String>,
     /// Historical + current matched lines in this jail (`<ipjailmatches>`).
     pub ip_jail_matches: Vec<String>,
+    /// Live jail counters exposed to Python `ActionInfo` (`jail.banned`, etc.).
+    pub jail_stats: ActionJailStats,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ActionJailStats {
+    pub banned: usize,
+    pub banned_total: u64,
+    pub found: usize,
+    pub found_total: u64,
 }

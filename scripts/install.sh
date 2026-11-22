@@ -6,6 +6,7 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 root="${DESTDIR:-}"
 bin="$root/usr/local/bin"
 units="$root/usr/local/lib/systemd/system"
+python_library="$root/usr/local/lib/fail2ban-rs/python.zip"
 config="$root/etc/fail2ban"
 man="$root/usr/local/share/man"
 
@@ -27,6 +28,7 @@ if [[ "${1:-}" == --uninstall ]]; then
     rm -f -- "$bin/fail2ban-regex"
     rm -f -- "$units/fail2ban.service"
     rm -f -- "$units/fail2ban.socket"
+    rm -f -- "$python_library"
     rm -f -- "$man/man1/fail2ban.1"
     rm -f -- "$man/man1/fail2ban-server.1"
     rm -f -- "$man/man1/fail2ban-client.1"
@@ -88,6 +90,7 @@ for binary in fail2ban-server fail2ban-client fail2ban-regex; do
 done
 install_member fail2ban.service 0644 "$units/fail2ban.service"
 install_member fail2ban.socket 0644 "$units/fail2ban.socket"
+install_member python.zip 0644 "$python_library"
 for page in fail2ban fail2ban-server fail2ban-client fail2ban-regex; do
     install_member "man/$page.1" 0644 "$man/man1/$page.1"
 done

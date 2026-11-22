@@ -348,8 +348,13 @@ impl Transmitter {
             return Ok(value);
         }
         let jail = self.jail(name)?;
-        let jail = jail.state.lock().await;
-        jail_property(&jail, string(args, 1)?, args.get(2..).unwrap_or_default())
+        let mut jail = jail.state.lock().await;
+        jail_property(
+            &mut jail,
+            string(args, 1)?,
+            args.get(2..).unwrap_or_default(),
+        )
+        .await
     }
 
     fn set_global(&mut self, key: &str, args: &[Value]) -> Result<Option<Value>> {
@@ -557,9 +562,13 @@ impl Transmitter {
                 key
             }
             "bantime" => {
-                state
-                    .ban_manager
-                    .set_ban_time(str2seconds_i64(&scalar(args, 0)?)?);
+                let time = str2seconds_i64(&scalar(args, 0)?)?;
+                state.ban_manager.set_ban_time(time);
+                for (_, action) in &mut state.actions {
+                    if let ActionKind::Python(action) = action {
+                        action.set_ban_time(time);
+                    }
+                }
                 key
             }
             "banip" => return Ok(integer(state.ban_ip(&strings(args)?).await?)),
@@ -581,7 +590,7 @@ impl Transmitter {
                 } else {
                     None
                 };
-                state.add_action(action, path, init)?;
+                state.add_action(action, path, init).await?;
                 return Ok(if quiet { Null } else { text(action) });
             }
             "delaction" => {
@@ -620,7 +629,7 @@ impl Transmitter {
         let response = if quiet {
             Null
         } else {
-            jail_property(&state, get_key, &[])?
+            jail_property(&mut state, get_key, &[]).await?
         };
         drop(state);
         if restart {
@@ -630,7 +639,7 @@ impl Transmitter {
     }
 }
 
-fn jail_property(jail: &JailState, key: &str, args: &[Value]) -> Result<Value> {
+async fn jail_property(jail: &mut JailState, key: &str, args: &[Value]) -> Result<Value> {
     let filter = &jail.filter;
     Ok(match key {
         "logpath" => Value::str_list(jail.get_log_paths()),
@@ -675,15 +684,17 @@ fn jail_property(jail: &JailState, key: &str, args: &[Value]) -> Result<Value> {
         "actions" => Value::str_list(jail.actions.iter().map(|(name, _)| name)),
         "action" | "actionproperties" | "actionmethods" => {
             let name = string(args, 0)?;
-            let action = jail.get_action(name).ok_or_else(|| unknown_action(name))?;
+            let action = jail
+                .get_action_mut(name)
+                .ok_or_else(|| unknown_action(name))?;
             match key {
-                "actionproperties" => Value::str_list(action.property_names()),
-                "actionmethods" => Value::str_list(action.methods()),
+                "actionproperties" => action.property_names().await?,
+                "actionmethods" => action.methods().await?,
                 _ => {
                     let property = string(args, 1)?;
-                    text(action.get_property(property).ok_or_else(|| {
+                    action.get_property(property).await?.ok_or_else(|| {
                         Error::invalid_command(format!("Action has no attribute {property:?}"))
-                    })?)
+                    })?
                 }
             }
         }
@@ -705,17 +716,19 @@ async fn change_action(
     default_ban_time: i64,
 ) -> Result<Value> {
     let key = string(args, 0)?;
-    if action.methods().iter().any(|m| m == key) {
-        let cls = match action {
-            ActionKind::Command(_) => "CommandAction",
-            ActionKind::Smtp(_) => "SMTPAction",
-        };
+    let cls = match action {
+        ActionKind::Python(py) => return py.set_or_call(key, args.get(1)).await,
+        ActionKind::Command(a) if a.methods().iter().any(|m| m == key) => Some("CommandAction"),
+        ActionKind::Smtp(a) if a.methods().iter().any(|m| m == key) => Some("SMTPAction"),
+        ActionKind::Command(_) | ActionKind::Smtp(_) => None,
+    };
+    if let Some(cls) = cls {
         let kwargs = parse_action_kwargs(args.get(1), cls, key)?;
         return call_action_method(action, cls, key, &kwargs, default_ban_time).await;
     }
     let value = scalar(args, 1)?;
-    action.set_property(key, &value)?;
-    Ok(action.get_property(key).map_or(Null, text))
+    action.set_property(key, &value).await?;
+    Ok(action.get_property(key).await?.unwrap_or(Null))
 }
 
 fn parse_action_kwargs(
@@ -822,6 +835,7 @@ fn action_context_from_json(
         ip_jail_failures,
         ip_matches: Vec::new(),
         ip_jail_matches: Vec::new(),
+        jail_stats: Default::default(),
     }
 }
 
@@ -844,17 +858,17 @@ async fn call_action_method(
             Ok(Null)
         }
         "reload" => {
-            action.reload().await?;
+            action.reload(None).await?;
             Ok(Null)
         }
         "flush" => {
             reject_unknown_kwargs(kwargs, cls, method, &[])?;
-            action.flush().await?;
+            let _ = action.flush().await?;
             Ok(Null)
         }
         "clearAllParams" => {
             reject_unknown_kwargs(kwargs, cls, method, &[])?;
-            action.clear_all_params();
+            action.clear_all_params().await?;
             Ok(Null)
         }
         "invalidateBanEpoch" => {

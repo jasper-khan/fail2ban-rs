@@ -4,10 +4,20 @@
 //! using exact upstream templates and a native async RFC 5321/2822 client
 //! over `tokio::net::TcpStream` (supporting `AUTH PLAIN` and `AUTH LOGIN`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::crypto::{
+    WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
+};
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::{self, ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 use crate::duration::parse_bool;
 use crate::error::{Error, Result};
@@ -38,6 +48,18 @@ pub struct SmtpAction {
 }
 
 impl SmtpAction {
+    // Recognize the verbatim bytes shipped in 1.1.1 so a customized file named smtp.py still runs as a Python action.
+    pub(crate) fn is_stock_module(path: &str) -> bool {
+        const STOCK_SIZE: u64 = 6725;
+        const STOCK_FNV1A: u64 = 0x6cd4_8e15_f154_e630;
+        std::fs::metadata(path).is_ok_and(|info| info.is_file() && info.len() == STOCK_SIZE)
+            && std::fs::read(path).is_ok_and(|bytes| {
+                bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+                }) == STOCK_FNV1A
+            })
+    }
+
     /// Construct an `SmtpAction` with exact upstream defaults from `smtp.py`.
     pub fn new(jail_name: String, name: String) -> Self {
         Self {
@@ -286,17 +308,9 @@ impl SmtpAction {
             .unwrap_or_else(|| tags::system_hostnames().1.as_str())
     }
 
-    /// Send an email over SMTP (`tokio::net::TcpStream`).
-    ///
-    /// TLS (`ssl=true`) is explicitly rejected because no TLS crate is linked.
+    /// Send an email over SMTP, upgrading via `STARTTLS` when `ssl=true`.
     pub async fn send_message(&self, subject: &str, body: &str) -> Result<()> {
-        if self.ssl {
-            return Err(Error::action("smtp ssl=true requires TLS support"));
-        }
-
         let (smtp_host, smtp_port) = parse_host_port(&self.host)?;
-        let recipients = parse_recipients(&self.dest)?;
-        let from_addr = sanitize_envelope_addr(&self.sender);
         let ehlo_host = sanitize_header(self.hostname());
         let ehlo_name = if ehlo_host.is_empty() {
             "localhost"
@@ -331,48 +345,62 @@ impl SmtpAction {
             greeting.trim()
         );
 
-        // EHLO / HELO fallback
-        send_line(&mut writer, &format!("EHLO {ehlo_name}"), self.timeout).await?;
-        let (ehlo_code, mut ehlo_text) = read_smtp_reply(&mut reader, self.timeout).await?;
-        if matches!(ehlo_code, 500 | 502) {
-            send_line(&mut writer, &format!("HELO {ehlo_name}"), self.timeout).await?;
-            let (helo_code, helo_text) = read_smtp_reply(&mut reader, self.timeout).await?;
-            if helo_code != 250 {
-                return Err(Error::action(format!(
-                    "SMTP HELO failed with {helo_code}: {helo_text}"
-                )));
+        let ehlo = smtp_hello(&mut reader, &mut writer, ehlo_name, self.timeout).await?;
+        if self.ssl {
+            if !ehlo.lines().skip(1).any(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("STARTTLS"))
+            }) {
+                return Err(Error::action(
+                    "STARTTLS extension not supported by SMTP server",
+                ));
             }
-            ehlo_text = helo_text;
-        } else if ehlo_code != 250 {
-            return Err(Error::action(format!(
-                "SMTP EHLO failed with {ehlo_code}: {ehlo_text}"
-            )));
+            send_line(&mut writer, "STARTTLS", self.timeout).await?;
+            expect_code(&mut reader, &[220], "STARTTLS", self.timeout).await?;
+            if !reader.buffer().is_empty() {
+                return Err(Error::action(
+                    "unexpected pipelined data before SMTP STARTTLS",
+                ));
+            }
+            let stream = reader
+                .into_inner()
+                .reunite(writer)
+                .map_err(|e| Error::action(format!("opening SMTP TLS stream: {e}")))?;
+            let stream = smtp_tls(stream, &smtp_host, self.timeout).await?;
+            let (read, mut writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let ehlo = smtp_hello(&mut reader, &mut writer, ehlo_name, self.timeout).await?;
+            return self
+                .send_envelope(&mut reader, &mut writer, &ehlo, subject, body)
+                .await;
         }
+        self.send_envelope(&mut reader, &mut writer, &ehlo, subject, body)
+            .await
+    }
+
+    async fn send_envelope<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        &self,
+        reader: &mut BufReader<R>,
+        writer: &mut W,
+        ehlo_text: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<()> {
+        let recipients = parse_recipients(&self.dest)?;
+        let from_addr = sanitize_envelope_addr(&self.sender);
 
         // AUTH PLAIN / AUTH LOGIN when credentials are provided
         if let (Some(user), Some(pass)) = (
             self.user.as_deref().filter(|s| !s.is_empty()),
             self.password.as_deref().filter(|s| !s.is_empty()),
         ) {
-            smtp_auth(
-                &mut reader,
-                &mut writer,
-                user,
-                pass,
-                &ehlo_text,
-                self.timeout,
-            )
-            .await?;
+            smtp_auth(reader, writer, user, pass, ehlo_text, self.timeout).await?;
         }
 
         // MAIL FROM
-        send_line(
-            &mut writer,
-            &format!("MAIL FROM:<{from_addr}>"),
-            self.timeout,
-        )
-        .await?;
-        expect_code(&mut reader, &[250], "MAIL FROM", self.timeout).await?;
+        send_line(writer, &format!("MAIL FROM:<{from_addr}>"), self.timeout).await?;
+        expect_code(reader, &[250], "MAIL FROM", self.timeout).await?;
 
         // RCPT TO for every recipient
         let mut accepted = 0usize;
@@ -382,8 +410,8 @@ impl SmtpAction {
             if clean.is_empty() {
                 continue;
             }
-            send_line(&mut writer, &format!("RCPT TO:<{clean}>"), self.timeout).await?;
-            let (rc, msg) = read_smtp_reply(&mut reader, self.timeout).await?;
+            send_line(writer, &format!("RCPT TO:<{clean}>"), self.timeout).await?;
+            let (rc, msg) = read_smtp_reply(reader, self.timeout).await?;
             if matches!(rc, 250 | 251) {
                 accepted += 1;
             } else {
@@ -391,7 +419,7 @@ impl SmtpAction {
             }
         }
         if accepted == 0 {
-            let _ = send_quit(&mut reader, &mut writer, self.timeout).await;
+            let _ = send_quit(reader, writer, self.timeout).await;
             return Err(Error::action(format!(
                 "SMTP all recipients rejected: {}",
                 failed_rcpts.join("; ")
@@ -408,8 +436,8 @@ impl SmtpAction {
         }
 
         // DATA
-        send_line(&mut writer, "DATA", self.timeout).await?;
-        expect_code(&mut reader, &[354], "DATA", self.timeout).await?;
+        send_line(writer, "DATA", self.timeout).await?;
+        expect_code(reader, &[354], "DATA", self.timeout).await?;
 
         let message_bytes =
             build_rfc2822_message(subject, &self.sendername, &from_addr, &self.dest, body);
@@ -422,7 +450,7 @@ impl SmtpAction {
             .map_err(|_| Error::action("timed out flushing SMTP DATA"))?
             .map_err(|e| Error::action(format!("flushing SMTP DATA failed: {e}")))?;
 
-        expect_code(&mut reader, &[250], "DATA end", self.timeout).await?;
+        expect_code(reader, &[250], "DATA end", self.timeout).await?;
         f2b_log!(
             LogLevel::Debug,
             "fail2ban.smtp",
@@ -430,8 +458,87 @@ impl SmtpAction {
             sanitize_header(subject)
         );
 
-        let _ = send_quit(&mut reader, &mut writer, self.timeout).await;
+        let _ = send_quit(reader, writer, self.timeout).await;
         Ok(())
+    }
+}
+
+async fn smtp_hello<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    name: &str,
+    timeout: Duration,
+) -> Result<String> {
+    send_line(writer, &format!("EHLO {name}"), timeout).await?;
+    let (code, text) = read_smtp_reply(reader, timeout).await?;
+    if code == 250 {
+        return Ok(text);
+    }
+    send_line(writer, &format!("HELO {name}"), timeout).await?;
+    expect_code(reader, &[250], "HELO", timeout).await?;
+    Ok(String::new())
+}
+
+async fn smtp_tls(
+    stream: TcpStream,
+    host: &str,
+    timeout: Duration,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let server_name = ServerName::try_from(host.to_owned())
+        .map_err(|e| Error::action(format!("invalid SMTP TLS server name: {e}")))?;
+    let provider = rustls::crypto::ring::default_provider();
+    let verifier = SmtpServerVerifier(provider.signature_verification_algorithms);
+    let config = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::action(format!("setting up SMTP TLS: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    tokio::time::timeout(
+        timeout,
+        TlsConnector::from(Arc::new(config)).connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| Error::action("timed out negotiating SMTP STARTTLS"))?
+    .map_err(|e| Error::action(format!("SMTP STARTTLS failed: {e}")))
+}
+
+/// Fail2Ban 1.1.1 calls `SMTP.starttls()` with Python's default unauthenticated certificate context.
+#[derive(Debug)]
+struct SmtpServerVerifier(WebPkiSupportedAlgorithms);
+
+impl ServerCertVerifier for SmtpServerVerifier {
+    fn verify_server_cert(
+        &self,
+        _cert: &CertificateDer<'_>,
+        _chain: &[CertificateDer<'_>],
+        _name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, signature, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, signature, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
     }
 }
 
@@ -571,12 +678,15 @@ async fn read_smtp_reply<R: tokio::io::AsyncRead + Unpin>(
     let mut reply_code: Option<u16> = None;
     loop {
         let mut line = String::new();
-        let n = tokio::time::timeout(io_timeout, reader.read_line(&mut line))
+        let n = tokio::time::timeout(io_timeout, (&mut *reader).take(8193).read_line(&mut line))
             .await
             .map_err(|_| Error::action("timed out waiting for SMTP server response"))?
             .map_err(|e| Error::action(format!("reading SMTP server response failed: {e}")))?;
         if n == 0 {
             return Err(Error::action("SMTP server closed connection unexpectedly"));
+        }
+        if n > 8192 {
+            return Err(Error::action("SMTP reply line exceeds 8192 bytes"));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.len() < 3 {
@@ -584,9 +694,10 @@ async fn read_smtp_reply<R: tokio::io::AsyncRead + Unpin>(
                 "malformed SMTP reply line: {trimmed:?}"
             )));
         }
-        let code: u16 = trimmed[..3]
-            .parse()
-            .map_err(|_| Error::action(format!("invalid SMTP reply code in {trimmed:?}")))?;
+        let code: u16 = trimmed
+            .get(..3)
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| Error::action(format!("invalid SMTP reply code in {trimmed:?}")))?;
         if let Some(prev) = reply_code
             && prev != code
         {
@@ -850,6 +961,7 @@ mod tests {
             ip_jail_failures: 4,
             ip_matches: vec!["all1".to_owned()],
             ip_jail_matches: vec!["jail1".to_owned(), ".dotline".to_owned()],
+            jail_stats: Default::default(),
         };
         let (ban_sub, ban_body) = act.format_ban_message(&ctx);
         assert_eq!(ban_sub, "[Fail2Ban] sshd: banned 198.51.100.7 from mx01");
@@ -863,12 +975,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ssl_true_returns_clear_error() {
-        let mut act =
-            SmtpAction::from_json("sshd".to_owned(), "smtp".to_owned(), r#"{"ssl":"true"}"#)
+    async fn required_starttls_never_sends_credentials_in_plaintext() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            write.write_all(b"220 sample ready\r\n").await.unwrap();
+            let mut hello = String::new();
+            read.read_line(&mut hello).await.unwrap();
+            assert!(hello.starts_with("EHLO "));
+            write
+                .write_all(b"250-sample\r\n250 AUTH PLAIN\r\n")
+                .await
                 .unwrap();
+            let mut extra = Vec::new();
+            read.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty());
+        });
+        let mut act = SmtpAction::from_json(
+            "sshd".to_owned(),
+            "smtp".to_owned(),
+            r#"{"ssl":true,"user":"fixture","password":"fixture"}"#,
+        )
+        .unwrap();
+        act.host = address.to_string();
         let err = act.start().await.unwrap_err();
-        assert!(err.to_string().contains("TLS"));
+        assert!(err.to_string().contains("STARTTLS extension"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -951,6 +1086,7 @@ mod tests {
             ip_jail_failures: 1,
             ip_matches: vec![],
             ip_jail_matches: vec![],
+            jail_stats: Default::default(),
         };
         act.ban(&restored_ctx).await.unwrap();
 
@@ -965,6 +1101,7 @@ mod tests {
             ip_jail_failures: 3,
             ip_matches: vec![],
             ip_jail_matches: vec![],
+            jail_stats: Default::default(),
         };
         act.ban(&ctx).await.unwrap();
 

@@ -687,6 +687,7 @@ impl CommandAction {
             ip_jail_failures: 0,
             ip_matches: Vec::new(),
             ip_jail_matches: Vec::new(),
+            jail_stats: Default::default(),
         };
         let real_cmd = tags::replace_dynamic_tags(
             static_cmd,
@@ -733,6 +734,7 @@ mod tests {
             ip_jail_failures: 2,
             ip_matches: vec!["auth failed".to_owned()],
             ip_jail_matches: vec!["auth failed".to_owned()],
+            jail_stats: Default::default(),
         }
     }
 

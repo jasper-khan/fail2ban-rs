@@ -34,7 +34,7 @@ use crate::filter::ipdns::allow_ipv6;
 use crate::logging::LogLevel;
 use crate::observer::{self, BanTimeExtra};
 use crate::protocol::PickleValue;
-use crate::ticket::{ActionContext, Ticket, TicketId};
+use crate::ticket::{ActionContext, ActionJailStats, Ticket, TicketId};
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const PERIODIC_CHECK_INTERVAL_SECS: f64 = 30.0;
@@ -344,14 +344,15 @@ impl JailState {
         }
     }
 
-    /// Add or reload an action (`CommandAction` or built-in `smtp.py` Python action).
-    pub fn add_action(
+    /// Add or reload an action.
+    pub async fn add_action(
         &mut self,
         act_name: &str,
         python_path: Option<&str>,
         init_json: Option<&str>,
     ) -> Result<()> {
         let init_str = init_json.unwrap_or("{}");
+        let ban_time = self.ban_manager.ban_time();
         if let Some(pos) = self.actions.iter().position(|(n, _)| n == act_name) {
             if !self.reloading {
                 return Err(Error::invalid_command(format!(
@@ -360,13 +361,14 @@ impl JailState {
             }
             let same_kind = match (&self.actions[pos].1, python_path) {
                 (ActionKind::Command(_), None) => true,
-                (ActionKind::Smtp(_), Some(p)) => {
-                    p.rsplit(['/', '\\']).next().unwrap_or(p) == "smtp.py"
+                (ActionKind::Smtp(_), Some(path)) => {
+                    crate::action::SmtpAction::is_stock_module(path)
                 }
+                (ActionKind::Python(action), Some(path)) => action.can_reload(path),
                 _ => false,
             };
             if same_kind {
-                self.actions[pos].1.clear_all_params();
+                self.actions[pos].1.clear_all_params().await?;
                 if let ActionKind::Smtp(ref mut smtp) = self.actions[pos].1
                     && let Some(raw) = init_json
                 {
@@ -377,7 +379,8 @@ impl JailState {
                     )?;
                 }
             } else {
-                let replacement = build_action(&self.name, act_name, python_path, init_str)?;
+                let replacement =
+                    build_action(&self.name, act_name, python_path, init_str, ban_time).await?;
                 self.actions[pos].1 = replacement;
             }
             if let Some(ref mut kept) = self.reload_actions {
@@ -386,7 +389,7 @@ impl JailState {
             return Ok(());
         }
 
-        let action = build_action(&self.name, act_name, python_path, init_str)?;
+        let action = build_action(&self.name, act_name, python_path, init_str, ban_time).await?;
         self.actions.push((act_name.to_owned(), action));
         if self.reloading
             && let Some(ref mut kept) = self.reload_actions
@@ -411,14 +414,6 @@ impl JailState {
     pub fn get_action_mut(&mut self, act_name: &str) -> Option<&mut ActionKind> {
         self.actions
             .iter_mut()
-            .find(|(n, _)| n == act_name)
-            .map(|(_, a)| a)
-    }
-
-    /// Look up shared reference to an action by name.
-    pub fn get_action(&self, act_name: &str) -> Option<&ActionKind> {
-        self.actions
-            .iter()
             .find(|(n, _)| n == act_name)
             .map(|(_, a)| a)
     }
@@ -466,13 +461,15 @@ impl JailState {
             }
 
             for idx in kept_indices {
-                if let Err(err) = self.actions[idx].1.reload().await {
+                let (name, action) = &mut self.actions[idx];
+                let options = kept_actions.get(name).and_then(Option::as_deref);
+                if let Err(err) = action.reload(options).await {
                     f2b_log!(
                         LogLevel::Error,
                         "fail2ban.actions",
                         "Failed to reload jail '{}' action '{}': {err}",
                         self.name,
-                        self.actions[idx].0
+                        name
                     );
                 }
             }
@@ -488,16 +485,21 @@ impl JailState {
                 for act_name in &removed {
                     if let Some(pos) = self.actions.iter().position(|(n, _)| n == act_name) {
                         let (_, mut act) = self.actions.remove(pos);
+                        let mut flushed = false;
                         if act.supports_flush() {
-                            if let Err(err) = act.flush().await {
-                                f2b_log!(
-                                    LogLevel::Error,
-                                    "fail2ban.actions",
-                                    "Failed to flush removed action '{act_name}' in '{}': {err}",
-                                    self.name
-                                );
+                            match act.flush().await {
+                                Ok(ok) => flushed = ok,
+                                Err(err) => {
+                                    f2b_log!(
+                                        LogLevel::Error,
+                                        "fail2ban.actions",
+                                        "Failed to flush removed action '{act_name}' in '{}': {err}",
+                                        self.name
+                                    );
+                                }
                             }
-                        } else {
+                        }
+                        if !flushed {
                             for ticket in &active_tickets {
                                 let ctx = self.build_action_context(ticket, false);
                                 if let Err(err) = act.unban(&ctx).await {
@@ -1065,9 +1067,10 @@ impl JailState {
                     act_name
                 );
                 match act.flush().await {
-                    Ok(()) => {
+                    Ok(true) => {
                         flushed_actions.insert(act_name.clone());
                     }
+                    Ok(false) => {}
                     Err(err) => {
                         f2b_log!(
                             LogLevel::Error,
@@ -1168,6 +1171,12 @@ impl JailState {
             ip_jail_failures,
             ip_matches,
             ip_jail_matches,
+            jail_stats: ActionJailStats {
+                banned: self.ban_manager.size(),
+                banned_total: self.ban_manager.total_bans(),
+                found: self.fail_manager.size(),
+                found_total: self.fail_manager.total_failures(),
+            },
         }
     }
 
@@ -1396,14 +1405,17 @@ impl JailState {
     }
 }
 
-fn build_action(
+async fn build_action(
     jail_name: &str,
     act_name: &str,
     python_path: Option<&str>,
     init_json: &str,
+    ban_time: i64,
 ) -> Result<ActionKind> {
     match python_path {
-        Some(path) => ActionKind::from_python_spec(jail_name, act_name, path, init_json),
+        Some(path) => {
+            ActionKind::from_python_spec(jail_name, act_name, path, init_json, ban_time).await
+        }
         None => Ok(ActionKind::command(
             jail_name.to_owned(),
             act_name.to_owned(),
@@ -1789,17 +1801,19 @@ mod tests {
             st.fail_manager.set_max_retry(2);
             st.ban_manager.set_ban_time(3);
             st.add_log_path(log_file.clone(), false).unwrap();
-            st.add_action("rec", None, None).unwrap();
+            st.add_action("rec", None, None).await.unwrap();
             let act = st.get_action_mut("rec").unwrap();
             act.set_property(
                 "actionban",
                 &format!("echo ban:<ip> >> '{}'", ban_log.display()),
             )
+            .await
             .unwrap();
             act.set_property(
                 "actionunban",
                 &format!("echo unban:<ip> >> '{}'", ban_log.display()),
             )
+            .await
             .unwrap();
         }
 
@@ -1889,23 +1903,25 @@ mod tests {
             st.filter.set_ignore_self(false);
             st.ban_extra.set_opt("increment", Some("true")).unwrap();
 
-            st.add_action("fw", None, None).unwrap();
+            st.add_action("fw", None, None).await.unwrap();
             st.get_action_mut("fw")
                 .unwrap()
                 .set_property(
                     "actionban",
                     &format!("echo fw:<ip> >> '{}'", ban_log.display()),
                 )
+                .await
                 .unwrap();
 
-            st.add_action("notify", None, None).unwrap();
+            st.add_action("notify", None, None).await.unwrap();
             let notify = st.get_action_mut("notify").unwrap();
-            notify.set_property("norestored", "true").unwrap();
+            notify.set_property("norestored", "true").await.unwrap();
             notify
                 .set_property(
                     "actionban",
                     &format!("echo notify:<ip> >> '{}'", ban_log.display()),
                 )
+                .await
                 .unwrap();
         }
 
