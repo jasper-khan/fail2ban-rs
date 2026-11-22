@@ -7,6 +7,7 @@ root="${DESTDIR:-}"
 bin="$root/usr/local/bin"
 units="$root/usr/local/lib/systemd/system"
 python_library="$root/usr/local/lib/fail2ban-rs/python.zip"
+unit_state="$root/usr/local/lib/fail2ban-rs/systemd-state"
 config="$root/etc/fail2ban"
 man="$root/usr/local/share/man"
 
@@ -20,8 +21,22 @@ esac
 [[ $(uname -s) == Linux ]] || die "Fail2Ban requires Linux."
 
 if [[ "${1:-}" == --uninstall ]]; then
+    saved_service_enabled=""
+    saved_socket_enabled=""
+    if [[ -f "$unit_state" ]]; then
+        while IFS='=' read -r k v; do
+            case "$k" in
+                fail2ban.service) saved_service_enabled="$v" ;;
+                fail2ban.socket) saved_socket_enabled="$v" ;;
+            esac
+        done < "$unit_state"
+    fi
     if [[ -z "$root" && -f "$units/fail2ban.service" ]]; then
-        systemctl disable --now fail2ban.socket fail2ban.service
+        if [[ -n "$saved_service_enabled" || -n "$saved_socket_enabled" ]]; then
+            systemctl stop fail2ban.socket fail2ban.service || true
+        else
+            systemctl disable --now fail2ban.socket fail2ban.service
+        fi
     fi
     rm -f -- "$bin/fail2ban-server"
     rm -f -- "$bin/fail2ban-client"
@@ -29,6 +44,8 @@ if [[ "${1:-}" == --uninstall ]]; then
     rm -f -- "$units/fail2ban.service"
     rm -f -- "$units/fail2ban.socket"
     rm -f -- "$python_library"
+    rm -f -- "$unit_state"
+    rmdir -- "$root/usr/local/lib/fail2ban-rs" 2>/dev/null || true
     rm -f -- "$man/man1/fail2ban.1"
     rm -f -- "$man/man1/fail2ban-server.1"
     rm -f -- "$man/man1/fail2ban-client.1"
@@ -36,6 +53,16 @@ if [[ "${1:-}" == --uninstall ]]; then
     rm -f -- "$man/man5/jail.conf.5"
     if [[ -z "$root" ]]; then
         systemctl daemon-reload
+        if [[ "$saved_service_enabled" == enabled ]]; then
+            systemctl enable fail2ban.service || true
+        elif [[ "$saved_service_enabled" == disabled ]]; then
+            systemctl disable fail2ban.service || true
+        fi
+        if [[ "$saved_socket_enabled" == enabled ]]; then
+            systemctl enable fail2ban.socket || true
+        elif [[ "$saved_socket_enabled" == disabled ]]; then
+            systemctl disable fail2ban.socket || true
+        fi
     fi
     exit 0
 fi
@@ -48,7 +75,7 @@ if [[ -z "$root" ]] && {
     die "Stop fail2ban.service and fail2ban.socket before replacing the binaries."
 fi
 
-version="${FAIL2BAN_VERSION:-1.1.1}"
+version="${FAIL2BAN_VERSION:-1.1.2}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid Fail2Ban version."
 case "$(uname -m)" in
     x86_64|amd64) arch=amd64 ;;
@@ -85,6 +112,18 @@ install_member() {
     tar -xOzf "$archive" "$name/$1" > "$work/member"
     install -D -m "$2" "$work/member" "$3"
 }
+if [[ -z "$root" && ! -f "$unit_state" ]]; then
+    svc_state="disabled"
+    sock_state="disabled"
+    if systemctl is-enabled --quiet fail2ban.service 2>/dev/null; then
+        svc_state="enabled"
+    fi
+    if systemctl is-enabled --quiet fail2ban.socket 2>/dev/null; then
+        sock_state="enabled"
+    fi
+    install -d -m 0755 "$root/usr/local/lib/fail2ban-rs"
+    printf 'fail2ban.service=%s\nfail2ban.socket=%s\n' "$svc_state" "$sock_state" > "$unit_state"
+fi
 for binary in fail2ban-server fail2ban-client fail2ban-regex; do
     install_member "bin/$binary" 0755 "$bin/$binary"
 done

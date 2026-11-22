@@ -158,7 +158,7 @@ impl FilterPoll {
                 break;
             }
             let events = self.poll_once();
-            if !send_events(&tx, events).await {
+            if !send_events(&tx, &mut shutdown, events).await {
                 break;
             }
             tokio::select! {

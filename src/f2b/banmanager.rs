@@ -254,6 +254,23 @@ impl BanManager {
         removed
     }
 
+    /// Re-insert a ticket whose action unban failed without incrementing `total_bans` or `ban_count`.
+    pub fn retain_for_retry(&mut self, ticket: Ticket) {
+        let eob = comparison_end(&ticket, self.ban_time);
+        if self.next_unban_time > eob {
+            self.next_unban_time = eob;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.ban_list.insert(
+            ticket.fid.clone(),
+            BanEntry {
+                ticket,
+                insertion: seq,
+            },
+        );
+    }
+
     fn recompute_next_unban(&mut self) {
         self.next_unban_time = self
             .ban_list

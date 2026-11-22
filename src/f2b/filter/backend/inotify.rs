@@ -156,7 +156,7 @@ impl FilterPyinotify {
             self.register_dir_watch(async_fd.get_ref(), &cfg.path);
             self.try_open_file(async_fd.get_ref(), cfg, None, &mut startup_events);
         }
-        if !send_events(&tx, startup_events).await {
+        if !send_events(&tx, &mut shutdown, startup_events).await {
             return Ok(());
         }
 
@@ -178,7 +178,7 @@ impl FilterPyinotify {
                 }
                 () = tokio::time::sleep(pending_wait), if has_pending => {
                     let retry_events = self.retry_pending(async_fd.get_ref());
-                    if !send_events(&tx, retry_events).await {
+                    if !send_events(&tx, &mut shutdown, retry_events).await {
                         break;
                     }
                 }
@@ -212,7 +212,7 @@ impl FilterPyinotify {
                         }
                     }
 
-                    if !send_events(&tx, batch_events).await {
+                    if !send_events(&tx, &mut shutdown, batch_events).await {
                         break;
                     }
                 }

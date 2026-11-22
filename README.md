@@ -21,15 +21,15 @@ With Zig, `cargo-zigbuild`, and Python 3 installed, build the Linux amd64 and ar
 
 ```bash
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-bash scripts/build-release.sh 1.1.1
+bash scripts/build-release.sh 1.1.2
 ```
 
 Run the installer for your architecture from the release directory.
 
 ```bash
-cd dist/v1.1.1
-sha256sum -c fail2ban-rs-1.1.1-linux-amd64.tar.gz.sha256
-sudo bash ../../scripts/install.sh fail2ban-rs-1.1.1-linux-amd64.tar.gz
+cd dist/v1.1.2
+sha256sum -c fail2ban-rs-1.1.2-linux-amd64.tar.gz.sha256
+sudo bash ../../scripts/install.sh fail2ban-rs-1.1.2-linux-amd64.tar.gz
 ```
 
 The installer puts `fail2ban-client`, `fail2ban-server`, and `fail2ban-regex` in `/usr/local/bin`.

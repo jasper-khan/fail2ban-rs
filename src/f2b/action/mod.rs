@@ -127,9 +127,10 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.clear_all_params(),
             Self::Smtp(a) => a.clear_all_params(),
-            Self::Python(a) => {
+            Self::Python(a) if a.has_clear_all_params => {
                 a.method("clearAllParams", None).await?;
             }
+            Self::Python(_) => {}
         }
         Ok(())
     }

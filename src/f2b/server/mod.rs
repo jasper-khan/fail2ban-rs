@@ -1,7 +1,8 @@
 //! Fail2Ban server lifecycle and local command socket.
 
-mod jail;
+pub mod jail;
 mod transmitter;
+pub use transmitter::Transmitter;
 
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
@@ -32,7 +33,6 @@ use crate::protocol::{
     DEFAULT_TIMEOUT, PickleValue, decode_pickle, encode_frame, err_response_kind, ok_response,
     read_frame,
 };
-use transmitter::Transmitter;
 
 pub fn run_cli(args: Vec<String>) -> i32 {
     let Ok(CliAction::Run(opts, command)) = parse_cli(&args) else {

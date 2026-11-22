@@ -89,8 +89,8 @@ def capabilities(action):
         bool(getattr(action, "norestored", False)),
         bool(getattr(action, "_prolongable", False)),
         flushable,
-        callable(getattr(action, "reload", None))
-        and callable(getattr(action, "clearAllParams", None)),
+        callable(getattr(action, "reload", None)),
+        callable(getattr(action, "clearAllParams", None)),
         callable(getattr(action, "consistencyCheck", None)),
     ]
 

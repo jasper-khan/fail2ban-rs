@@ -2,6 +2,7 @@
 //! `fail2ban/server/filtersystemd.py`, backed by `journalctl --output=json --follow`.
 
 use std::process::Stdio;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -58,101 +59,163 @@ impl FilterSystemd {
         build_journalctl_args(&self.config, self.since_epoch, self.tail)
     }
 
-    /// Spawn `journalctl` and forward formatted journal entries until `shutdown` signals
-    /// `true`, `tx` closes, or `journalctl` exits.
+    /// Spawn `journalctl`, supervise unexpected exits with backoff, and forward
+    /// formatted journal entries until `shutdown` signals `true` or `tx` closes.
     pub async fn run(
-        self,
+        mut self,
         tx: mpsc::Sender<LogEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-
-        let args = self.args();
-        let mut child = Command::new(&self.journalctl_bin)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|err| {
-                Error::io(
-                    format!("Failed to spawn {} {:?}", self.journalctl_bin, args),
-                    err,
-                )
-            })?;
-
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(Error::io(
-                "journalctl child stdout not captured",
-                std::io::Error::other("stdout pipe unavailable"),
-            ));
-        };
-
-        let mut reader = BufReader::new(stdout);
-        let mut line_buf = String::new();
+        let start_wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        let mut in_operation = self.tail;
+        let mut backoff = Duration::from_millis(100);
 
         loop {
-            line_buf.clear();
-            tokio::select! {
-                res = shutdown.changed() => {
-                    if res.is_err() || *shutdown.borrow() {
-                        break;
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+
+            let args = self.args();
+            let mut child = Command::new(&self.journalctl_bin)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|err| {
+                    Error::io(
+                        format!("Failed to spawn {} {:?}", self.journalctl_bin, args),
+                        err,
+                    )
+                })?;
+
+            let Some(stdout) = child.stdout.take() else {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(Error::io(
+                    "journalctl child stdout not captured",
+                    std::io::Error::other("stdout pipe unavailable"),
+                ));
+            };
+
+            let mut reader = BufReader::new(stdout);
+            let mut line_buf = String::new();
+            let mut stop_requested = false;
+            let mut made_progress = false;
+
+            loop {
+                line_buf.clear();
+                tokio::select! {
+                    res = shutdown.changed() => {
+                        if res.is_err() || *shutdown.borrow() {
+                            stop_requested = true;
+                            break;
+                        }
                     }
-                }
-                read_res = reader.read_line(&mut line_buf) => {
-                    match read_res {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = line_buf.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-                            match serde_json::from_str::<serde_json::Value>(trimmed) {
-                                Ok(val) => {
-                                    if let Some((formatted, preset_date)) = format_journal_entry(&val, self.encoding) {
-                                        if let (Some(min_ts), Some(ts)) = (self.since_epoch, preset_date)
-                                            && ts < min_ts
-                                        {
-                                            continue;
-                                        }
-                                        if tx.send(LogEvent::Line {
-                                            line: formatted,
-                                            preset_date,
-                                            log_path: None,
-                                        }).await.is_err() {
-                                            break;
+                    read_res = reader.read_line(&mut line_buf) => {
+                        match read_res {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let trimmed = line_buf.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                                    Ok(val) => {
+                                        if let Some((formatted, preset_date)) = format_journal_entry(&val, self.encoding) {
+                                            if let (Some(min_ts), Some(ts)) = (self.since_epoch, preset_date)
+                                                && ts < min_ts
+                                            {
+                                                continue;
+                                            }
+                                            if let Some(ts) = preset_date {
+                                                if !in_operation && ts >= start_wall - 1.0 {
+                                                    in_operation = true;
+                                                }
+                                                let next_since = ts + 0.000_001;
+                                                self.since_epoch = Some(
+                                                    self.since_epoch.map_or(next_since, |prev| prev.max(next_since)),
+                                                );
+                                            }
+                                            made_progress = true;
+                                            let ev = LogEvent::Line {
+                                                line: formatted,
+                                                preset_date,
+                                                log_path: None,
+                                                in_operation,
+                                                checkpoint: None,
+                                            };
+                                            tokio::select! {
+                                                biased;
+                                                res = shutdown.changed() => {
+                                                    if res.is_err() || *shutdown.borrow() {
+                                                        stop_requested = true;
+                                                        break;
+                                                    }
+                                                }
+                                                send_res = tx.send(ev) => {
+                                                    if send_res.is_err() {
+                                                        stop_requested = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                                Err(err) => {
-                                    log_msg(
-                                        LogLevel::Debug,
-                                        "fail2ban.filter",
-                                        &format!("Skipping malformed journalctl JSON line: {err}"),
-                                    );
+                                    Err(err) => {
+                                        log_msg(
+                                            LogLevel::Debug,
+                                            "fail2ban.filter",
+                                            &format!("Skipping malformed journalctl JSON line: {err}"),
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(err) => {
-                            log_msg(
-                                LogLevel::Warning,
-                                "fail2ban.filter",
-                                &format!("Error reading journalctl stdout: {err}"),
-                            );
-                            break;
+                            Err(err) => {
+                                log_msg(
+                                    LogLevel::Warning,
+                                    "fail2ban.filter",
+                                    &format!("Error reading journalctl stdout: {err}"),
+                                );
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        Ok(())
+            if stop_requested || *shutdown.borrow() || tx.is_closed() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Ok(());
+            }
+
+            let status = child.wait().await;
+            log_msg(
+                LogLevel::Warning,
+                "fail2ban.filter",
+                &format!(
+                    "Journal reader exited ({status:?}), reopening journal from {:?}",
+                    self.since_epoch
+                ),
+            );
+            in_operation = true;
+            if made_progress {
+                backoff = Duration::from_millis(100);
+            } else {
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+            }
+            tokio::select! {
+                res = shutdown.changed() => {
+                    if res.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                () = tokio::time::sleep(backoff) => {}
+            }
+        }
     }
 }
 

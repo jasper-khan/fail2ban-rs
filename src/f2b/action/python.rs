@@ -18,6 +18,7 @@ pub struct PythonAction {
     name: String,
     jail_name: String,
     path: PathBuf,
+    init_options: JsonValue,
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
@@ -26,6 +27,7 @@ pub struct PythonAction {
     pub(super) prolongable: bool,
     pub(super) flushable: bool,
     pub(super) reloadable: bool,
+    pub(super) has_clear_all_params: bool,
     pub(super) checkable: bool,
 }
 
@@ -78,6 +80,7 @@ impl PythonAction {
             name: name.to_owned(),
             jail_name: jail.to_owned(),
             path: PathBuf::from(path),
+            init_options: options.clone(),
             child,
             stdin,
             stdout,
@@ -86,6 +89,7 @@ impl PythonAction {
             prolongable: false,
             flushable: false,
             reloadable: false,
+            has_clear_all_params: false,
             checkable: false,
         };
         action
@@ -112,15 +116,25 @@ impl PythonAction {
         self.ban_time = ban_time;
     }
 
-    pub(crate) fn can_reload(&self, path: &str) -> bool {
-        self.reloadable && self.path == Path::new(path)
+    pub(crate) fn can_in_place_reload(&self, path: &str, init_options: &str) -> bool {
+        if self.path != Path::new(path) {
+            return false;
+        }
+        if self.reloadable {
+            return true;
+        }
+        parse_options(init_options).is_ok_and(|opts| opts == self.init_options)
     }
 
     pub(crate) async fn method(&mut self, key: &str, options: Option<&str>) -> Result<PickleValue> {
+        let parsed = parse_options(options.unwrap_or("{}"))?;
+        if key == "reload" && options.is_some() {
+            self.init_options = parsed.clone();
+        }
         self.request(json!({
             "operation": "method",
             "key": key,
-            "options": parse_options(options.unwrap_or("{}"))?
+            "options": parsed
         }))
         .await
     }
@@ -237,12 +251,19 @@ impl PythonAction {
         let PickleValue::List(flags) = flags else {
             return Err(malformed());
         };
-        let [norestored, prolongable, flushable, reloadable, checkable]: [PickleValue; 5] =
-            flags.try_into().map_err(|_| malformed())?;
+        let [
+            norestored,
+            prolongable,
+            flushable,
+            reloadable,
+            has_clear,
+            checkable,
+        ]: [PickleValue; 6] = flags.try_into().map_err(|_| malformed())?;
         self.norestored = norestored == PickleValue::Bool(true);
         self.prolongable = prolongable == PickleValue::Bool(true);
         self.flushable = flushable == PickleValue::Bool(true);
         self.reloadable = reloadable == PickleValue::Bool(true);
+        self.has_clear_all_params = has_clear == PickleValue::Bool(true);
         self.checkable = checkable == PickleValue::Bool(true);
         Ok(value)
     }

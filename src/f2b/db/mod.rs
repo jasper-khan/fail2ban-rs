@@ -493,6 +493,19 @@ impl Fail2BanDb {
         correct_ban_time: Option<i64>,
         now: i64,
     ) -> Result<Vec<Ticket>> {
+        self.get_current_bans_with_base(jail, forbantime, correct_ban_time, forbantime, now)
+    }
+
+    /// Restore currently active or permanent bans from `bips`, passing the jail's
+    /// base `bantime` (for legacy `bantime = -2` rows) and `correct_ban_time` cap independently.
+    pub fn get_current_bans_with_base(
+        &self,
+        jail: Option<&str>,
+        forbantime: Option<i64>,
+        correct_ban_time: Option<i64>,
+        base_ban_time: Option<i64>,
+        now: i64,
+    ) -> Result<Vec<Ticket>> {
         let min_timeofban = forbantime
             .filter(|&fb| fb != -1)
             .map(|fb| now.saturating_sub(fb));
@@ -549,7 +562,7 @@ impl Fail2BanDb {
                 continue;
             }
             let bantime = if raw_bantime == -2 {
-                correct_ban_time.unwrap_or(600)
+                base_ban_time.or(cap).unwrap_or(600)
             } else if let Some(max_bt) = cap
                 && (raw_bantime == -1 || raw_bantime > max_bt)
             {

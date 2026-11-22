@@ -11,7 +11,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::configurator::glob_existing;
 use crate::date::DateDetector;
@@ -70,6 +70,8 @@ pub enum LogEvent {
         line: String,
         preset_date: Option<f64>,
         log_path: Option<String>,
+        in_operation: bool,
+        checkpoint: Option<(String, u64)>,
     },
     Checkpoint {
         path: String,
@@ -130,6 +132,7 @@ pub(crate) struct WatchedFile {
     identity: FileIdentityState,
     file: File,
     pending: Vec<u8>,
+    in_operation: bool,
 }
 
 impl WatchedFile {
@@ -168,6 +171,8 @@ impl WatchedFile {
             }
         }
 
+        let in_operation =
+            tail || (config.resume_fingerprint.is_some() && config.auto_seek.is_none());
         Ok(Self {
             config,
             encoding,
@@ -175,6 +180,7 @@ impl WatchedFile {
             identity,
             file,
             pending: Vec::new(),
+            in_operation,
         })
     }
 
@@ -214,6 +220,22 @@ impl WatchedFile {
         }
     }
 
+    fn ensure_fingerprint(&mut self) {
+        if self.identity.fingerprint.is_empty() {
+            let cur = self.file.stream_position().ok();
+            if let Ok(meta) = self.file.metadata()
+                && let Ok(fp) =
+                    super::file_identity::file_first_line_sha1(&mut self.file, meta.len())
+                && !fp.is_empty()
+            {
+                self.identity.fingerprint = fp;
+            }
+            if let Some(pos) = cur {
+                let _ = self.file.seek(SeekFrom::Start(pos));
+            }
+        }
+    }
+
     fn drain_current_fd(&mut self, out: &mut Vec<LogEvent>) {
         let seek_target = self.identity.pos + self.pending.len() as u64;
         if let Err(err) = self.file.seek(SeekFrom::Start(seek_target)) {
@@ -231,7 +253,10 @@ impl WatchedFile {
 
         loop {
             match self.file.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.in_operation = true;
+                    break;
+                }
                 Ok(n) => {
                     self.pending.extend_from_slice(&buf[..n]);
                     if self.active_encoding == LogEncoding::Utf16
@@ -251,14 +276,17 @@ impl WatchedFile {
                         emitted_lines = true;
                     }
                     if self.pending.len() >= MAX_PENDING_LINE_BYTES {
+                        self.ensure_fingerprint();
                         let line = self.active_encoding.decode(&self.pending);
-                        self.identity
-                            .set_pos(self.identity.pos + self.pending.len() as u64);
+                        let next_pos = self.identity.pos + self.pending.len() as u64;
+                        self.identity.set_pos(next_pos);
                         self.pending.clear();
                         out.push(LogEvent::Line {
                             line,
                             preset_date: None,
                             log_path: Some(path_str.clone()),
+                            in_operation: self.in_operation,
+                            checkpoint: Some((self.identity.fingerprint.clone(), next_pos)),
                         });
                         emitted_lines = true;
                     }
@@ -276,30 +304,31 @@ impl WatchedFile {
         }
 
         if emitted_lines {
-            if self.identity.fingerprint.is_empty()
-                && let Ok(meta) = self.file.metadata()
-                && let Ok(fp) =
-                    super::file_identity::file_first_line_sha1(&mut self.file, meta.len())
-                && !fp.is_empty()
-            {
-                self.identity.fingerprint = fp;
-            }
+            self.ensure_fingerprint();
             out.push(self.checkpoint_event());
         }
     }
 
     fn emit_complete_lines(&mut self, path_str: &str, out: &mut Vec<LogEvent>) -> usize {
         let mut start = 0usize;
+        let mut checked_fp = false;
         while let Some((line_end, next_start)) =
             self.active_encoding.split_line(&self.pending[start..])
         {
+            if !checked_fp {
+                self.ensure_fingerprint();
+                checked_fp = true;
+            }
             let line = self
                 .active_encoding
                 .decode(&self.pending[start..start + line_end]);
+            let next_offset = self.identity.pos + (start + next_start) as u64;
             out.push(LogEvent::Line {
                 line,
                 preset_date: None,
                 log_path: Some(path_str.to_owned()),
+                in_operation: self.in_operation,
+                checkpoint: Some((self.identity.fingerprint.clone(), next_offset)),
             });
             start += next_start;
         }
@@ -317,6 +346,8 @@ impl WatchedFile {
                 line,
                 preset_date: None,
                 log_path: Some(self.config.path.to_string_lossy().into_owned()),
+                in_operation: self.in_operation,
+                checkpoint: None,
             });
             self.pending.clear();
         }
@@ -507,11 +538,28 @@ fn read_probe_line(file: &mut File, encoding: LogEncoding) -> io::Result<Option<
 }
 
 /// Forward a batch of events through an async mpsc channel, returning `false`
-/// if the receiver has closed.
-pub(crate) async fn send_events(tx: &mpsc::Sender<LogEvent>, events: Vec<LogEvent>) -> bool {
+/// if `shutdown` signals `true` or the receiver has closed.
+pub(crate) async fn send_events(
+    tx: &mpsc::Sender<LogEvent>,
+    shutdown: &mut watch::Receiver<bool>,
+    events: Vec<LogEvent>,
+) -> bool {
     for ev in events {
-        if tx.send(ev).await.is_err() {
+        if *shutdown.borrow() {
             return false;
+        }
+        tokio::select! {
+            biased;
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
+                    return false;
+                }
+            }
+            send_res = tx.send(ev) => {
+                if send_res.is_err() {
+                    return false;
+                }
+            }
         }
     }
     true

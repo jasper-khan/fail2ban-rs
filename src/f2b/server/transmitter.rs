@@ -11,7 +11,7 @@ use crate::VERSION;
 use crate::action::{ActionKind, Family, escape_tag, replace_dynamic_tags, tags};
 use crate::client::beautifier::py_repr;
 use crate::db::{DEFAULT_MAX_MATCHES, DEFAULT_PURGE_AGE, Fail2BanDb};
-use crate::duration::str2seconds_i64;
+use crate::duration::{parse_bool, str2seconds_i64};
 use crate::error::{Error, Result};
 use crate::f2b_log;
 use crate::filter::ipdns::{allow_ipv6, clear_dns_caches, set_allow_ipv6_str};
@@ -22,7 +22,7 @@ use crate::protocol::PickleValue::{
 use crate::ticket::{ActionContext, Ticket, TicketId};
 
 #[derive(Default)]
-pub(super) struct Transmitter {
+pub struct Transmitter {
     jails: BTreeMap<String, Jail>,
     jail_order: Vec<String>,
     db: Option<Arc<Mutex<Fail2BanDb>>>,
@@ -32,7 +32,7 @@ pub(super) struct Transmitter {
 }
 
 impl Transmitter {
-    pub(super) async fn dispatch(&mut self, value: &Value) -> Result<Value> {
+    pub async fn dispatch(&mut self, value: &Value) -> Result<Value> {
         if self.stopping {
             return Err(Error::invalid_command("Server is stopping"));
         }
@@ -136,9 +136,17 @@ impl Transmitter {
             if !pending.is_some_and(|pending| std::mem::replace(pending, false)) {
                 return Err(Error::duplicate_jail(name));
             }
-            if jail.state.lock().await.backend_spec == backend {
+            let old_backend = jail.state.lock().await.backend_spec.clone();
+            if old_backend == backend {
+                f2b_log!(LogLevel::Info, "fail2ban.server", "Reload jail {name:?}");
                 return Ok(());
             }
+            f2b_log!(
+                LogLevel::Info,
+                "fail2ban.server",
+                "Restart jail {name:?} (reason: {old_backend:?} != {backend:?})"
+            );
+            super::jail::validate_backend_spec(backend)?;
             self.remove_jail(name).await?;
         }
         let jail = Jail::new(name, backend, self.db.clone())?;
@@ -183,6 +191,10 @@ impl Transmitter {
             self.jail(target)?;
             vec![target.to_owned()]
         };
+        if let Err(err) = validate_reload_commands(commands) {
+            f2b_log!(LogLevel::Info, "fail2ban.server", "Reload finished.");
+            return Err(err);
+        }
         let mut pending = BTreeMap::new();
         for name in names {
             let jail = self.jail(&name)?;
@@ -198,16 +210,26 @@ impl Transmitter {
         }
         self.pending_reload = Some(pending);
         let mut result = self.stream(commands).await.map(|_| ());
-        for (name, _) in self.pending_reload.take().unwrap_or_default() {
-            if self.jails.contains_key(&name) {
-                result = result.and(self.remove_jail(&name).await);
+        let leftover = self.pending_reload.take().unwrap_or_default();
+        if result.is_ok() {
+            for (name, untouched) in leftover {
+                if untouched && self.jails.contains_key(&name) {
+                    result = result.and(self.remove_jail(&name).await);
+                }
+            }
+            for jail in self.jails.values() {
+                if jail.state.lock().await.is_reloading() {
+                    result = result.and(jail.reload_commit().await);
+                }
+            }
+        } else {
+            for jail in self.jails.values() {
+                if jail.state.lock().await.is_reloading() {
+                    jail.reload_abort().await;
+                }
             }
         }
-        for jail in self.jails.values() {
-            if jail.state.lock().await.is_reloading() {
-                result = result.and(jail.reload_commit().await);
-            }
-        }
+        f2b_log!(LogLevel::Info, "fail2ban.server", "Reload finished.");
         result.map(|_| text("OK"))
     }
 
@@ -1024,4 +1046,102 @@ fn invalid() -> Error {
 
 fn unknown_action(name: &str) -> Error {
     Error::invalid_command(format!("Invalid Action name: {name}"))
+}
+
+fn validate_reload_commands(commands: &[Value]) -> Result<()> {
+    let mut filters: BTreeMap<String, crate::filter::Filter> = BTreeMap::new();
+    let mut extras: BTreeMap<String, crate::observer::BanTimeExtra> = BTreeMap::new();
+
+    for frame in commands {
+        let cmd = list(frame)?;
+        let Some((head, args)) = cmd.split_first() else {
+            return Err(invalid());
+        };
+        let name = head.as_str().ok_or_else(invalid)?;
+        if !matches!(name, "set" | "multi-set") || args.len() < 2 {
+            continue;
+        }
+        let multiple = name == "multi-set";
+        let jail = string(args, 0)?;
+        let key = string(args, 1)?;
+        let rest = &args[2..];
+        let filter = filters
+            .entry(jail.to_owned())
+            .or_insert_with(|| crate::filter::Filter::new(jail));
+        match key {
+            "ignoreself" => {
+                let _ = parse_bool(&scalar(rest, 0)?)?;
+            }
+            "ignorecache" => {
+                filter.set_ignore_cache(optional_string(arg(rest, 0)?))?;
+            }
+            "addlogpath" => {
+                let _ = string(rest, 0)?;
+                if rest.len() > 2 {
+                    return Err(Error::Value(
+                        "Only one file can be added at a time".to_owned(),
+                    ));
+                }
+                if rest.len() == 2
+                    && !matches!(
+                        string(rest, 1)?.to_ascii_lowercase().as_str(),
+                        "head" | "tail"
+                    )
+                {
+                    return Err(Error::Value(
+                        "File option must be 'head' or 'tail'".to_owned(),
+                    ));
+                }
+            }
+            "logencoding" => {
+                filter.set_log_encoding_str(string(rest, 0)?)?;
+            }
+            "prefregex" => {
+                filter.set_prefregex(optional_string(arg(rest, 0)?))?;
+            }
+            "addfailregex" | "addignoreregex" => {
+                let values = if multiple {
+                    list(arg(rest, 0)?)?
+                } else {
+                    rest.get(..1).ok_or_else(invalid)?
+                };
+                for pattern in strings(values)? {
+                    if key == "addfailregex" {
+                        filter.add_fail_regex(&pattern)?;
+                    } else {
+                        filter.add_ignore_regex(&pattern)?;
+                    }
+                }
+            }
+            "usedns" => {
+                filter.set_use_dns_str(string(rest, 0)?)?;
+            }
+            "findtime" => {
+                filter.set_find_time_str(&scalar(rest, 0)?)?;
+            }
+            "datepattern" => {
+                filter.set_date_pattern(optional_string(arg(rest, 0)?))?;
+            }
+            "logtimezone" => {
+                filter.set_log_timezone(optional_string(arg(rest, 0)?))?;
+            }
+            "maxmatches" | "maxretry" => {
+                let _ = nonnegative(rest, 0)?;
+            }
+            "maxlines" => {
+                filter.set_max_lines(nonnegative(rest, 0)?)?;
+            }
+            "bantime" => {
+                let _ = str2seconds_i64(&scalar(rest, 0)?)?;
+            }
+            key if key.starts_with("bantime.") => {
+                extras
+                    .entry(jail.to_owned())
+                    .or_default()
+                    .set_opt_value(&key["bantime.".len()..], arg(rest, 0)?)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

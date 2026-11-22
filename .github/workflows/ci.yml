@@ -41,8 +41,15 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      FAIL2BAN_111_SOURCE: ${{ github.workspace }}/.upstream-fail2ban-1.1.1
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: fail2ban/fail2ban
+          ref: f60978618a101427b06924fc932b44350fec2b63
+          path: .upstream-fail2ban-1.1.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked --no-fail-fast

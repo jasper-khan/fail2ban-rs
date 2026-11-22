@@ -2,6 +2,7 @@
 //!
 //! Coordinates [`DateDetector`], [`FailRegex`], [`IgnoreConfig`], `mlfid` multi-line
 //! session correlation, and log input [`backend`]s.
+#![allow(unsafe_code)]
 
 pub mod backend;
 pub mod file_identity;
@@ -10,6 +11,7 @@ pub mod poll_stamp;
 pub mod regex;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::date::DateDetector;
@@ -70,23 +72,28 @@ pub enum LogEncoding {
     Utf16Le,
     Utf16Be,
     Utf16,
+    Iconv {
+        iconv_name: &'static CStr,
+        display_name: &'static str,
+    },
 }
 
 impl LogEncoding {
-    /// Parse a Fail2Ban `logencoding` string (`auto`, `utf-8`, `latin1`, `ascii`, `cp1252`, `utf-16*`).
+    /// Parse a Fail2Ban `logencoding` string (`auto`, `utf-8`, `latin1`, `ascii`, `cp1252`, `cp932`, `utf-16*`, etc.).
     pub fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
+        let lower = raw.trim().to_ascii_lowercase();
+        match lower.as_str() {
             "auto" | "" => Ok(Self::Auto),
             "utf-8" | "utf8" | "utf_8" => Ok(Self::Utf8),
-            "latin1" | "latin-1" | "latin_1" | "iso-8859-1" | "iso8859-1" | "iso_8859_1" => {
-                Ok(Self::Latin1)
-            }
-            "ascii" | "us-ascii" | "us_ascii" => Ok(Self::Ascii),
-            "cp1252" | "windows-1252" | "windows_1252" => Ok(Self::Cp1252),
-            "utf-16le" | "utf16le" | "utf_16_le" => Ok(Self::Utf16Le),
-            "utf-16be" | "utf16be" | "utf_16_be" => Ok(Self::Utf16Be),
+            "latin1" | "latin-1" | "latin_1" | "iso-8859-1" | "iso8859-1" | "iso_8859_1"
+            | "iso8859_1" | "cp819" | "l1" => Ok(Self::Latin1),
+            "ascii" | "us-ascii" | "us_ascii" | "646" => Ok(Self::Ascii),
+            "cp1252" | "windows-1252" | "windows_1252" | "1252" => Ok(Self::Cp1252),
+            "utf-16le" | "utf16le" | "utf_16_le" | "utf-16-le" => Ok(Self::Utf16Le),
+            "utf-16be" | "utf16be" | "utf_16_be" | "utf-16-be" => Ok(Self::Utf16Be),
             "utf-16" | "utf16" | "utf_16" => Ok(Self::Utf16),
-            _ => Err(Error::config(format!("Unsupported logencoding {raw:?}"))),
+            _ => resolve_iconv_encoding(&lower)
+                .ok_or_else(|| Error::config(format!("Unsupported logencoding {raw:?}"))),
         }
     }
 
@@ -100,6 +107,7 @@ impl LogEncoding {
             Self::Utf16Le => "utf-16le",
             Self::Utf16Be => "utf-16be",
             Self::Utf16 => "utf-16",
+            Self::Iconv { display_name, .. } => display_name,
         }
     }
 
@@ -124,7 +132,12 @@ impl LogEncoding {
     /// containing `0x0A` (e.g. U+020A in UTF-16LE/BE). Returns `(line_end_no_crlf, next_start)`.
     pub fn split_line(self, buf: &[u8]) -> Option<(usize, usize)> {
         match self {
-            Self::Auto | Self::Utf8 | Self::Latin1 | Self::Ascii | Self::Cp1252 => {
+            Self::Auto
+            | Self::Utf8
+            | Self::Latin1
+            | Self::Ascii
+            | Self::Cp1252
+            | Self::Iconv { .. } => {
                 let nl = memchr::memchr(b'\n', buf)?;
                 let line_end = if nl > 0 && buf[nl - 1] == b'\r' {
                     nl - 1
@@ -197,8 +210,128 @@ impl LogEncoding {
                 let (resolved, skip) = self.resolve_bom(bytes);
                 decode_utf16_bytes(&bytes[skip..], resolved == Self::Utf16Be)
             }
+            Self::Iconv { iconv_name, .. } => decode_iconv_bytes(iconv_name, bytes),
         }
     }
+}
+
+fn resolve_iconv_encoding(lower: &str) -> Option<LogEncoding> {
+    let norm = lower.replace(['-', ' '], "_");
+    let (iconv_name, display_name) = match norm.as_str() {
+        "cp932" | "932" | "ms932" | "mskanji" | "ms_kanji" | "windows_31j" | "csWindows31J" => {
+            (c"CP932", "cp932")
+        }
+        "shift_jis" | "shiftjis" | "sjis" | "s_jis" | "shift_jis_2004" | "shift_jisx0213" => {
+            (c"SHIFT_JIS", "shift_jis")
+        }
+        "euc_jp" | "eucjp" | "ujis" | "u_jis" | "euc_jis_2004" | "euc_jisx0213" => {
+            (c"EUC-JP", "euc_jp")
+        }
+        "gbk" | "936" | "cp936" | "ms936" => (c"GBK", "gbk"),
+        "gb2312" | "chinese" | "csiso58gb231280" | "euc_cn" | "euccn" | "hz" => {
+            (c"GB2312", "gb2312")
+        }
+        "gb18030" | "gb18030_2000" => (c"GB18030", "gb18030"),
+        "big5" | "big5_tw" | "csbig5" | "cp950" | "950" | "ms950" | "big5hkscs" => {
+            (c"BIG5", "big5")
+        }
+        "euc_kr" | "euckr" | "korean" | "ksc5601" | "ks_c_5601_1987" | "cp949" | "949" | "uhc" => {
+            (c"EUC-KR", "euc_kr")
+        }
+        "koi8_r" | "koi8r" => (c"KOI8-R", "koi8_r"),
+        "koi8_u" | "koi8u" => (c"KOI8-U", "koi8_u"),
+        "cp1250" | "windows_1250" | "1250" => (c"CP1250", "cp1250"),
+        "cp1251" | "windows_1251" | "1251" => (c"CP1251", "cp1251"),
+        "cp1253" | "windows_1253" | "1253" => (c"CP1253", "cp1253"),
+        "cp1254" | "windows_1254" | "1254" => (c"CP1254", "cp1254"),
+        "cp1255" | "windows_1255" | "1255" => (c"CP1255", "cp1255"),
+        "cp1256" | "windows_1256" | "1256" => (c"CP1256", "cp1256"),
+        "cp1257" | "windows_1257" | "1257" => (c"CP1257", "cp1257"),
+        "cp1258" | "windows_1258" | "1258" => (c"CP1258", "cp1258"),
+        "cp866" | "866" | "ibm866" => (c"CP866", "cp866"),
+        "cp850" | "850" | "ibm850" => (c"CP850", "cp850"),
+        "cp437" | "437" | "ibm437" => (c"CP437", "cp437"),
+        "iso_8859_2" | "iso8859_2" | "latin2" | "l2" => (c"ISO-8859-2", "iso8859-2"),
+        "iso_8859_3" | "iso8859_3" | "latin3" | "l3" => (c"ISO-8859-3", "iso8859-3"),
+        "iso_8859_4" | "iso8859_4" | "latin4" | "l4" => (c"ISO-8859-4", "iso8859-4"),
+        "iso_8859_5" | "iso8859_5" | "cyrillic" => (c"ISO-8859-5", "iso8859-5"),
+        "iso_8859_6" | "iso8859_6" | "arabic" => (c"ISO-8859-6", "iso8859-6"),
+        "iso_8859_7" | "iso8859_7" | "greek" => (c"ISO-8859-7", "iso8859-7"),
+        "iso_8859_8" | "iso8859_8" | "hebrew" => (c"ISO-8859-8", "iso8859-8"),
+        "iso_8859_9" | "iso8859_9" | "latin5" | "l5" => (c"ISO-8859-9", "iso8859-9"),
+        "iso_8859_10" | "iso8859_10" | "latin6" | "l6" => (c"ISO-8859-10", "iso8859-10"),
+        "iso_8859_13" | "iso8859_13" | "latin7" | "l7" => (c"ISO-8859-13", "iso8859-13"),
+        "iso_8859_14" | "iso8859_14" | "latin8" | "l8" => (c"ISO-8859-14", "iso8859-14"),
+        "iso_8859_15" | "iso8859_15" | "latin9" | "l9" => (c"ISO-8859-15", "iso8859-15"),
+        "iso_8859_16" | "iso8859_16" | "latin10" | "l10" => (c"ISO-8859-16", "iso8859-16"),
+        _ => return None,
+    };
+    Some(LogEncoding::Iconv {
+        iconv_name,
+        display_name,
+    })
+}
+
+#[cfg(unix)]
+fn decode_iconv_bytes(from_code: &CStr, mut input: &[u8]) -> String {
+    use std::ffi::{c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        fn iconv_open(tocode: *const c_char, fromcode: *const c_char) -> *mut c_void;
+        fn iconv(
+            cd: *mut c_void,
+            inbuf: *mut *mut c_char,
+            inbytesleft: *mut usize,
+            outbuf: *mut *mut c_char,
+            outbytesleft: *mut usize,
+        ) -> usize;
+        fn iconv_close(cd: *mut c_void) -> c_int;
+    }
+
+    let invalid = usize::MAX as *mut c_void;
+    // SAFETY: Both `c"UTF-8"` and `from_code` are valid NUL-terminated static C strings.
+    let cd = unsafe { iconv_open(c"UTF-8".as_ptr(), from_code.as_ptr()) };
+    if cd == invalid || cd.is_null() {
+        return String::from_utf8_lossy(input).into_owned();
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut chunk = [0u8; 256];
+    while !input.is_empty() {
+        let mut in_ptr = input.as_ptr() as *mut c_char;
+        let mut in_left = input.len();
+        let mut out_ptr = chunk.as_mut_ptr() as *mut c_char;
+        let mut out_left = chunk.len();
+        // SAFETY: `cd` is a valid open iconv descriptor; `in_ptr`/`in_left` and `out_ptr`/`out_left`
+        // point to live slices of exact length `in_left` and `out_left`.
+        let res = unsafe { iconv(cd, &mut in_ptr, &mut in_left, &mut out_ptr, &mut out_left) };
+        let written = chunk.len() - out_left;
+        if written > 0 {
+            out.push_str(&String::from_utf8_lossy(&chunk[..written]));
+        }
+        let consumed = input.len() - in_left;
+        input = &input[consumed..];
+        if res == usize::MAX {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == nix::libc::E2BIG {
+                continue;
+            }
+            if !input.is_empty() {
+                out.push('\u{FFFD}');
+                input = &input[1..];
+            }
+        }
+    }
+    // SAFETY: `cd` is a valid open iconv descriptor and is not used after `iconv_close`.
+    unsafe {
+        iconv_close(cd);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn decode_iconv_bytes(_from_code: &CStr, input: &[u8]) -> String {
+    String::from_utf8_lossy(input).into_owned()
 }
 
 fn decode_utf16_bytes(bytes: &[u8], big_endian: bool) -> String {
@@ -330,6 +463,24 @@ impl MlfIdCache {
     }
 }
 
+/// Saved filter configuration state for rolling back a failed reload.
+#[derive(Debug)]
+pub struct FilterReloadSnapshot {
+    prefregex: Option<FailRegex>,
+    failregex: Vec<FailRegex>,
+    ignoreregex: Vec<FailRegex>,
+    regex_hits: Vec<usize>,
+    ignoreregex_hits: Vec<usize>,
+    ignore: IgnoreConfig,
+    date_detector: DateDetector,
+    log_timezone: Option<String>,
+    log_encoding: LogEncoding,
+    log_encoding_name: String,
+    max_lines: usize,
+    use_dns: UseDns,
+    find_time: f64,
+}
+
 /// Fail2Ban 1.1.1 log filter pipeline.
 #[derive(Debug)]
 pub struct Filter {
@@ -353,6 +504,7 @@ pub struct Filter {
     mlfid_cache: MlfIdCache,
     last_date: f64,
     last_time_text: Option<String>,
+    next_sim_by_time_warn: f64,
     line_buffer: Vec<(String, String, String)>,
     stats: ProcessLineStats,
 }
@@ -387,6 +539,7 @@ impl Filter {
             mlfid_cache: MlfIdCache::new(DEFAULT_MLFID_MAX_COUNT, DEFAULT_MLFID_MAX_TIME),
             last_date: 0.0,
             last_time_text: None,
+            next_sim_by_time_warn: 0.0,
             line_buffer: Vec::new(),
             stats: ProcessLineStats::default(),
         }
@@ -704,6 +857,44 @@ impl Filter {
         self.mlfid_cache.clear();
     }
 
+    /// Save current regex/ignore rules and clear them at the beginning of a reload.
+    pub fn snapshot_and_clear_for_reload(&mut self) -> FilterReloadSnapshot {
+        let snap = FilterReloadSnapshot {
+            prefregex: self.prefregex.take(),
+            failregex: std::mem::take(&mut self.failregex),
+            ignoreregex: std::mem::take(&mut self.ignoreregex),
+            regex_hits: std::mem::take(&mut self.stats.regex_hits),
+            ignoreregex_hits: std::mem::take(&mut self.stats.ignoreregex_hits),
+            ignore: std::mem::take(&mut self.ignore),
+            date_detector: self.date_detector.clone(),
+            log_timezone: self.log_timezone.clone(),
+            log_encoding: self.log_encoding,
+            log_encoding_name: self.log_encoding_name.clone(),
+            max_lines: self.max_lines,
+            use_dns: self.use_dns,
+            find_time: self.find_time,
+        };
+        self.ignore = IgnoreConfig::new();
+        snap
+    }
+
+    /// Restore a saved [`FilterReloadSnapshot`] when a reload stream fails.
+    pub fn restore_reload_snapshot(&mut self, snap: FilterReloadSnapshot) {
+        self.prefregex = snap.prefregex;
+        self.failregex = snap.failregex;
+        self.ignoreregex = snap.ignoreregex;
+        self.stats.regex_hits = snap.regex_hits;
+        self.stats.ignoreregex_hits = snap.ignoreregex_hits;
+        self.ignore = snap.ignore;
+        self.date_detector = snap.date_detector;
+        self.log_timezone = snap.log_timezone;
+        self.log_encoding = snap.log_encoding;
+        self.log_encoding_name = snap.log_encoding_name;
+        self.max_lines = snap.max_lines;
+        self.use_dns = snap.use_dns;
+        self.find_time = snap.find_time;
+    }
+
     /// Reset filter patterns, ignore rules, date settings, and DNS caches during
     /// live jail reload (`begin = true`), finalizing on `begin = false`.
     pub fn reload(&mut self, begin: bool) -> Result<()> {
@@ -761,7 +952,29 @@ impl Filter {
             self.line_buffer.drain(..excess);
         }
 
-        let Some(event_time) = time_opt.or_else(|| (!self.check_find_time).then_some(now)) else {
+        let Some(mut event_time) = time_opt.or_else(|| {
+            if !self.check_find_time {
+                Some(now)
+            } else if self.in_operation {
+                let org_lines = self.line_buffer.clone();
+                let buf = FailRegex::tuple_lines_buf(&org_lines);
+                if self.would_match_failregex(&buf, &org_lines) {
+                    log_msg(
+                        LogLevel::Warning,
+                        "fail2ban.filter",
+                        &format!(
+                            "[{}] Found a match but no valid date/time found for {:?}",
+                            self.jail_name, clean
+                        ),
+                    );
+                    self.stats.missed += 1;
+                    out.missed = true;
+                }
+                Some(now)
+            } else {
+                None
+            }
+        }) else {
             // Even without a parsed timestamp, probe failregex for missed-date diagnostics.
             let org_lines = self.line_buffer.clone();
             let buf = FailRegex::tuple_lines_buf(&org_lines);
@@ -780,21 +993,42 @@ impl Filter {
             return out;
         };
 
-        out.date_time = Some(event_time);
-
-        if self.check_find_time && event_time < now - self.find_time {
-            log_msg(
-                LogLevel::TraceDebug,
-                "fail2ban.filter",
-                &format!(
-                    "[{}] Ignore line since time {event_time} < {}",
-                    self.jail_name,
-                    now - self.find_time
-                ),
-            );
-            return out;
+        if self.check_find_time {
+            if self.in_operation {
+                let delta = (event_time - now) as i64;
+                if delta.abs() > 60 {
+                    if now >= self.next_sim_by_time_warn {
+                        self.next_sim_by_time_warn = now + 86_400.0;
+                        log_msg(
+                            LogLevel::Warning,
+                            "fail2ban.filter",
+                            &format!(
+                                "[{}] Detected a log entry {}s {} the current time in operation mode. Treating such entries as if they just happened.",
+                                self.jail_name,
+                                delta.abs(),
+                                if delta < 0 { "before" } else { "after" },
+                            ),
+                        );
+                    }
+                    event_time = now;
+                    self.last_date = now;
+                }
+            } else if event_time < now - self.find_time {
+                log_msg(
+                    LogLevel::TraceDebug,
+                    "fail2ban.filter",
+                    &format!(
+                        "[{}] Ignore line since time {event_time} < {}",
+                        self.jail_name,
+                        now - self.find_time
+                    ),
+                );
+                out.date_time = Some(event_time);
+                return out;
+            }
         }
 
+        out.date_time = Some(event_time);
         self.run_find_failure(event_time, &mut out);
         out
     }
