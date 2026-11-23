@@ -4,10 +4,13 @@ set -euo pipefail
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
 root="${DESTDIR:-}"
+state_dir="$root/usr/local/lib/fail2ban-rs"
 bin="$root/usr/local/bin"
 units="$root/usr/local/lib/systemd/system"
-python_library="$root/usr/local/lib/fail2ban-rs/python.zip"
-unit_state="$root/usr/local/lib/fail2ban-rs/systemd-state"
+python_library="$state_dir/python.zip"
+unit_state="$state_dir/systemd-state"
+backup_dir="$state_dir/backup"
+backup_manifest="$state_dir/backup-manifest"
 config="$root/etc/fail2ban"
 man="$root/usr/local/share/man"
 
@@ -66,6 +69,70 @@ restore_unit_state() {
     esac
 }
 
+backup_existing_path() {
+    local rel="$1"
+    local src="$root/$rel"
+    local dst="$backup_dir/$rel"
+    if [[ -e "$src" || -L "$src" ]]; then
+        mkdir -p -- "$(dirname -- "$dst")"
+        rm -f -- "$dst"
+        cp -a -- "$src" "$dst"
+        printf '%s\n' "$rel" >> "$backup_manifest"
+    fi
+}
+
+restore_backed_up_files() {
+    [[ -f "$backup_manifest" ]] || return 0
+    local rel src dst
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        case "/$rel/" in
+            */../*) die "Invalid backup manifest entry: $rel" ;;
+        esac
+        [[ "$rel" != /* ]] || die "Invalid backup manifest entry: $rel"
+        src="$backup_dir/$rel"
+        dst="$root/$rel"
+        if [[ -e "$src" || -L "$src" ]]; then
+            mkdir -p -- "$(dirname -- "$dst")"
+            rm -f -- "$dst"
+            cp -a -- "$src" "$dst"
+        fi
+    done < "$backup_manifest"
+}
+
+cleanup_backup_files() {
+    if [[ -f "$backup_manifest" ]]; then
+        local rel
+        while IFS= read -r rel; do
+            [[ -n "$rel" ]] || continue
+            case "/$rel/" in */../*) continue ;; esac
+            [[ "$rel" != /* ]] || continue
+            rm -f -- "$backup_dir/$rel"
+        done < "$backup_manifest"
+        rm -f -- "$backup_manifest"
+    fi
+    local dir
+    for dir in \
+        "$backup_dir/etc/fail2ban/filter.d/ignorecommands" \
+        "$backup_dir/etc/fail2ban/filter.d" \
+        "$backup_dir/etc/fail2ban" \
+        "$backup_dir/etc" \
+        "$backup_dir/usr/local/share/man/man1" \
+        "$backup_dir/usr/local/share/man/man5" \
+        "$backup_dir/usr/local/share/man" \
+        "$backup_dir/usr/local/share" \
+        "$backup_dir/usr/local/lib/systemd/system" \
+        "$backup_dir/usr/local/lib/systemd" \
+        "$backup_dir/usr/local/lib" \
+        "$backup_dir/usr/local/bin" \
+        "$backup_dir/usr/local" \
+        "$backup_dir/usr" \
+        "$backup_dir"
+    do
+        rmdir -- "$dir" 2>/dev/null || true
+    done
+}
+
 if [[ "${1:-}" == --uninstall ]]; then
     has_saved_state=0
     saved_service_enabled=""
@@ -109,6 +176,7 @@ if [[ "${1:-}" == --uninstall ]]; then
     rm -f -- "$man/man1/fail2ban-client.1"
     rm -f -- "$man/man1/fail2ban-regex.1"
     rm -f -- "$man/man5/jail.conf.5"
+    restore_backed_up_files
     if [[ -z "$root" ]]; then
         systemctl daemon-reload
         if [[ "$has_saved_state" -eq 1 ]]; then
@@ -120,8 +188,9 @@ if [[ "${1:-}" == --uninstall ]]; then
             fi
         fi
     fi
+    cleanup_backup_files
     rm -f -- "$unit_state"
-    rmdir -- "$root/usr/local/lib/fail2ban-rs" 2>/dev/null || true
+    rmdir -- "$state_dir" 2>/dev/null || true
     exit 0
 fi
 
@@ -173,8 +242,28 @@ install_member() {
 if [[ -z "$root" && ! -f "$unit_state" ]]; then
     svc_state=$(capture_unit_state fail2ban.service)
     sock_state=$(capture_unit_state fail2ban.socket)
-    install -d -m 0755 "$root/usr/local/lib/fail2ban-rs"
+    install -d -m 0755 "$state_dir"
     printf 'fail2ban.service=%s\nfail2ban.socket=%s\n' "$svc_state" "$sock_state" > "$unit_state"
+fi
+take_backup=0
+if [[ ! -f "$backup_manifest" && ! -f "$python_library" ]]; then
+    take_backup=1
+    install -d -m 0755 "$state_dir"
+    : > "$backup_manifest"
+    for rel in \
+        usr/local/bin/fail2ban-server \
+        usr/local/bin/fail2ban-client \
+        usr/local/bin/fail2ban-regex \
+        usr/local/lib/systemd/system/fail2ban.service \
+        usr/local/lib/systemd/system/fail2ban.socket \
+        usr/local/share/man/man1/fail2ban.1 \
+        usr/local/share/man/man1/fail2ban-server.1 \
+        usr/local/share/man/man1/fail2ban-client.1 \
+        usr/local/share/man/man1/fail2ban-regex.1 \
+        usr/local/share/man/man5/jail.conf.5
+    do
+        backup_existing_path "$rel"
+    done
 fi
 for binary in fail2ban-server fail2ban-client fail2ban-regex; do
     install_member "bin/$binary" 0755 "$bin/$binary"
@@ -202,6 +291,9 @@ while IFS= read -r member; do
                 mode=0755
                 if [[ -f "$dest" ]] && printf '%s  %s\n' \
                     0069a4f1828849673a23841e5b796bfd88e2fcdf1f4f5854f9723e7f3989f9da "$dest" | sha256sum --status -c -; then
+                    if [[ "$take_backup" -eq 1 ]]; then
+                        backup_existing_path "etc/fail2ban/$relative"
+                    fi
                     install_member "config/$relative" "$mode" "$dest"
                 fi
             fi

@@ -14,8 +14,10 @@ use crate::VERSION;
 use crate::config::{FilterReader, JailReader, layers, shlex_split, spec};
 use crate::date::strptime::set_alternate_year;
 use crate::error::{Error, Result};
-use crate::filter::backend::systemd::{build_journalctl_args, format_journal_entry};
-use crate::filter::backend::{JournalConfig, expand_journal_files};
+use crate::filter::backend::JournalConfig;
+use crate::filter::backend::systemd::{
+    build_journalctl_args, format_journal_entry, parse_systemd_journal_options,
+};
 use crate::filter::ipdns::UseDns;
 use crate::filter::regex::FailRegex;
 use crate::filter::{Filter, LogEncoding, MatchResult};
@@ -1324,37 +1326,21 @@ fn parse_journal_groups(tokens: &[String]) -> Vec<Vec<String>> {
 }
 
 fn build_journal_config(log_arg: &str, matches: &[Vec<String>]) -> Result<JournalConfig> {
-    let mut cfg = JournalConfig {
-        matches: matches.to_vec(),
-        flags: None,
-        path: None,
-        files: Vec::new(),
-        namespace: None,
-    };
+    let mut resolved_matches = matches.to_vec();
+    let mut params = BTreeMap::new();
     if log_arg.contains('[') {
         let parsed = spec::parse(log_arg)?;
-        if let Some(flags_str) = parsed.parameters.get("journalflags") {
-            cfg.flags = flags_str.trim().parse::<u32>().ok();
-        }
-        if let Some(path_str) = parsed.parameters.get("journalpath") {
-            cfg.path = Some(PathBuf::from(path_str));
-        }
-        if let Some(files_str) = parsed.parameters.get("journalfiles") {
-            cfg.files = expand_journal_files(files_str);
-        }
-        if let Some(ns_str) = parsed.parameters.get("namespace") {
-            let ns = ns_str.trim();
-            if !ns.is_empty() {
-                cfg.namespace = Some(ns.to_owned());
+        for (k, v) in parsed.parameters {
+            if k == "journalmatch" {
+                if resolved_matches.is_empty() {
+                    resolved_matches = parse_journal_groups(&shlex_split(&v));
+                }
+            } else {
+                params.insert(k, v);
             }
         }
-        if cfg.matches.is_empty()
-            && let Some(jm) = parsed.parameters.get("journalmatch")
-        {
-            cfg.matches = parse_journal_groups(&shlex_split(jm));
-        }
     }
-    Ok(cfg)
+    Ok(parse_systemd_journal_options(&params, resolved_matches)?.config)
 }
 
 fn read_journal_entries(

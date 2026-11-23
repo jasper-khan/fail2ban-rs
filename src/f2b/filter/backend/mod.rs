@@ -106,6 +106,7 @@ pub struct JournalConfig {
     pub path: Option<PathBuf>,
     pub files: Vec<PathBuf>,
     pub namespace: Option<String>,
+    pub rotated: bool,
 }
 
 /// Expand Fail2Ban's `journalfiles` parameter (whitespace/comma-separated glob patterns)

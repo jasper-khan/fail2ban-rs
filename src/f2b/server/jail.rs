@@ -17,18 +17,17 @@ use crate::action::{ActionKind, CommandAction, SmtpAction};
 use crate::banmanager::{AddBanOutcome, BanManager};
 use crate::config::spec;
 use crate::db::Fail2BanDb;
-use crate::duration::{parse_bool, time2str};
+use crate::duration::time2str;
 use crate::error::{Error, Result};
 use crate::f2b_log;
 use crate::failmanager::FailManager;
 use crate::filter::backend::inotify::FilterPyinotify;
 use crate::filter::backend::polling::FilterPoll;
 use crate::filter::backend::systemd::{
-    FilterSystemd, validate_journal_config, validate_journal_match_tokens,
+    FilterSystemd, parse_systemd_journal_options, validate_journal_config,
+    validate_journal_match_tokens,
 };
-use crate::filter::backend::{
-    AutoSeekConfig, BackendKind, FileLogConfig, JournalConfig, LogEvent, expand_journal_files,
-};
+use crate::filter::backend::{AutoSeekConfig, BackendKind, FileLogConfig, JournalConfig, LogEvent};
 use crate::filter::file_identity::file_first_line_sha1;
 use crate::filter::ipdns::allow_ipv6;
 use crate::filter::{Filter, FilterReloadSnapshot, LogEncoding};
@@ -56,6 +55,7 @@ struct ParsedBackend {
     journal_path: Option<PathBuf>,
     journal_files: Vec<PathBuf>,
     journal_namespace: Option<String>,
+    journal_rotated: bool,
     use_dns: Option<String>,
 }
 
@@ -85,88 +85,34 @@ fn parse_backend_spec(raw: &str) -> Result<ParsedBackend> {
         concrete => concrete,
     };
 
-    let mut journal_flags = None;
-    let mut journal_path = None;
-    let mut journal_files = Vec::new();
-    let mut journal_namespace = None;
-    let mut rotated = false;
-    let mut use_dns = None;
-
-    if !parsed.parameters.is_empty() {
-        if real_backend != BackendKind::Systemd {
+    if real_backend != BackendKind::Systemd {
+        if !parsed.parameters.is_empty() {
             return Err(Error::invalid_command(format!(
                 "Backend {:?} got unexpected keyword arguments: {:?}",
                 parsed.name,
                 parsed.parameters.keys().collect::<Vec<_>>()
             )));
         }
-        for (key, v) in &parsed.parameters {
-            match key.as_str() {
-                "journalflags" => {
-                    let flags = v.trim().parse::<u32>().map_err(|_| {
-                        Error::invalid_command(format!("invalid journalflags value {v:?}"))
-                    })?;
-                    journal_flags = Some(flags);
-                }
-                "journalpath" => {
-                    let p = v.trim();
-                    if !p.is_empty() {
-                        journal_path = Some(PathBuf::from(p));
-                    }
-                }
-                "journalfiles" => {
-                    journal_files = expand_journal_files(v);
-                }
-                "namespace" => {
-                    let ns = v.trim();
-                    if !ns.is_empty() {
-                        journal_namespace = Some(ns.to_owned());
-                    }
-                }
-                "rotated" => {
-                    rotated = parse_bool(v)?;
-                }
-                "useDns" => {
-                    use_dns = Some(v.trim().to_owned());
-                }
-                "tail" => {
-                    return Err(Error::invalid_command(
-                        "FilterSystemd got an unexpected keyword argument 'tail' \
-                         (removed for Fail2Ban 1.1.1 parity; remove 'tail=...' from the systemd backend option)",
-                    ));
-                }
-                other => {
-                    return Err(Error::invalid_command(format!(
-                        "FilterSystemd got an unexpected keyword argument {other:?}"
-                    )));
-                }
-            }
-        }
+        return Ok(ParsedBackend {
+            real_backend,
+            journal_flags: None,
+            journal_path: None,
+            journal_files: Vec::new(),
+            journal_namespace: None,
+            journal_rotated: false,
+            use_dns: None,
+        });
     }
 
-    if real_backend == BackendKind::Systemd
-        && journal_flags.is_none()
-        && journal_files.is_empty()
-        && journal_path.is_none()
-    {
-        if let Ok(env_flags) = std::env::var("F2B_SYSTEMD_DEFAULT_FLAGS")
-            && !env_flags.trim().is_empty()
-        {
-            journal_flags = Some(env_flags.trim().parse::<u32>().map_err(|_| {
-                Error::invalid_command(format!("invalid F2B_SYSTEMD_DEFAULT_FLAGS {env_flags:?}"))
-            })?);
-        } else if rotated {
-            journal_flags = Some(4);
-        }
-    }
-
+    let jopts = parse_systemd_journal_options(&parsed.parameters, Vec::new())?;
     Ok(ParsedBackend {
         real_backend,
-        journal_flags,
-        journal_path,
-        journal_files,
-        journal_namespace,
-        use_dns,
+        journal_flags: jopts.config.flags,
+        journal_path: jopts.config.path,
+        journal_files: jopts.config.files,
+        journal_namespace: jopts.config.namespace,
+        journal_rotated: jopts.config.rotated,
+        use_dns: jopts.use_dns,
     })
 }
 
@@ -179,6 +125,13 @@ struct ReloadSnapshot {
     journal_matches: Vec<Vec<String>>,
     encoding: LogEncoding,
     filter: FilterReloadSnapshot,
+    fail_max_retry: u64,
+    fail_max_time: f64,
+    fail_max_matches: usize,
+    ban_time: i64,
+    ban_extra: BanTimeExtra,
+    file_checkpoints: BTreeMap<PathBuf, (String, u64)>,
+    dirty_file_checkpoints: BTreeSet<PathBuf>,
     command_actions: BTreeMap<String, CommandAction>,
     smtp_actions: BTreeMap<String, SmtpAction>,
 }
@@ -201,6 +154,7 @@ pub struct JailState {
     pub journal_path: Option<PathBuf>,
     pub journal_files: Vec<PathBuf>,
     pub journal_namespace: Option<String>,
+    pub journal_rotated: bool,
     pub db: Option<Arc<std::sync::Mutex<Fail2BanDb>>>,
     ban_epoch: u64,
     last_consistency_check: f64,
@@ -285,6 +239,7 @@ impl JailState {
             journal_path: parsed.journal_path,
             journal_files: parsed.journal_files,
             journal_namespace: parsed.journal_namespace,
+            journal_rotated: parsed.journal_rotated,
             db,
             ban_epoch: 0,
             last_consistency_check: 0.0,
@@ -336,6 +291,7 @@ impl JailState {
             path: self.journal_path.clone(),
             files: self.journal_files.clone(),
             namespace: self.journal_namespace.clone(),
+            rotated: self.journal_rotated,
         }
     }
 
@@ -476,13 +432,6 @@ impl JailState {
                     )?;
                 }
             } else {
-                if self.alive {
-                    return Err(Error::invalid_command(format!(
-                        "Action '{act_name}' in jail '{}' cannot be replaced in place while running; \
-                         use 'reload --restart' to restart the jail with ban restoration",
-                        self.name
-                    )));
-                }
                 let replacement =
                     build_action(&self.name, act_name, python_path, init_str, ban_time).await?;
                 let old = std::mem::replace(&mut self.actions[pos].1, replacement);
@@ -555,6 +504,13 @@ impl JailState {
             journal_matches: std::mem::take(&mut self.journal_matches),
             encoding,
             filter: filter_snap,
+            fail_max_retry: self.fail_manager.max_retry(),
+            fail_max_time: self.fail_manager.max_time(),
+            fail_max_matches: self.fail_manager.max_matches(),
+            ban_time: self.ban_manager.ban_time(),
+            ban_extra: self.ban_extra.clone(),
+            file_checkpoints: self.file_checkpoints.clone(),
+            dirty_file_checkpoints: self.dirty_file_checkpoints.clone(),
             command_actions,
             smtp_actions,
         });
@@ -590,12 +546,21 @@ impl JailState {
                     *act = ActionKind::Command(orig.clone());
                 } else if let Some(orig) = snap.smtp_actions.get(name) {
                     *act = ActionKind::Smtp(orig.clone());
+                } else if let ActionKind::Python(py) = act {
+                    py.set_ban_time(snap.ban_time);
                 }
             }
             self.idle = snap.was_idle;
             self.log_paths = snap.log_paths;
             self.journal_matches = snap.journal_matches;
             self.filter.restore_reload_snapshot(snap.filter);
+            self.fail_manager.set_max_retry(snap.fail_max_retry);
+            self.fail_manager.set_max_time(snap.fail_max_time);
+            self.fail_manager.set_max_matches(snap.fail_max_matches);
+            self.ban_manager.set_ban_time(snap.ban_time);
+            self.ban_extra = snap.ban_extra;
+            self.file_checkpoints = snap.file_checkpoints;
+            self.dirty_file_checkpoints = snap.dirty_file_checkpoints;
         } else {
             self.idle = false;
         }
@@ -620,30 +585,6 @@ impl JailState {
         }
 
         if let Some(kept_actions) = self.reload_actions.take() {
-            if self.alive {
-                for (new_name, new_act) in &self.actions {
-                    if kept_actions
-                        .get(new_name)
-                        .is_some_and(|(_, is_new)| *is_new)
-                    {
-                        for (old_name, old_act) in &self.actions {
-                            if !kept_actions.contains_key(old_name)
-                                && new_act.shares_firewall_state(old_act)
-                            {
-                                let msg = format!(
-                                    "Action '{new_name}' shares firewall state with '{old_name}' in jail '{}'; \
-                                     use 'reload --restart' to restart the jail with ban restoration",
-                                    self.name
-                                );
-                                self.reload_actions = Some(kept_actions);
-                                self.reload_abort();
-                                return Err(Error::invalid_command(msg));
-                            }
-                        }
-                    }
-                }
-            }
-
             let active_tickets: Vec<Ticket> = self
                 .ban_manager
                 .get_ban_list(false)
@@ -652,7 +593,7 @@ impl JailState {
                 .collect();
 
             let ipv6_allowed = allow_ipv6();
-            let mut started_new: Vec<(usize, Vec<Ticket>)> = Vec::new();
+            let mut started_new: Vec<(usize, String, Vec<Ticket>)> = Vec::new();
             let mut handoff_err: Option<Error> = None;
 
             for idx in 0..self.actions.len() {
@@ -663,7 +604,13 @@ impl JailState {
                 };
                 if is_new {
                     if self.alive {
+                        // Enroll before calling start() so a partially started dual-stack action
+                        // stops its successful family half if another family fails to start.
+                        started_new.push((idx, act_name.clone(), Vec::new()));
                         if let Err(err) = self.actions[idx].1.start(ipv6_allowed).await {
+                            if matches!(&self.actions[idx].1, ActionKind::Smtp(_)) {
+                                started_new.pop();
+                            }
                             f2b_log!(
                                 LogLevel::Error,
                                 "fail2ban.actions",
@@ -673,7 +620,6 @@ impl JailState {
                             handoff_err = Some(err);
                             break;
                         }
-                        started_new.push((idx, Vec::new()));
                         if !self.actions[idx].1.norestored() {
                             for ticket in &active_tickets {
                                 let ctx = self.build_action_context(ticket, false);
@@ -688,7 +634,7 @@ impl JailState {
                                     handoff_err = Some(err);
                                     break;
                                 }
-                                if let Some((_, replayed)) = started_new.last_mut() {
+                                if let Some((_, _, replayed)) = started_new.last_mut() {
                                     replayed.push(ticket.clone());
                                 }
                             }
@@ -711,7 +657,7 @@ impl JailState {
 
             if let Some(err) = handoff_err {
                 // Roll back newly started replacements without touching existing working actions.
-                for (idx, replayed) in started_new.into_iter().rev() {
+                for (idx, _, replayed) in started_new.into_iter().rev() {
                     for ticket in replayed.iter().rev() {
                         let ctx = self.build_action_context(ticket, false);
                         let _ = self.actions[idx].1.unban(&ctx).await;
@@ -734,13 +680,21 @@ impl JailState {
             }
 
             for (act_name, mut act) in retired {
+                let to_unban: Vec<&Ticket> = active_tickets
+                    .iter()
+                    .filter(|t| {
+                        self.pending_unban_actions
+                            .get(&t.fid)
+                            .is_none_or(|needed| needed.contains(&act_name))
+                    })
+                    .collect();
                 for pending in self.pending_unban_actions.values_mut() {
                     pending.remove(&act_name);
                 }
                 if !self.alive {
                     continue;
                 }
-                if !active_tickets.is_empty() {
+                if !to_unban.is_empty() {
                     let mut flushed = false;
                     if act.supports_flush() {
                         match act.flush().await {
@@ -756,7 +710,7 @@ impl JailState {
                         }
                     }
                     if !flushed {
-                        for ticket in &active_tickets {
+                        for ticket in to_unban {
                             let ctx = self.build_action_context(ticket, false);
                             if let Err(err) = act.unban(&ctx).await {
                                 f2b_log!(
@@ -776,6 +730,16 @@ impl JailState {
                         "Failed to stop removed action '{act_name}' in '{}': {err}",
                         self.name
                     );
+                }
+            }
+
+            // Include every newly replayed action in subsequent partial-unban cleanup so
+            // retrying a per-IP unban never leaves a replacement action blocking the IP.
+            for (_, act_name, replayed) in started_new {
+                for ticket in replayed {
+                    if let Some(pending) = self.pending_unban_actions.get_mut(&ticket.fid) {
+                        pending.insert(act_name.clone());
+                    }
                 }
             }
         }
@@ -1067,6 +1031,7 @@ impl JailState {
                 .ban_manager
                 .get_ban_list(false)
                 .into_iter()
+                .filter(|id| !self.pending_unban_actions.contains_key(id))
                 .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
                 .collect();
             let mut max_epoch = self.ban_epoch;
@@ -1117,7 +1082,7 @@ impl JailState {
     /// Manually unban specific IPs (or flush all if `ips` is `None`).
     pub async fn unban_ip(&mut self, ips: Option<&[String]>, ifexists: bool) -> Result<usize> {
         match ips {
-            None => self.flush_bans(true, false).await,
+            None => Ok(self.flush_bans(true, false).await),
             Some(targets) => {
                 let mut cnt = 0usize;
                 let mut missed = Vec::new();
@@ -1359,7 +1324,7 @@ impl JailState {
         ])
     }
 
-    async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> Result<usize> {
+    async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> usize {
         let tickets = self.ban_manager.flush_ban_list();
         let mut flushed_actions: BTreeSet<String> = BTreeSet::new();
         for (act_name, act) in &mut self.actions {
@@ -1387,9 +1352,12 @@ impl JailState {
                 }
             }
         }
+        // Match upstream Actions.__flushBan: clear jail database history unconditionally on bulk unban.
+        if clear_db {
+            self.db_del_ban(None);
+        }
         let log_prefix = if on_stop { "Repeal Ban" } else { "Unban" };
         let mut unbanned = 0usize;
-        let mut first_err: Option<Error> = None;
         for ticket in tickets {
             f2b_log!(
                 LogLevel::Notice,
@@ -1400,8 +1368,7 @@ impl JailState {
                 ticket.fid
             );
             let ctx = self.build_action_context(&ticket, false);
-            let only_actions = self.pending_unban_actions.get(&ticket.fid).cloned();
-            let mut failed_actions: BTreeSet<String> = BTreeSet::new();
+            let only_actions = self.pending_unban_actions.remove(&ticket.fid);
             for (act_name, act) in self.actions.iter_mut().rev() {
                 if flushed_actions.contains(act_name) {
                     continue;
@@ -1419,31 +1386,12 @@ impl JailState {
                         self.name,
                         ticket.fid
                     );
-                    failed_actions.insert(act_name.clone());
-                    if first_err.is_none() {
-                        first_err = Some(err);
-                    }
                 }
             }
-            if failed_actions.is_empty() {
-                self.pending_unban_actions.remove(&ticket.fid);
-                if clear_db {
-                    self.db_del_ban(Some(&ticket.fid));
-                }
-                unbanned += 1;
-            } else {
-                self.pending_unban_actions
-                    .insert(ticket.fid.clone(), failed_actions);
-                self.ban_manager.retain_for_retry(ticket);
-            }
+            unbanned += 1;
         }
-        if let Some(err) = first_err {
-            return Err(err);
-        }
-        if clear_db {
-            self.db_del_ban(None);
-        }
-        Ok(unbanned)
+        self.pending_unban_actions.clear();
+        unbanned
     }
 
     async fn unban_ticket_actions(&mut self, ticket: &Ticket, log_notice: bool) -> Result<()> {
@@ -1943,15 +1891,8 @@ impl Jail {
         let mut st = self.state.lock().await;
         st.flush_file_checkpoints_to_db();
         st.flush_journal_pos_to_db(current_unix_seconds());
-        if (st.alive || !st.ban_manager.get_ban_list(false).is_empty() || !st.actions.is_empty())
-            && let Err(err) = st.flush_bans(false, true).await
-        {
-            f2b_log!(
-                LogLevel::Error,
-                "fail2ban.actions",
-                "Failed to flush bans while stopping jail '{}': {err}",
-                st.name
-            );
+        if st.alive || !st.ban_manager.get_ban_list(false).is_empty() || !st.actions.is_empty() {
+            let _ = st.flush_bans(false, true).await;
         }
         let jail_name = st.name.clone();
         for (act_name, act) in st.actions.iter_mut().rev() {
@@ -2133,7 +2074,7 @@ fn spawn_backend_task(
                     } else {
                         0.0
                     };
-                    Some((ts + 0.000_001).max(floor))
+                    Some(ts.max(floor))
                 } else if st.filter.check_find_time() {
                     Some(current_unix_seconds() - st.filter.find_time())
                 } else {

@@ -32,6 +32,8 @@ pub struct Transmitter {
     jail_order: Vec<String>,
     db: Option<Arc<Mutex<Fail2BanDb>>>,
     pending_reload: Option<BTreeMap<String, PendingReloadJail>>,
+    reload_replacing_all: bool,
+    staged_db: Option<Option<Arc<Mutex<Fail2BanDb>>>>,
     staged_jails: BTreeMap<String, Jail>,
     staged_order: Vec<String>,
     staged_to_start: BTreeSet<String>,
@@ -175,12 +177,12 @@ impl Transmitter {
                     "Restart jail {name:?} (reason: {old_backend:?} != {backend:?})"
                 );
             }
-            let candidate = Jail::new(name, backend, self.db.clone())?;
+            let candidate = Jail::new(name, backend, self.effective_db().cloned())?;
             self.staged_jails.insert(name.to_owned(), candidate);
             self.staged_order.push(name.to_owned());
             return Ok(());
         }
-        let jail = Jail::new(name, backend, self.db.clone())?;
+        let jail = Jail::new(name, backend, self.effective_db().cloned())?;
         if self.pending_reload.is_some() {
             self.staged_jails.insert(name.to_owned(), jail);
             self.staged_order.push(name.to_owned());
@@ -237,6 +239,8 @@ impl Transmitter {
                 jail.state.lock().await.unban_ip(None, true).await?;
             }
         }
+        let replacing_all =
+            has("--restart") && (target == "--all" || names.len() == self.jails.len());
         let mut pending = BTreeMap::new();
         for name in names {
             if has("--restart") {
@@ -260,12 +264,16 @@ impl Transmitter {
             }
         }
         self.pending_reload = Some(pending);
+        self.reload_replacing_all = replacing_all;
+        self.staged_db = None;
         self.staged_jails.clear();
         self.staged_order.clear();
         self.staged_to_start.clear();
 
         let mut result = self.stream(commands).await.map(|_| ());
         let leftover = self.pending_reload.take().unwrap_or_default();
+        self.reload_replacing_all = false;
+        let staged_db = self.staged_db.take();
         let staged_order = std::mem::take(&mut self.staged_order);
         let mut staged_jails = std::mem::take(&mut self.staged_jails);
         let staged_to_start = std::mem::take(&mut self.staged_to_start);
@@ -291,6 +299,18 @@ impl Transmitter {
                 {
                     result = Err(err);
                     break;
+                }
+            }
+        }
+        if result.is_ok()
+            && let Some(new_db) = staged_db
+        {
+            if let Err(err) = self.stop_all().await {
+                result = Err(err);
+            } else {
+                self.db = new_db;
+                if let Err(err) = self.with_db(|db| db.del_all_jails()) {
+                    result = Err(err);
                 }
             }
         }
@@ -339,6 +359,13 @@ impl Transmitter {
         result.map(|_| text("OK"))
     }
 
+    fn effective_db(&self) -> Option<&Arc<Mutex<Fail2BanDb>>> {
+        match &self.staged_db {
+            Some(staged) => staged.as_ref(),
+            None => self.db.as_ref(),
+        }
+    }
+
     fn with_db<T>(&self, op: impl FnOnce(&mut Fail2BanDb) -> Result<T>) -> Result<Option<T>> {
         self.db
             .as_ref()
@@ -351,13 +378,30 @@ impl Transmitter {
             .transpose()
     }
 
+    fn with_effective_db<T>(
+        &self,
+        op: impl FnOnce(&mut Fail2BanDb) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.effective_db()
+            .map(|db| {
+                let mut db = db
+                    .lock()
+                    .map_err(|_| Error::database("database lock poisoned"))?;
+                op(&mut db)
+            })
+            .transpose()
+    }
+
     fn set_database(&mut self, filename: &str) -> Result<()> {
-        let prior = self.with_db(|db| Ok(db.filename().to_owned()))?;
+        let prior = self.with_effective_db(|db| Ok(db.filename().to_owned()))?;
         let disabled = filename.eq_ignore_ascii_case("none");
         if prior.as_deref() == Some(filename) || (prior.is_none() && disabled) {
             return Ok(());
         }
-        if !self.jails.is_empty() {
+        let stage_switch = self.pending_reload.is_some()
+            && (self.jails.is_empty() || self.reload_replacing_all)
+            && self.staged_jails.is_empty();
+        if !stage_switch && (!self.jails.is_empty() || !self.staged_jails.is_empty()) {
             return Err(Error::database(
                 "Cannot change database when there are jails present",
             ));
@@ -366,12 +410,19 @@ impl Transmitter {
             make_parent(Path::new(filename))
                 .map_err(|e| Error::io("creating database directory", e))?;
         }
-        self.db = Fail2BanDb::open_optional(filename, DEFAULT_PURGE_AGE, DEFAULT_MAX_MATCHES)?
-            .map(|db| {
-                db.del_all_jails()?;
-                Ok::<_, Error>(Arc::new(Mutex::new(db)))
-            })
-            .transpose()?;
+        let opened = Fail2BanDb::open_optional(filename, DEFAULT_PURGE_AGE, DEFAULT_MAX_MATCHES)?
+            .map(|db| Arc::new(Mutex::new(db)));
+        if stage_switch {
+            self.staged_db = Some(opened);
+            return Ok(());
+        }
+        if let Some(ref db_arc) = opened {
+            let db = db_arc
+                .lock()
+                .map_err(|_| Error::database("database lock poisoned"))?;
+            db.del_all_jails()?;
+        }
+        self.db = opened;
         Ok(())
     }
 
@@ -472,11 +523,15 @@ impl Transmitter {
             "logtarget" => text(logging::get_target()),
             "syslogsocket" => text(logging::get_syslog_socket()),
             "thread" => Dict(vec![(text("stacksize"), Int(self.stacksize))]),
-            "dbfile" => self.with_db(|db| Ok(text(db.filename())))?.unwrap_or(Null),
-            "dbmaxmatches" => self
-                .with_db(|db| Ok(integer(db.max_matches())))?
+            "dbfile" => self
+                .with_effective_db(|db| Ok(text(db.filename())))?
                 .unwrap_or(Null),
-            "dbpurgeage" => self.with_db(|db| Ok(Int(db.purge_age())))?.unwrap_or(Null),
+            "dbmaxmatches" => self
+                .with_effective_db(|db| Ok(integer(db.max_matches())))?
+                .unwrap_or(Null),
+            "dbpurgeage" => self
+                .with_effective_db(|db| Ok(Int(db.purge_age())))?
+                .unwrap_or(Null),
             _ => return Ok(None),
         }))
     }
@@ -507,13 +562,13 @@ impl Transmitter {
             }
             "dbfile" => self.set_database(string(args, 0)?)?,
             "dbmaxmatches" => {
-                self.with_db(|db| {
+                self.with_effective_db(|db| {
                     db.set_max_matches(nonnegative(args, 0)?);
                     Ok(())
                 })?;
             }
             "dbpurgeage" => {
-                self.with_db(|db| {
+                self.with_effective_db(|db| {
                     db.set_purge_age(str2seconds_i64(&scalar(args, 0)?)?);
                     Ok(())
                 })?;
