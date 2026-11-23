@@ -112,6 +112,10 @@ impl PythonAction {
         &self.jail_name
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn set_ban_time(&mut self, ban_time: i64) {
         self.ban_time = ban_time;
     }

@@ -1,6 +1,6 @@
 //! Commands exchanged between Fail2Ban clients and the service.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,12 +21,20 @@ use crate::protocol::PickleValue::{
 };
 use crate::ticket::{ActionContext, Ticket, TicketId};
 
+struct PendingReloadJail {
+    untouched: bool,
+    force_restart: bool,
+}
+
 #[derive(Default)]
 pub struct Transmitter {
     jails: BTreeMap<String, Jail>,
     jail_order: Vec<String>,
     db: Option<Arc<Mutex<Fail2BanDb>>>,
-    pending_reload: Option<BTreeMap<String, bool>>,
+    pending_reload: Option<BTreeMap<String, PendingReloadJail>>,
+    staged_jails: BTreeMap<String, Jail>,
+    staged_order: Vec<String>,
+    staged_to_start: BTreeSet<String>,
     stacksize: i64,
     pub(super) stopping: bool,
 }
@@ -66,6 +74,13 @@ impl Transmitter {
             }
             "start" => {
                 let name = string(args, 0)?;
+                if self.pending_reload.is_some() && self.staged_jails.contains_key(name) {
+                    self.staged_to_start.insert(name.to_owned());
+                    if let Some(pending) = &mut self.pending_reload {
+                        pending.remove(name);
+                    }
+                    return Ok(Null);
+                }
                 self.jail(name)?.start().await?;
                 if let Some(pending) = &mut self.pending_reload {
                     pending.remove(name);
@@ -119,8 +134,9 @@ impl Transmitter {
     }
 
     fn jail(&self, name: &str) -> Result<&Jail> {
-        self.jails
+        self.staged_jails
             .get(name)
+            .or_else(|| self.jails.get(name))
             .ok_or_else(|| Error::unknown_jail(name))
     }
 
@@ -128,28 +144,48 @@ impl Transmitter {
         if name == "--all" {
             return Err(Error::invalid_command("Reserved name '--all'"));
         }
+        if self.staged_jails.contains_key(name) {
+            return Err(Error::duplicate_jail(name));
+        }
         if let Some(jail) = self.jails.get(name) {
             let pending = self
                 .pending_reload
                 .as_mut()
                 .and_then(|jails| jails.get_mut(name));
-            if !pending.is_some_and(|pending| std::mem::replace(pending, false)) {
+            let Some(entry) = pending.filter(|e| e.untouched) else {
                 return Err(Error::duplicate_jail(name));
-            }
+            };
+            entry.untouched = false;
+            let force_restart = entry.force_restart;
             let old_backend = jail.state.lock().await.backend_spec.clone();
-            if old_backend == backend {
+            if !force_restart && old_backend == backend {
                 f2b_log!(LogLevel::Info, "fail2ban.server", "Reload jail {name:?}");
                 return Ok(());
             }
-            f2b_log!(
-                LogLevel::Info,
-                "fail2ban.server",
-                "Restart jail {name:?} (reason: {old_backend:?} != {backend:?})"
-            );
-            super::jail::validate_backend_spec(backend)?;
-            self.remove_jail(name).await?;
+            if force_restart {
+                f2b_log!(
+                    LogLevel::Info,
+                    "fail2ban.server",
+                    "Restart jail {name:?} (reason: --restart)"
+                );
+            } else {
+                f2b_log!(
+                    LogLevel::Info,
+                    "fail2ban.server",
+                    "Restart jail {name:?} (reason: {old_backend:?} != {backend:?})"
+                );
+            }
+            let candidate = Jail::new(name, backend, self.db.clone())?;
+            self.staged_jails.insert(name.to_owned(), candidate);
+            self.staged_order.push(name.to_owned());
+            return Ok(());
         }
         let jail = Jail::new(name, backend, self.db.clone())?;
+        if self.pending_reload.is_some() {
+            self.staged_jails.insert(name.to_owned(), jail);
+            self.staged_order.push(name.to_owned());
+            return Ok(());
+        }
         self.with_db(|db| db.add_jail(name))?;
         self.jails.insert(name.to_owned(), jail);
         self.jail_order.push(name.to_owned());
@@ -191,38 +227,108 @@ impl Transmitter {
             self.jail(target)?;
             vec![target.to_owned()]
         };
-        if let Err(err) = validate_reload_commands(commands) {
+        if let Err(err) = validate_config_stream(commands) {
             f2b_log!(LogLevel::Info, "fail2ban.server", "Reload finished.");
             return Err(err);
         }
-        let mut pending = BTreeMap::new();
-        for name in names {
-            let jail = self.jail(&name)?;
-            if has("--unban") {
+        if has("--unban") {
+            for name in &names {
+                let jail = self.jail(name)?;
                 jail.state.lock().await.unban_ip(None, true).await?;
             }
+        }
+        let mut pending = BTreeMap::new();
+        for name in names {
             if has("--restart") {
-                self.remove_jail(&name).await?;
+                pending.insert(
+                    name,
+                    PendingReloadJail {
+                        untouched: true,
+                        force_restart: true,
+                    },
+                );
             } else {
+                let jail = self.jail(&name)?;
                 jail.reload_begin().await;
-                pending.insert(name, true);
+                pending.insert(
+                    name,
+                    PendingReloadJail {
+                        untouched: true,
+                        force_restart: false,
+                    },
+                );
             }
         }
         self.pending_reload = Some(pending);
+        self.staged_jails.clear();
+        self.staged_order.clear();
+        self.staged_to_start.clear();
+
         let mut result = self.stream(commands).await.map(|_| ());
         let leftover = self.pending_reload.take().unwrap_or_default();
+        let staged_order = std::mem::take(&mut self.staged_order);
+        let mut staged_jails = std::mem::take(&mut self.staged_jails);
+        let staged_to_start = std::mem::take(&mut self.staged_to_start);
+
         if result.is_ok() {
-            for (name, untouched) in leftover {
-                if untouched && self.jails.contains_key(&name) {
+            for name in &staged_order {
+                if let Some(candidate) = staged_jails.get(name) {
+                    let st = candidate.state.lock().await;
+                    if let Err(err) = st.validate_backend().await {
+                        result = Err(err);
+                        break;
+                    }
+                }
+            }
+        }
+        if result.is_ok() {
+            for (name, jail) in &self.jails {
+                if staged_jails.contains_key(name) {
+                    continue;
+                }
+                if jail.state.lock().await.is_reloading()
+                    && let Err(err) = jail.reload_commit().await
+                {
+                    result = Err(err);
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            for name in staged_order {
+                let Some(candidate) = staged_jails.remove(&name) else {
+                    continue;
+                };
+                if self.jails.contains_key(&name)
+                    && let Err(err) = self.remove_jail(&name).await
+                {
+                    result = Err(err);
+                    break;
+                }
+                if let Err(err) = self.with_db(|db| db.add_jail(&name)) {
+                    result = Err(err);
+                    break;
+                }
+                self.jails.insert(name.clone(), candidate);
+                if !self.jail_order.iter().any(|existing| existing == &name) {
+                    self.jail_order.push(name.clone());
+                }
+                if staged_to_start.contains(&name)
+                    && let Err(err) = self.jails[&name].start().await
+                {
+                    result = Err(err);
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            for (name, state) in leftover {
+                if state.untouched && self.jails.contains_key(&name) {
                     result = result.and(self.remove_jail(&name).await);
                 }
             }
-            for jail in self.jails.values() {
-                if jail.state.lock().await.is_reloading() {
-                    result = result.and(jail.reload_commit().await);
-                }
-            }
         } else {
+            drop(staged_jails);
             for jail in self.jails.values() {
                 if jail.state.lock().await.is_reloading() {
                     jail.reload_abort().await;
@@ -316,12 +422,23 @@ impl Transmitter {
 
     async fn unban(&self, ips: Option<&[String]>) -> Result<usize> {
         let mut count = 0;
+        let mut first_err: Option<Error> = None;
         for name in &self.jail_order {
             if let Some(jail) = self.jails.get(name) {
-                count += jail.state.lock().await.unban_ip(ips, true).await?;
+                match jail.state.lock().await.unban_ip(ips, true).await {
+                    Ok(n) => count += n,
+                    Err(err) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                }
             }
         }
-        Ok(count)
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(count),
+        }
     }
 
     async fn banned(&self, ips: &[String]) -> Result<Value> {
@@ -510,11 +627,11 @@ impl Transmitter {
                 key
             }
             "addjournalmatch" => {
-                state.add_journal_match(&strings(args)?);
+                state.add_journal_match(&strings(args)?).await?;
                 "journalmatch"
             }
             "deljournalmatch" => {
-                state.del_journal_match(&strings(args)?)?;
+                state.del_journal_match(&strings(args)?).await?;
                 "journalmatch"
             }
             "prefregex" => {
@@ -1048,7 +1165,22 @@ fn unknown_action(name: &str) -> Error {
     Error::invalid_command(format!("Invalid Action name: {name}"))
 }
 
-fn validate_reload_commands(commands: &[Value]) -> Result<()> {
+fn is_global_set_key(key: &str) -> bool {
+    matches!(
+        key,
+        "loglevel"
+            | "logtarget"
+            | "syslogsocket"
+            | "allowipv6"
+            | "dbfile"
+            | "dbmaxmatches"
+            | "dbpurgeage"
+            | "thread"
+    )
+}
+
+/// Validate a protocol command stream (used by both `reload` preflight and `fail2ban-client -t`).
+pub fn validate_config_stream(commands: &[Value]) -> Result<()> {
     let mut filters: BTreeMap<String, crate::filter::Filter> = BTreeMap::new();
     let mut extras: BTreeMap<String, crate::observer::BanTimeExtra> = BTreeMap::new();
 
@@ -1058,11 +1190,20 @@ fn validate_reload_commands(commands: &[Value]) -> Result<()> {
             return Err(invalid());
         };
         let name = head.as_str().ok_or_else(invalid)?;
+        if name == "add" {
+            let _ = string(args, 0)?;
+            let backend = args.get(1).and_then(Value::as_str).unwrap_or("auto");
+            super::jail::validate_backend_spec(backend)?;
+            continue;
+        }
         if !matches!(name, "set" | "multi-set") || args.len() < 2 {
             continue;
         }
-        let multiple = name == "multi-set";
         let jail = string(args, 0)?;
+        if is_global_set_key(jail) {
+            continue;
+        }
+        let multiple = name == "multi-set";
         let key = string(args, 1)?;
         let rest = &args[2..];
         let filter = filters
@@ -1095,6 +1236,9 @@ fn validate_reload_commands(commands: &[Value]) -> Result<()> {
             }
             "logencoding" => {
                 filter.set_log_encoding_str(string(rest, 0)?)?;
+            }
+            "addjournalmatch" => {
+                crate::filter::backend::systemd::validate_journal_match_tokens(&strings(rest)?)?;
             }
             "prefregex" => {
                 filter.set_prefregex(optional_string(arg(rest, 0)?))?;

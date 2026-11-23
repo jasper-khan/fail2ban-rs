@@ -72,6 +72,7 @@ pub enum LogEvent {
         log_path: Option<String>,
         in_operation: bool,
         checkpoint: Option<(String, u64)>,
+        journal_cursor: Option<String>,
     },
     Checkpoint {
         path: String,
@@ -287,6 +288,7 @@ impl WatchedFile {
                             log_path: Some(path_str.clone()),
                             in_operation: self.in_operation,
                             checkpoint: Some((self.identity.fingerprint.clone(), next_pos)),
+                            journal_cursor: None,
                         });
                         emitted_lines = true;
                     }
@@ -329,6 +331,7 @@ impl WatchedFile {
                 log_path: Some(path_str.to_owned()),
                 in_operation: self.in_operation,
                 checkpoint: Some((self.identity.fingerprint.clone(), next_offset)),
+                journal_cursor: None,
             });
             start += next_start;
         }
@@ -348,12 +351,13 @@ impl WatchedFile {
                 log_path: Some(self.config.path.to_string_lossy().into_owned()),
                 in_operation: self.in_operation,
                 checkpoint: None,
+                journal_cursor: None,
             });
             self.pending.clear();
         }
     }
 
-    fn checkpoint_event(&self) -> LogEvent {
+    pub(crate) fn checkpoint_event(&self) -> LogEvent {
         LogEvent::Checkpoint {
             path: self.config.path.to_string_lossy().into_owned(),
             fingerprint: self.identity.fingerprint.clone(),

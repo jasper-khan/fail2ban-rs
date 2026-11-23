@@ -2,7 +2,7 @@
 
 pub mod jail;
 mod transmitter;
-pub use transmitter::Transmitter;
+pub use transmitter::{Transmitter, validate_config_stream};
 
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};

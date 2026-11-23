@@ -1285,3 +1285,829 @@ async fn reload_safety_action_handoff_sqlite_restore_live_eof_idle_reconfig_jour
         "restarted journalctl must resume from last seen timestamp + 1us:\n{recorded_args}"
     );
 }
+
+#[tokio::test]
+async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_and_cli_test() {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use fail2ban_rs::db::Fail2BanDb;
+    use fail2ban_rs::filter::LogEncoding;
+    use fail2ban_rs::filter::backend::systemd::FilterSystemd;
+    use fail2ban_rs::filter::backend::{JournalConfig, LogEvent};
+    use fail2ban_rs::protocol::PickleValue;
+    use fail2ban_rs::server::Transmitter;
+    use fail2ban_rs::server::jail::{Jail, current_unix_seconds};
+    use fail2ban_rs::ticket::TicketId;
+    use tokio::sync::{mpsc, watch};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = |v: &str| PickleValue::Str(v.to_owned());
+
+    // 1. Failed action handoff & shared firewall state preserve live enforcement;
+    //    failed backend switch preserves running jail;
+    //    partial unban retry skips succeeded actions; bulk unban failure retains DB + tickets.
+    let db_path = dir.path().join("r2.sqlite3");
+    let order_log = dir.path().join("r2_actions.log");
+    let mut tr = Transmitter::default();
+    tr.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("dbfile"),
+        s(db_path.to_str().unwrap()),
+    ]))
+    .await
+    .unwrap();
+    tr.dispatch(&PickleValue::List(vec![s("add"), s("svc"), s("polling")]))
+        .await
+        .unwrap();
+    tr.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("svc"),
+        s("ignoreself"),
+        s("false"),
+    ]))
+    .await
+    .unwrap();
+    tr.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("svc"),
+        s("addaction"),
+        s("fw1"),
+    ]))
+    .await
+    .unwrap();
+    for (k, v) in [
+        (
+            "actionstart",
+            format!("echo fw1:start >> '{}'", order_log.display()),
+        ),
+        (
+            "actionban",
+            format!("echo fw1:ban:<ip> >> '{}'", order_log.display()),
+        ),
+        (
+            "actionunban",
+            format!("echo fw1:unban:<ip> >> '{}'", order_log.display()),
+        ),
+        (
+            "actionstop",
+            format!("echo fw1:stop >> '{}'", order_log.display()),
+        ),
+    ] {
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("svc"),
+            s("action"),
+            s("fw1"),
+            s(k),
+            s(&v),
+        ]))
+        .await
+        .unwrap();
+    }
+    tr.dispatch(&PickleValue::List(vec![s("start"), s("svc")]))
+        .await
+        .unwrap();
+    tr.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("svc"),
+        s("banip"),
+        s("192.0.2.50"),
+    ]))
+    .await
+    .unwrap();
+
+    // 1a. Replacement action whose replay ban fails must NOT retire fw1 and must return Err.
+    let fail_replay_stream = PickleValue::List(vec![
+        PickleValue::List(vec![s("add"), s("svc"), s("polling")]),
+        PickleValue::List(vec![s("set"), s("svc"), s("addaction"), s("fw_bad")]),
+        PickleValue::List(vec![
+            s("set"),
+            s("svc"),
+            s("action"),
+            s("fw_bad"),
+            s("actionstart"),
+            s(&format!("echo fw_bad:start >> '{}'", order_log.display())),
+        ]),
+        PickleValue::List(vec![
+            s("set"),
+            s("svc"),
+            s("action"),
+            s("fw_bad"),
+            s("actionban"),
+            s("false"),
+        ]),
+        PickleValue::List(vec![
+            s("set"),
+            s("svc"),
+            s("action"),
+            s("fw_bad"),
+            s("actionstop"),
+            s(&format!("echo fw_bad:stop >> '{}'", order_log.display())),
+        ]),
+        PickleValue::List(vec![s("start"), s("svc")]),
+    ]);
+    assert!(
+        tr.dispatch(&PickleValue::List(vec![
+            s("reload"),
+            s("--all"),
+            PickleValue::List(vec![]),
+            fail_replay_stream
+        ]))
+        .await
+        .is_err(),
+        "failed replay on replacement action must fail reload"
+    );
+    assert_eq!(
+        tr.dispatch(&PickleValue::List(vec![s("get"), s("svc"), s("actions")]))
+            .await
+            .unwrap(),
+        PickleValue::List(vec![s("fw1")]),
+        "fw1 must remain active after failed replacement replay"
+    );
+    let log_after_fail = fs::read_to_string(&order_log).unwrap();
+    assert!(
+        !log_after_fail.contains("fw1:unban") && !log_after_fail.contains("fw1:stop"),
+        "fw1 must not be unbanned or stopped when replacement fails:\n{log_after_fail}"
+    );
+
+    // 1b. Replacement sharing firewall cleanup command with fw1 requires reload --restart.
+    let shared_fw_stream = PickleValue::List(vec![
+        PickleValue::List(vec![s("add"), s("svc"), s("polling")]),
+        PickleValue::List(vec![s("set"), s("svc"), s("addaction"), s("fw_shared")]),
+        PickleValue::List(vec![
+            s("set"),
+            s("svc"),
+            s("action"),
+            s("fw_shared"),
+            s("actionunban"),
+            s(&format!("echo fw1:unban:<ip> >> '{}'", order_log.display())),
+        ]),
+        PickleValue::List(vec![s("start"), s("svc")]),
+    ]);
+    let shared_err = tr
+        .dispatch(&PickleValue::List(vec![
+            s("reload"),
+            s("--all"),
+            PickleValue::List(vec![]),
+            shared_fw_stream,
+        ]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        shared_err.contains("reload --restart"),
+        "expected reload --restart error, got: {shared_err}"
+    );
+    assert_eq!(
+        tr.dispatch(&PickleValue::List(vec![s("get"), s("svc"), s("actions")]))
+            .await
+            .unwrap(),
+        PickleValue::List(vec![s("fw1")])
+    );
+
+    // 1c. Failed backend switch (polling -> systemd with failing Python action import) leaves old jail live.
+    let bad_switch_stream = PickleValue::List(vec![
+        PickleValue::List(vec![s("add"), s("svc"), s("systemd")]),
+        PickleValue::List(vec![
+            s("set"),
+            s("svc"),
+            s("addaction"),
+            s("broken_py"),
+            s("/nonexistent/fail2ban_broken_action.py"),
+            s("{}"),
+        ]),
+        PickleValue::List(vec![s("start"), s("svc")]),
+    ]);
+    assert!(
+        tr.dispatch(&PickleValue::List(vec![
+            s("reload"),
+            s("--all"),
+            PickleValue::List(vec![]),
+            bad_switch_stream
+        ]))
+        .await
+        .is_err(),
+        "backend switch with failing action import must fail reload"
+    );
+    let stats_after_switch = tr
+        .dispatch(&PickleValue::List(vec![s("stats")]))
+        .await
+        .unwrap();
+    let stats_str = format!("{stats_after_switch:?}");
+    assert!(
+        stats_str.contains("polling"),
+        "old polling jail must remain running after failed switch: {stats_str}"
+    );
+    assert_eq!(
+        tr.dispatch(&PickleValue::List(vec![s("get"), s("svc"), s("banip")]))
+            .await
+            .unwrap(),
+        PickleValue::List(vec![s("192.0.2.50")]),
+        "active ban must remain enforced after failed backend switch"
+    );
+    let log_after_switch = fs::read_to_string(&order_log).unwrap();
+    assert!(
+        !log_after_switch.contains("fw1:stop"),
+        "old jail must not be stopped before staged replacement is validated:\n{log_after_switch}"
+    );
+    let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+    // 2. Partial unban retry skips already-succeeded actions; bulk unban retains DB + ticket on error.
+    let unban_db_path = dir.path().join("unban.sqlite3");
+    let once_marker = dir.path().join("fw_once_deleted");
+    let flaky_ok = dir.path().join("fw_flaky_ok");
+    let mut tr2 = Transmitter::default();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("dbfile"),
+        s(unban_db_path.to_str().unwrap()),
+    ]))
+    .await
+    .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![s("add"), s("multi"), s("polling")]))
+        .await
+        .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("ignoreself"),
+        s("false"),
+    ]))
+    .await
+    .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("addaction"),
+        s("fw_flaky"),
+    ]))
+    .await
+    .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("action"),
+        s("fw_flaky"),
+        s("actionban"),
+        s("true"),
+    ]))
+    .await
+    .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("action"),
+        s("fw_flaky"),
+        s("actionunban"),
+        s(&format!("test -f '{}'", flaky_ok.display())),
+    ]))
+    .await
+    .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("addaction"),
+        s("fw_once"),
+    ]))
+    .await
+    .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("action"),
+        s("fw_once"),
+        s("actionban"),
+        s("true"),
+    ]))
+    .await
+    .unwrap();
+    // Fails if invoked a second time (like `nft delete element` on an already-removed element).
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("action"),
+        s("fw_once"),
+        s("actionunban"),
+        s(&format!(
+            "test ! -f '{0}' && touch '{0}'",
+            once_marker.display()
+        )),
+    ]))
+    .await
+    .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![s("start"), s("multi")]))
+        .await
+        .unwrap();
+    tr2.dispatch(&PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("banip"),
+        s("192.0.2.80"),
+    ]))
+    .await
+    .unwrap();
+
+    // Bulk `unban --all` fails because fw_flaky fails while fw_once succeeds -> ticket & DB row retained!
+    assert!(
+        tr2.dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await
+            .is_err(),
+        "bulk unban must return error when any action fails"
+    );
+    assert!(once_marker.exists(), "fw_once must have run once");
+    assert_eq!(
+        tr2.dispatch(&PickleValue::List(vec![s("get"), s("multi"), s("banip")]))
+            .await
+            .unwrap(),
+        PickleValue::List(vec![s("192.0.2.80")]),
+        "ticket must remain banned after failed bulk unban"
+    );
+    {
+        let check_db = Fail2BanDb::open(unban_db_path.to_str().unwrap(), 86_400, 10).unwrap();
+        let active = check_db
+            .get_current_bans(Some("multi"), None, None, current_unix_seconds() as i64)
+            .unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "SQLite ban row must be retained when bulk unban fails"
+        );
+    }
+
+    // Now allow fw_flaky to succeed: retry must NOT re-run fw_once (which would fail!) and must clear the ban.
+    fs::write(&flaky_ok, "ok").unwrap();
+    assert_eq!(
+        tr2.dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await
+            .unwrap(),
+        PickleValue::Int(1),
+        "retry must skip already-succeeded fw_once and succeed via fw_flaky"
+    );
+    assert_eq!(
+        tr2.dispatch(&PickleValue::List(vec![s("get"), s("multi"), s("banip")]))
+            .await
+            .unwrap(),
+        PickleValue::List(vec![])
+    );
+    let _ = tr2.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+    // 3. Journal reader keeps fixed cutoff within child (equal + out-of-order _SOURCE_REALTIME_TIMESTAMP)
+    //    and resumes restarted child via --after-cursor.
+    let cursor_jctl = dir.path().join("mock-cursor-jctl.sh");
+    let cursor_state = dir.path().join("cursor_runs");
+    fs::write(
+        &cursor_jctl,
+        format!(
+            "#!/usr/bin/env bash\n\
+             count=0\n\
+             if [[ -f '{0}' ]]; then count=$(cat '{0}'); fi\n\
+             count=$((count + 1))\n\
+             echo \"$count: $*\" >> '{0}.args'\n\
+             echo \"$count\" > '{0}'\n\
+             if [[ $count -eq 1 ]]; then\n\
+                 echo '{{\"__CURSOR\":\"s=1;i=1\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"rec1\",\"__REALTIME_TIMESTAMP\":\"1715675415000000\",\"_SOURCE_REALTIME_TIMESTAMP\":\"1715675415000000\"}}'\n\
+                 echo '{{\"__CURSOR\":\"s=1;i=2\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"rec2-same-ts\",\"__REALTIME_TIMESTAMP\":\"1715675415000000\",\"_SOURCE_REALTIME_TIMESTAMP\":\"1715675415000000\"}}'\n\
+                 echo '{{\"__CURSOR\":\"s=1;i=3\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"rec3-older-source\",\"__REALTIME_TIMESTAMP\":\"1715675415500000\",\"_SOURCE_REALTIME_TIMESTAMP\":\"1715675410000000\"}}'\n\
+                 exit 1\n\
+             else\n\
+                 echo '{{\"__CURSOR\":\"s=1;i=4\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"rec4-after-cursor\",\"__REALTIME_TIMESTAMP\":\"1715675415500000\",\"_SOURCE_REALTIME_TIMESTAMP\":\"1715675415000000\"}}'\n\
+                 sleep 30\n\
+             fi\n",
+            cursor_state.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cursor_jctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (j_tx, mut j_rx) = mpsc::channel(16);
+    let (j_shut_tx, j_shut_rx) = watch::channel(false);
+    let reader = FilterSystemd::new(JournalConfig::default(), LogEncoding::Utf8, false)
+        .with_since(Some(1_715_675_415.0))
+        .with_journalctl_bin(cursor_jctl.to_str().unwrap());
+    let j_handle = tokio::spawn(async move { reader.run(j_tx, j_shut_rx).await });
+
+    let mut received = Vec::new();
+    for _ in 0..4 {
+        let ev = tokio::time::timeout(Duration::from_secs(3), j_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let LogEvent::Line { line, .. } = ev {
+            received.push(line);
+        }
+    }
+    let _ = j_shut_tx.send(true);
+    j_handle.await.unwrap().unwrap();
+
+    assert!(received[0].contains("rec1"), "{received:?}");
+    assert!(received[1].contains("rec2-same-ts"), "{received:?}");
+    assert!(received[2].contains("rec3-older-source"), "{received:?}");
+    assert!(received[3].contains("rec4-after-cursor"), "{received:?}");
+    let cursor_args = fs::read_to_string(format!("{}.args", cursor_state.display())).unwrap();
+    assert!(
+        cursor_args.contains("--after-cursor=s=1;i=3"),
+        "restarted journalctl must resume with --after-cursor:\n{cursor_args}"
+    );
+
+    // 4. Invalid journalmatch is rejected without disturbing live reader, and dead reader surfaces in status.
+    let status_jctl = dir.path().join("mock-status-jctl.sh");
+    let kill_flag = dir.path().join("jctl_die");
+    fs::write(
+        &status_jctl,
+        format!(
+            "#!/usr/bin/env bash\n\
+             for a in \"$@\"; do\n\
+                 if [[ \"$a\" == \"--lines=0\" ]]; then\n\
+                     for m in \"$@\"; do\n\
+                         if [[ \"$m\" == \"_REJECT=1\" ]]; then echo 'rejected match' >&2; exit 1; fi\n\
+                     done\n\
+                     exit 0\n\
+                 fi\n\
+             done\n\
+             if [[ -f '{}' ]]; then\n\
+                 echo 'simulated journal failure' >&2\n\
+                 exit 1\n\
+             fi\n\
+             sleep 30\n",
+            kill_flag.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&status_jctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let j_sys = Jail::new("syshealth", "systemd", None).unwrap();
+    {
+        let mut st = j_sys.state.lock().await;
+        st.set_journalctl_bin(status_jctl.to_str().unwrap());
+        st.add_journal_match(&["_SYSTEMD_UNIT=sshd.service".to_owned()])
+            .await
+            .unwrap();
+        assert!(
+            st.add_journal_match(&["INVALID_NO_EQ".to_owned()])
+                .await
+                .is_err(),
+            "syntactically invalid journalmatch must be rejected"
+        );
+        assert!(
+            st.add_journal_match(&["_REJECT=1".to_owned()])
+                .await
+                .is_err(),
+            "journalctl-rejected match must fail before replacing live reader"
+        );
+        assert_eq!(st.journal_matches.len(), 1);
+    }
+    fs::write(&kill_flag, "1").unwrap();
+    j_sys.start().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_backend_error = false;
+    while tokio::time::Instant::now() < deadline {
+        let st = j_sys.state.lock().await;
+        let basic = format!("{:?}", st.status("basic"));
+        let stats = format!("{:?}", st.status("stats"));
+        if basic.contains("Backend error")
+            && basic.contains("simulated journal failure")
+            && stats.contains("systemd (error)")
+        {
+            saw_backend_error = true;
+            break;
+        }
+        drop(st);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_backend_error,
+        "dead journal reader must expose backend error in status and stats"
+    );
+    j_sys.stop().await.unwrap();
+
+    // 5. Idle `tail` jail reconfiguration before any line consumed does not skip queued records
+    //    (covers both non-empty and initially empty tail files).
+    let tail_nonempty = dir.path().join("tail_nonempty.log");
+    let tail_empty = dir.path().join("tail_empty.log");
+    fs::write(&tail_nonempty, "old pre-existing line\n").unwrap();
+    fs::write(&tail_empty, "").unwrap();
+
+    let tail_jail = Jail::new("tailrec", "polling", None).unwrap();
+    {
+        let mut st = tail_jail.state.lock().await;
+        st.filter.set_ignore_self(false);
+        st.filter.set_date_pattern(Some("{NONE}")).unwrap();
+        st.filter.add_fail_regex("^fail <HOST>$").unwrap();
+        st.fail_manager.set_max_retry(1);
+        st.add_log_path(tail_nonempty.clone(), true).unwrap();
+        st.add_log_path(tail_empty.clone(), true).unwrap();
+    }
+    tail_jail.start().await.unwrap();
+    // Immediately idle before any new record is consumed.
+    tail_jail.set_idle(true).await;
+    {
+        let mut f1 = OpenOptions::new()
+            .append(true)
+            .open(&tail_nonempty)
+            .unwrap();
+        writeln!(f1, "fail 192.0.2.41").unwrap();
+        let mut f2 = OpenOptions::new().append(true).open(&tail_empty).unwrap();
+        writeln!(f2, "fail 192.0.2.42").unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    {
+        let mut st = tail_jail.state.lock().await;
+        st.filter.set_log_encoding_str("utf-8").unwrap();
+    }
+    tail_jail.restart_backend_if_alive().await;
+    tail_jail.set_idle(false).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let mut both_banned = false;
+    while tokio::time::Instant::now() < deadline {
+        let st = tail_jail.state.lock().await;
+        if st.ban_manager.in_ban_list(&TicketId::parse("192.0.2.41"))
+            && st.ban_manager.in_ban_list(&TicketId::parse("192.0.2.42"))
+        {
+            both_banned = true;
+            break;
+        }
+        drop(st);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        both_banned,
+        "idle tail reconfiguration must not skip queued records in nonempty or empty files"
+    );
+    tail_jail.stop().await.unwrap();
+
+    // 6. Sustained log traffic must not starve 1-second periodic tick / ban expiry,
+    //    and file offsets must not commit to SQLite ahead of ban writes or per benign line.
+    let batch_db_path = dir.path().join("batch.sqlite3");
+    let batch_db = Arc::new(std::sync::Mutex::new(
+        Fail2BanDb::open(batch_db_path.to_str().unwrap(), 86_400, 10).unwrap(),
+    ));
+    let batch_log = dir.path().join("batch.log");
+    let pos_seen_during_ban = dir.path().join("pos_during_ban.txt");
+    fs::write(&batch_log, "").unwrap();
+    let batch_jail = Jail::new("batch", "polling", Some(Arc::clone(&batch_db))).unwrap();
+    {
+        let mut st = batch_jail.state.lock().await;
+        st.filter.set_ignore_self(false);
+        st.filter.set_date_pattern(Some("{NONE}")).unwrap();
+        st.filter.add_fail_regex("^banme <HOST>$").unwrap();
+        st.fail_manager.set_max_retry(1);
+        st.ban_manager.set_ban_time(1);
+        st.add_log_path(batch_log.clone(), false).unwrap();
+        st.add_action("probe", None, None).await.unwrap();
+        st.get_action_mut("probe")
+            .unwrap()
+            .set_property(
+                "actionban",
+                &format!(
+                    "python3 -c \"import sqlite3; c=sqlite3.connect('{}'); r=c.execute('SELECT lastfilepos FROM logs').fetchall(); print(r)\" > '{}'",
+                    batch_db_path.display(),
+                    pos_seen_during_ban.display()
+                ),
+            )
+            .await
+            .unwrap();
+        // Process benign lines directly without LogEvent::Checkpoint: SQLite `logs` must stay untouched per line.
+        let now = current_unix_seconds();
+        for i in 0..5u64 {
+            st.handle_log_event(
+                LogEvent::Line {
+                    line: format!("benign line {i}"),
+                    preset_date: None,
+                    log_path: Some(batch_log.to_string_lossy().into_owned()),
+                    in_operation: true,
+                    checkpoint: Some(("fp_test".to_owned(), (i + 1) * 14)),
+                    journal_cursor: None,
+                },
+                now,
+            )
+            .await;
+        }
+        assert!(
+            batch_db
+                .lock()
+                .unwrap()
+                .get_logs("batch")
+                .unwrap()
+                .is_empty(),
+            "benign LogEvent::Line must not synchronously commit SQLite per line"
+        );
+        // Trigger a ban line: during actionban, SQLite must NOT already have the post-line offset.
+        st.handle_log_event(
+            LogEvent::Line {
+                line: "banme 192.0.2.77".to_owned(),
+                preset_date: None,
+                log_path: Some(batch_log.to_string_lossy().into_owned()),
+                in_operation: true,
+                checkpoint: Some(("fp_test".to_owned(), 999)),
+                journal_cursor: None,
+            },
+            now,
+        )
+        .await;
+        let seen_mid_ban = fs::read_to_string(&pos_seen_during_ban).unwrap();
+        assert!(
+            !seen_mid_ban.contains("999"),
+            "SQLite offset must not advance before ban action & DB write finish: {seen_mid_ban}"
+        );
+        // Periodic tick / Checkpoint flushes batched offset after ban persistence.
+        st.periodic_tick(now).await;
+        let saved_logs = batch_db.lock().unwrap().get_logs("batch").unwrap();
+        assert!(
+            saved_logs.iter().any(|(_, _, pos)| *pos == 999),
+            "batched offset must persist on tick/checkpoint: {saved_logs:?}"
+        );
+    }
+
+    // Now test sustained traffic does not starve ban expiry for 192.0.2.78 (bantime=1s).
+    let flood_jail = Jail::new("flood", "polling", None).unwrap();
+    let flood_log = dir.path().join("flood.log");
+    fs::write(&flood_log, "").unwrap();
+    {
+        let mut st = flood_jail.state.lock().await;
+        st.filter.set_ignore_self(false);
+        st.filter.set_date_pattern(Some("{NONE}")).unwrap();
+        st.filter.add_fail_regex("^hit <HOST>$").unwrap();
+        st.fail_manager.set_max_retry(1);
+        st.ban_manager.set_ban_time(1);
+        st.add_log_path(flood_log.clone(), false).unwrap();
+    }
+    flood_jail.start().await.unwrap();
+    flood_jail
+        .state
+        .lock()
+        .await
+        .ban_ip(&["192.0.2.78".to_owned()])
+        .await
+        .unwrap();
+    let flood_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood_stop_bg = Arc::clone(&flood_stop);
+    let flood_log_bg = flood_log.clone();
+    let writer_task = tokio::spawn(async move {
+        let mut batch = String::new();
+        for i in 0..400 {
+            batch.push_str(&format!("benign flood line {i}\n"));
+        }
+        while !flood_stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(mut f) = OpenOptions::new().append(true).open(&flood_log_bg) {
+                let _ = f.write_all(batch.as_bytes());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let mut expired = false;
+    while tokio::time::Instant::now() < deadline {
+        if !flood_jail
+            .state
+            .lock()
+            .await
+            .ban_manager
+            .in_ban_list(&TicketId::parse("192.0.2.78"))
+        {
+            expired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    flood_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = writer_task.await;
+    flood_jail.stop().await.unwrap();
+    assert!(
+        expired,
+        "expired ban must still unban promptly under sustained log traffic"
+    );
+
+    // 7. `fail2ban-client -t` rejects Rust 1.1.1's `systemd[tail=true]` with a migration diagnostic.
+    let cli_conf = dir.path().join("cli_test_conf");
+    fs::create_dir_all(cli_conf.join("filter.d")).unwrap();
+    fs::create_dir_all(cli_conf.join("action.d")).unwrap();
+    fs::write(
+        cli_conf.join("fail2ban.conf"),
+        format!(
+            "[Definition]\nsocket = {0}/sock\npidfile = {0}/pid\n\
+             loglevel = ERROR\nlogtarget = STDERR\ndbfile = None\n",
+            cli_conf.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        cli_conf.join("filter.d/dummy.conf"),
+        "[Definition]\nfailregex = ^fail <HOST>$\n",
+    )
+    .unwrap();
+    fs::write(
+        cli_conf.join("jail.conf"),
+        "[legacy]\nenabled = true\nbackend = systemd[tail=true]\nfilter = dummy\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fail2ban-client"))
+        .arg("-c")
+        .arg(&cli_conf)
+        .arg("-t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "fail2ban-client -t must reject backend = systemd[tail=true]"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("unexpected keyword argument 'tail'") && combined.contains("1.1.1"),
+        "expected migration diagnostic in -t output:\n{combined}"
+    );
+
+    // 8. Non-reloadable Python action with changed init options on a live jail requires `reload --restart`
+    //    and leaves the running action intact on plain `reload`.
+    if let Some(upstream) = upstream_source() {
+        let py_act_path = upstream
+            .join("fail2ban/tests/files/action.d/action.py")
+            .to_string_lossy()
+            .into_owned();
+        let mut tr_py = Transmitter::default();
+        tr_py
+            .dispatch(&PickleValue::List(vec![s("add"), s("pyj"), s("polling")]))
+            .await
+            .unwrap();
+        tr_py
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyj"),
+                s("addaction"),
+                s("pyact"),
+                s(&py_act_path),
+                s(r#"{"opt1":"v1"}"#),
+            ]))
+            .await
+            .unwrap();
+        tr_py
+            .dispatch(&PickleValue::List(vec![s("start"), s("pyj")]))
+            .await
+            .unwrap();
+        tr_py
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyj"),
+                s("banip"),
+                s("192.0.2.91"),
+            ]))
+            .await
+            .unwrap();
+        let py_change_stream = PickleValue::List(vec![
+            PickleValue::List(vec![s("add"), s("pyj"), s("polling")]),
+            PickleValue::List(vec![
+                s("set"),
+                s("pyj"),
+                s("addaction"),
+                s("pyact"),
+                s(&py_act_path),
+                s(r#"{"opt1":"v2"}"#),
+            ]),
+            PickleValue::List(vec![s("start"), s("pyj")]),
+        ]);
+        let err = tr_py
+            .dispatch(&PickleValue::List(vec![
+                s("reload"),
+                s("--all"),
+                PickleValue::List(vec![]),
+                py_change_stream,
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("reload --restart"),
+            "changing non-reloadable Python action options must require reload --restart: {err}"
+        );
+        assert_eq!(
+            tr_py
+                .dispatch(&PickleValue::List(vec![
+                    s("get"),
+                    s("pyj"),
+                    s("action"),
+                    s("pyact"),
+                    s("opt1")
+                ]))
+                .await
+                .unwrap(),
+            s("v1"),
+            "original Python action instance must remain active"
+        );
+        assert_eq!(
+            tr_py
+                .dispatch(&PickleValue::List(vec![s("get"), s("pyj"), s("banip")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s("192.0.2.91")])
+        );
+        let _ = tr_py.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+}

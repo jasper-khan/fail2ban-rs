@@ -103,7 +103,14 @@ impl FilterPoll {
                         };
                         match WatchedFile::open(cfg.clone(), self.encoding, tail_override) {
                             Ok(mut wf) => {
+                                let before = events.len();
                                 wf.collect_events(&mut events);
+                                if !events[before..]
+                                    .iter()
+                                    .any(|ev| matches!(ev, LogEvent::Checkpoint { .. }))
+                                {
+                                    events.push(wf.checkpoint_event());
+                                }
                                 self.watched.insert(path, wf);
                             }
                             Err(err) => {

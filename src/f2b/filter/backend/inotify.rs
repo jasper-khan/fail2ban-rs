@@ -281,7 +281,14 @@ impl FilterPyinotify {
         let path = cfg.path.clone();
         match WatchedFile::open(cfg.clone(), self.encoding, tail_override) {
             Ok(mut wf) => {
+                let before = out.len();
                 wf.collect_events(out);
+                if !out[before..]
+                    .iter()
+                    .any(|ev| matches!(ev, LogEvent::Checkpoint { .. }))
+                {
+                    out.push(wf.checkpoint_event());
+                }
                 self.watched.insert(path.clone(), wf);
                 self.pending.remove(&path);
                 self.register_file_watch(fd, &path);

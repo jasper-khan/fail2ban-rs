@@ -142,6 +142,28 @@ impl CommandAction {
         })
     }
 
+    /// Whether retiring `other` after starting `self` could erase shared firewall rules/sets.
+    pub fn shares_firewall_state(&self, other: &Self) -> bool {
+        let render = |act: &Self, tag: &str, family: Family| -> Option<String> {
+            let expanded = tags::expand(tag, &act.properties, family)
+                .ok()?
+                .into_string();
+            let rendered = tags::replace_family_tag(&expanded, family.as_str());
+            let trimmed = rendered.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        };
+        for family in [Family::Ipv4, Family::Ipv6] {
+            for tag in ["<actionflush>", "<actionstop>", "<actionunban>"] {
+                if let (Some(a), Some(b)) = (render(self, tag, family), render(other, tag, family))
+                    && a == b
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Clear all parameters back to defaults (used during config reload).
     ///
     /// Preserves runtime `started` family state and `ban_epoch` so live bans stay tracked.

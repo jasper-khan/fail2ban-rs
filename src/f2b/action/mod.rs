@@ -123,6 +123,14 @@ impl ActionKind {
         }
     }
 
+    pub fn shares_firewall_state(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Command(a), Self::Command(b)) => a.shares_firewall_state(b),
+            (Self::Python(a), Self::Python(b)) => a.path() == b.path(),
+            _ => false,
+        }
+    }
+
     pub async fn clear_all_params(&mut self) -> Result<()> {
         match self {
             Self::Command(a) => a.clear_all_params(),

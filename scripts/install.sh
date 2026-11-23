@@ -20,10 +20,58 @@ esac
 [[ -n "$root" || $(id -u) -eq 0 ]] || die "Run this installer as root."
 [[ $(uname -s) == Linux ]] || die "Fail2Ban requires Linux."
 
+capture_unit_state() {
+    local state
+    state=$(systemctl is-enabled "$1" 2>/dev/null | head -n 1 || true)
+    case "$state" in
+        ""|not-found) printf 'absent' ;;
+        *) printf '%s' "$state" ;;
+    esac
+}
+
+restore_unit_state() {
+    local unit="$1"
+    local state="$2"
+    case "$state" in
+        enabled)
+            systemctl disable --runtime "$unit" 2>/dev/null || true
+            systemctl enable "$unit"
+            ;;
+        enabled-runtime)
+            systemctl disable "$unit" 2>/dev/null || true
+            systemctl enable --runtime "$unit"
+            ;;
+        disabled)
+            systemctl disable --runtime "$unit" 2>/dev/null || true
+            systemctl disable "$unit"
+            ;;
+        masked)
+            systemctl disable --runtime "$unit" 2>/dev/null || true
+            systemctl disable "$unit" 2>/dev/null || true
+            systemctl unmask --runtime "$unit" 2>/dev/null || true
+            systemctl mask "$unit"
+            ;;
+        masked-runtime)
+            systemctl disable --runtime "$unit" 2>/dev/null || true
+            systemctl disable "$unit" 2>/dev/null || true
+            systemctl unmask "$unit" 2>/dev/null || true
+            systemctl mask --runtime "$unit"
+            ;;
+        static|indirect|linked|linked-runtime|generated|transient|alias|not-found|absent|""|unknown)
+            ;;
+        *)
+            printf 'Unsupported saved systemd state %s for %s\n' "$state" "$unit" >&2
+            return 1
+            ;;
+    esac
+}
+
 if [[ "${1:-}" == --uninstall ]]; then
+    has_saved_state=0
     saved_service_enabled=""
     saved_socket_enabled=""
     if [[ -f "$unit_state" ]]; then
+        has_saved_state=1
         while IFS='=' read -r k v; do
             case "$k" in
                 fail2ban.service) saved_service_enabled="$v" ;;
@@ -31,10 +79,22 @@ if [[ "${1:-}" == --uninstall ]]; then
             esac
         done < "$unit_state"
     fi
-    if [[ -z "$root" && -f "$units/fail2ban.service" ]]; then
-        if [[ -n "$saved_service_enabled" || -n "$saved_socket_enabled" ]]; then
+    if [[ -z "$root" ]]; then
+        if [[ "$has_saved_state" -eq 1 ]]; then
             systemctl stop fail2ban.socket fail2ban.service || true
-        else
+            case "$saved_service_enabled" in
+                absent|not-found|static|indirect)
+                    systemctl disable --runtime fail2ban.service 2>/dev/null || true
+                    systemctl disable fail2ban.service 2>/dev/null || true
+                    ;;
+            esac
+            case "$saved_socket_enabled" in
+                absent|not-found|static|indirect)
+                    systemctl disable --runtime fail2ban.socket 2>/dev/null || true
+                    systemctl disable fail2ban.socket 2>/dev/null || true
+                    ;;
+            esac
+        elif [[ -f "$units/fail2ban.service" ]]; then
             systemctl disable --now fail2ban.socket fail2ban.service
         fi
     fi
@@ -44,8 +104,6 @@ if [[ "${1:-}" == --uninstall ]]; then
     rm -f -- "$units/fail2ban.service"
     rm -f -- "$units/fail2ban.socket"
     rm -f -- "$python_library"
-    rm -f -- "$unit_state"
-    rmdir -- "$root/usr/local/lib/fail2ban-rs" 2>/dev/null || true
     rm -f -- "$man/man1/fail2ban.1"
     rm -f -- "$man/man1/fail2ban-server.1"
     rm -f -- "$man/man1/fail2ban-client.1"
@@ -53,17 +111,17 @@ if [[ "${1:-}" == --uninstall ]]; then
     rm -f -- "$man/man5/jail.conf.5"
     if [[ -z "$root" ]]; then
         systemctl daemon-reload
-        if [[ "$saved_service_enabled" == enabled ]]; then
-            systemctl enable fail2ban.service || true
-        elif [[ "$saved_service_enabled" == disabled ]]; then
-            systemctl disable fail2ban.service || true
-        fi
-        if [[ "$saved_socket_enabled" == enabled ]]; then
-            systemctl enable fail2ban.socket || true
-        elif [[ "$saved_socket_enabled" == disabled ]]; then
-            systemctl disable fail2ban.socket || true
+        if [[ "$has_saved_state" -eq 1 ]]; then
+            restore_failed=0
+            restore_unit_state fail2ban.service "$saved_service_enabled" || restore_failed=1
+            restore_unit_state fail2ban.socket "$saved_socket_enabled" || restore_failed=1
+            if [[ "$restore_failed" -ne 0 ]]; then
+                die "Failed to restore prior systemd enablement state; saved state retained at $unit_state."
+            fi
         fi
     fi
+    rm -f -- "$unit_state"
+    rmdir -- "$root/usr/local/lib/fail2ban-rs" 2>/dev/null || true
     exit 0
 fi
 
@@ -113,14 +171,8 @@ install_member() {
     install -D -m "$2" "$work/member" "$3"
 }
 if [[ -z "$root" && ! -f "$unit_state" ]]; then
-    svc_state="disabled"
-    sock_state="disabled"
-    if systemctl is-enabled --quiet fail2ban.service 2>/dev/null; then
-        svc_state="enabled"
-    fi
-    if systemctl is-enabled --quiet fail2ban.socket 2>/dev/null; then
-        sock_state="enabled"
-    fi
+    svc_state=$(capture_unit_state fail2ban.service)
+    sock_state=$(capture_unit_state fail2ban.socket)
     install -d -m 0755 "$root/usr/local/lib/fail2ban-rs"
     printf 'fail2ban.service=%s\nfail2ban.socket=%s\n' "$svc_state" "$sock_state" > "$unit_state"
 fi

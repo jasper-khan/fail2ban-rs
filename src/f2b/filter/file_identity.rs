@@ -66,7 +66,16 @@ impl FileIdentityState {
                     0
                 }
             }
-            _ => {
+            Some(_) => {
+                // Previously tracked in this session while empty or before a complete first line:
+                // resume at the saved offset (0 for an initially empty file) instead of skipping to EOF.
+                if size >= resume_offset {
+                    resume_offset
+                } else {
+                    0
+                }
+            }
+            None => {
                 if tail {
                     size
                 } else {

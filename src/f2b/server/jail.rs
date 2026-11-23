@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::action::ActionKind;
+use crate::action::{ActionKind, CommandAction, SmtpAction};
 use crate::banmanager::{AddBanOutcome, BanManager};
 use crate::config::spec;
 use crate::db::Fail2BanDb;
@@ -23,7 +23,9 @@ use crate::f2b_log;
 use crate::failmanager::FailManager;
 use crate::filter::backend::inotify::FilterPyinotify;
 use crate::filter::backend::polling::FilterPoll;
-use crate::filter::backend::systemd::FilterSystemd;
+use crate::filter::backend::systemd::{
+    FilterSystemd, validate_journal_config, validate_journal_match_tokens,
+};
 use crate::filter::backend::{
     AutoSeekConfig, BackendKind, FileLogConfig, JournalConfig, LogEvent, expand_journal_files,
 };
@@ -127,6 +129,12 @@ fn parse_backend_spec(raw: &str) -> Result<ParsedBackend> {
                 "useDns" => {
                     use_dns = Some(v.trim().to_owned());
                 }
+                "tail" => {
+                    return Err(Error::invalid_command(
+                        "FilterSystemd got an unexpected keyword argument 'tail' \
+                         (removed for Fail2Ban 1.1.1 parity; remove 'tail=...' from the systemd backend option)",
+                    ));
+                }
                 other => {
                     return Err(Error::invalid_command(format!(
                         "FilterSystemd got an unexpected keyword argument {other:?}"
@@ -171,6 +179,8 @@ struct ReloadSnapshot {
     journal_matches: Vec<Vec<String>>,
     encoding: LogEncoding,
     filter: FilterReloadSnapshot,
+    command_actions: BTreeMap<String, CommandAction>,
+    smtp_actions: BTreeMap<String, SmtpAction>,
 }
 
 /// Complete per-jail Fail2Ban state machine.
@@ -196,10 +206,15 @@ pub struct JailState {
     last_consistency_check: f64,
     last_periodic_check: f64,
     file_checkpoints: BTreeMap<PathBuf, (String, u64)>,
+    dirty_file_checkpoints: BTreeSet<PathBuf>,
     last_journal_ts: Option<f64>,
+    last_journal_cursor: Option<String>,
     journal_dirty: bool,
     journal_events_since_sync: u64,
     last_journal_db_sync: f64,
+    journalctl_bin: String,
+    backend_error: Arc<std::sync::Mutex<Option<String>>>,
+    pending_unban_actions: BTreeMap<TicketId, BTreeSet<String>>,
     reloading: bool,
     reload_logs: Option<BTreeSet<PathBuf>>,
     reload_actions: Option<BTreeMap<String, (Option<String>, bool)>>,
@@ -275,10 +290,15 @@ impl JailState {
             last_consistency_check: 0.0,
             last_periodic_check: current_unix_seconds(),
             file_checkpoints: BTreeMap::new(),
+            dirty_file_checkpoints: BTreeSet::new(),
             last_journal_ts: None,
+            last_journal_cursor: None,
             journal_dirty: false,
             journal_events_since_sync: 0,
             last_journal_db_sync: 0.0,
+            journalctl_bin: "journalctl".to_owned(),
+            backend_error: Arc::new(std::sync::Mutex::new(None)),
+            pending_unban_actions: BTreeMap::new(),
             reloading: false,
             reload_logs: None,
             reload_actions: None,
@@ -293,6 +313,38 @@ impl JailState {
 
     pub fn is_reloading(&self) -> bool {
         self.reloading
+    }
+
+    pub fn set_journalctl_bin(&mut self, bin: impl Into<String>) {
+        self.journalctl_bin = bin.into();
+    }
+
+    pub fn backend_error(&self) -> Option<String> {
+        self.backend_error.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn set_backend_error(&self, err: Option<String>) {
+        if let Ok(mut guard) = self.backend_error.lock() {
+            *guard = err;
+        }
+    }
+
+    fn journal_config(&self) -> JournalConfig {
+        JournalConfig {
+            matches: self.journal_matches.clone(),
+            flags: self.journal_flags,
+            path: self.journal_path.clone(),
+            files: self.journal_files.clone(),
+            namespace: self.journal_namespace.clone(),
+        }
+    }
+
+    /// Validate that the configured backend reader can start cleanly before activating or replacing it.
+    pub async fn validate_backend(&self) -> Result<()> {
+        if self.real_backend == BackendKind::Systemd {
+            validate_journal_config(&self.journal_config(), &self.journalctl_bin).await?;
+        }
+        Ok(())
     }
 
     /// Add a log file path to monitor (`FileFilter.addLogPath` semantics).
@@ -336,6 +388,7 @@ impl JailState {
         }
         self.log_paths.retain(|(p, _)| p != path);
         self.file_checkpoints.remove(path);
+        self.dirty_file_checkpoints.remove(path);
         if let Some(ref mut reload_set) = self.reload_logs {
             reload_set.remove(path);
         }
@@ -351,45 +404,39 @@ impl JailState {
             .collect()
     }
 
-    /// Add systemd journal match tokens (splitting on `+` into OR-groups).
-    pub fn add_journal_match(&mut self, tokens: &[String]) {
+    /// Validate and add systemd journal match tokens (splitting on `+` into OR-groups).
+    pub async fn add_journal_match(&mut self, tokens: &[String]) -> Result<()> {
         if self.real_backend != BackendKind::Systemd || tokens.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut groups: Vec<Vec<String>> = vec![Vec::new()];
-        for tok in tokens {
-            if tok == "+" {
-                groups.push(Vec::new());
-            } else {
-                if let Some(last) = groups.last_mut() {
-                    last.push(tok.clone());
-                }
-            }
-        }
-        for grp in groups {
-            if !grp.is_empty() {
-                self.journal_matches.push(grp);
-            }
-        }
+        let new_groups = validate_journal_match_tokens(tokens)?;
+        let mut proposed = self.journal_config();
+        proposed.matches.extend(new_groups.iter().cloned());
+        validate_journal_config(&proposed, &self.journalctl_bin).await?;
+        self.journal_matches.extend(new_groups);
+        Ok(())
     }
 
-    /// Remove a systemd journal match group (or all groups if `tokens` is empty).
-    pub fn del_journal_match(&mut self, tokens: &[String]) -> Result<()> {
+    /// Remove a systemd journal match group (or all groups if `tokens` is empty) after validating the remaining reader.
+    pub async fn del_journal_match(&mut self, tokens: &[String]) -> Result<()> {
         if self.real_backend != BackendKind::Systemd {
             return Ok(());
         }
+        let mut proposed = self.journal_matches.clone();
         if tokens.is_empty() {
-            self.journal_matches.clear();
-            return Ok(());
-        }
-        if let Some(pos) = self.journal_matches.iter().position(|g| g == tokens) {
-            self.journal_matches.remove(pos);
-            Ok(())
+            proposed.clear();
+        } else if let Some(pos) = proposed.iter().position(|g| g == tokens) {
+            proposed.remove(pos);
         } else {
-            Err(Error::invalid_command(format!(
+            return Err(Error::invalid_command(format!(
                 "Match {tokens:?} not found"
-            )))
+            )));
         }
+        let mut proposed_cfg = self.journal_config();
+        proposed_cfg.matches = proposed.clone();
+        validate_journal_config(&proposed_cfg, &self.journalctl_bin).await?;
+        self.journal_matches = proposed;
+        Ok(())
     }
 
     /// Add or reload an action.
@@ -429,6 +476,13 @@ impl JailState {
                     )?;
                 }
             } else {
+                if self.alive {
+                    return Err(Error::invalid_command(format!(
+                        "Action '{act_name}' in jail '{}' cannot be replaced in place while running; \
+                         use 'reload --restart' to restart the jail with ban restoration",
+                        self.name
+                    )));
+                }
                 let replacement =
                     build_action(&self.name, act_name, python_path, init_str, ban_time).await?;
                 let old = std::mem::replace(&mut self.actions[pos].1, replacement);
@@ -461,6 +515,9 @@ impl JailState {
             )));
         };
         self.actions.remove(pos);
+        for pending in self.pending_unban_actions.values_mut() {
+            pending.remove(act_name);
+        }
         Ok(())
     }
 
@@ -479,12 +536,27 @@ impl JailState {
         self.reloading = true;
         let encoding = self.filter.log_encoding();
         let filter_snap = self.filter.snapshot_and_clear_for_reload();
+        let mut command_actions = BTreeMap::new();
+        let mut smtp_actions = BTreeMap::new();
+        for (name, act) in &self.actions {
+            match act {
+                ActionKind::Command(cmd) => {
+                    command_actions.insert(name.clone(), cmd.clone());
+                }
+                ActionKind::Smtp(smtp) => {
+                    smtp_actions.insert(name.clone(), smtp.clone());
+                }
+                ActionKind::Python(_) => {}
+            }
+        }
         self.reload_snapshot = Some(ReloadSnapshot {
             was_idle,
             log_paths: self.log_paths.clone(),
             journal_matches: std::mem::take(&mut self.journal_matches),
             encoding,
             filter: filter_snap,
+            command_actions,
+            smtp_actions,
         });
 
         let existing_logs: BTreeSet<PathBuf> =
@@ -494,7 +566,7 @@ impl JailState {
         self.replaced_actions.clear();
     }
 
-    /// Roll back an in-progress reload when the reload command stream fails.
+    /// Roll back an in-progress reload when the reload command stream or action handoff fails.
     pub fn reload_abort(&mut self) -> bool {
         self.reload_logs = None;
         if let Some(kept) = self.reload_actions.take() {
@@ -513,6 +585,13 @@ impl JailState {
             }
         }
         if let Some(snap) = self.reload_snapshot.take() {
+            for (name, act) in &mut self.actions {
+                if let Some(orig) = snap.command_actions.get(name) {
+                    *act = ActionKind::Command(orig.clone());
+                } else if let Some(orig) = snap.smtp_actions.get(name) {
+                    *act = ActionKind::Smtp(orig.clone());
+                }
+            }
             self.idle = snap.was_idle;
             self.log_paths = snap.log_paths;
             self.journal_matches = snap.journal_matches;
@@ -524,18 +603,47 @@ impl JailState {
         self.idle
     }
 
-    /// Finalize reload phase: initialize new/replacement actions and replay active tickets,
-    /// reload retained actions, and retire obsolete logs & actions.
+    /// Finalize reload phase: validate handoff, initialize new actions and replay active tickets,
+    /// reload retained actions, and retire obsolete logs & actions only after replacement succeeds.
     ///
     /// Returns `true` if the log backend configuration changed and needs restart.
     pub async fn reload_commit(&mut self) -> Result<bool> {
-        if let Some(obsolete_logs) = self.reload_logs.take() {
-            for path in obsolete_logs {
-                self.del_log_path(&path);
-            }
+        if self.real_backend == BackendKind::Systemd
+            && self
+                .reload_snapshot
+                .as_ref()
+                .is_some_and(|prev| prev.journal_matches != self.journal_matches)
+            && let Err(err) = self.validate_backend().await
+        {
+            self.reload_abort();
+            return Err(err);
         }
 
         if let Some(kept_actions) = self.reload_actions.take() {
+            if self.alive {
+                for (new_name, new_act) in &self.actions {
+                    if kept_actions
+                        .get(new_name)
+                        .is_some_and(|(_, is_new)| *is_new)
+                    {
+                        for (old_name, old_act) in &self.actions {
+                            if !kept_actions.contains_key(old_name)
+                                && new_act.shares_firewall_state(old_act)
+                            {
+                                let msg = format!(
+                                    "Action '{new_name}' shares firewall state with '{old_name}' in jail '{}'; \
+                                     use 'reload --restart' to restart the jail with ban restoration",
+                                    self.name
+                                );
+                                self.reload_actions = Some(kept_actions);
+                                self.reload_abort();
+                                return Err(Error::invalid_command(msg));
+                            }
+                        }
+                    }
+                }
+            }
+
             let active_tickets: Vec<Ticket> = self
                 .ban_manager
                 .get_ban_list(false)
@@ -543,22 +651,15 @@ impl JailState {
                 .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
                 .collect();
 
-            let mut retired: Vec<(String, ActionKind)> = std::mem::take(&mut self.replaced_actions);
-            let mut idx = 0usize;
-            while idx < self.actions.len() {
-                if kept_actions.contains_key(&self.actions[idx].0) {
-                    idx += 1;
-                } else {
-                    retired.push(self.actions.remove(idx));
-                }
-            }
-
             let ipv6_allowed = allow_ipv6();
+            let mut started_new: Vec<(usize, Vec<Ticket>)> = Vec::new();
+            let mut handoff_err: Option<Error> = None;
+
             for idx in 0..self.actions.len() {
-                let (act_name, (options, is_new)) = {
-                    let name = self.actions[idx].0.clone();
-                    let entry = kept_actions.get(&name).cloned().unwrap_or((None, false));
-                    (name, entry)
+                let act_name = self.actions[idx].0.clone();
+                let Some((options, is_new)) = kept_actions.get(&act_name).cloned() else {
+                    // Obsolete action: keep intact until all replacements start and replay cleanly.
+                    continue;
                 };
                 if is_new {
                     if self.alive {
@@ -569,7 +670,10 @@ impl JailState {
                                 "Failed to start jail '{}' action '{act_name}': {err}",
                                 self.name
                             );
+                            handoff_err = Some(err);
+                            break;
                         }
+                        started_new.push((idx, Vec::new()));
                         if !self.actions[idx].1.norestored() {
                             for ticket in &active_tickets {
                                 let ctx = self.build_action_context(ticket, false);
@@ -581,7 +685,15 @@ impl JailState {
                                         ticket.fid,
                                         self.name
                                     );
+                                    handoff_err = Some(err);
+                                    break;
                                 }
+                                if let Some((_, replayed)) = started_new.last_mut() {
+                                    replayed.push(ticket.clone());
+                                }
+                            }
+                            if handoff_err.is_some() {
+                                break;
                             }
                         }
                     }
@@ -592,10 +704,42 @@ impl JailState {
                         "Failed to reload jail '{}' action '{act_name}': {err}",
                         self.name
                     );
+                    handoff_err = Some(err);
+                    break;
+                }
+            }
+
+            if let Some(err) = handoff_err {
+                // Roll back newly started replacements without touching existing working actions.
+                for (idx, replayed) in started_new.into_iter().rev() {
+                    for ticket in replayed.iter().rev() {
+                        let ctx = self.build_action_context(ticket, false);
+                        let _ = self.actions[idx].1.unban(&ctx).await;
+                    }
+                    let _ = self.actions[idx].1.stop().await;
+                }
+                self.reload_actions = Some(kept_actions);
+                self.reload_abort();
+                return Err(err);
+            }
+
+            let mut retired: Vec<(String, ActionKind)> = std::mem::take(&mut self.replaced_actions);
+            let mut idx = 0usize;
+            while idx < self.actions.len() {
+                if kept_actions.contains_key(&self.actions[idx].0) {
+                    idx += 1;
+                } else {
+                    retired.push(self.actions.remove(idx));
                 }
             }
 
             for (act_name, mut act) in retired {
+                for pending in self.pending_unban_actions.values_mut() {
+                    pending.remove(&act_name);
+                }
+                if !self.alive {
+                    continue;
+                }
                 if !active_tickets.is_empty() {
                     let mut flushed = false;
                     if act.supports_flush() {
@@ -636,6 +780,12 @@ impl JailState {
             }
         }
 
+        if let Some(obsolete_logs) = self.reload_logs.take() {
+            for path in obsolete_logs {
+                self.del_log_path(&path);
+            }
+        }
+
         self.reloading = false;
         let backend_changed = match self.reload_snapshot.take() {
             Some(prev) => {
@@ -656,9 +806,11 @@ impl JailState {
                 fingerprint,
                 offset,
             } => {
+                let pb = PathBuf::from(&path);
                 self.file_checkpoints
-                    .insert(PathBuf::from(&path), (fingerprint.clone(), offset));
+                    .insert(pb.clone(), (fingerprint.clone(), offset));
                 self.db_update_log(&path, &fingerprint, offset);
+                self.dirty_file_checkpoints.remove(&pb);
             }
             LogEvent::Line {
                 line,
@@ -666,25 +818,9 @@ impl JailState {
                 log_path,
                 in_operation,
                 checkpoint,
+                journal_cursor,
             } => {
-                if let (Some(path), Some((fp, offset))) = (&log_path, checkpoint) {
-                    self.file_checkpoints
-                        .insert(PathBuf::from(path), (fp.clone(), offset));
-                    self.db_update_log(path, &fp, offset);
-                }
                 self.filter.set_in_operation(in_operation);
-                if let Some(ts) = preset_date {
-                    self.last_journal_ts = Some(ts);
-                    if self.real_backend == BackendKind::Systemd {
-                        self.journal_dirty = true;
-                        self.journal_events_since_sync += 1;
-                        if self.journal_events_since_sync >= 100
-                            || now >= self.last_journal_db_sync + 5.0
-                        {
-                            self.flush_journal_pos_to_db(now);
-                        }
-                    }
-                }
                 let processed = self.filter.process_line_at(&line, preset_date, now);
                 for m in processed.results {
                     let Some(fid) = m.fid.or_else(|| m.ip.clone()) else {
@@ -723,11 +859,35 @@ impl JailState {
                         self.ban_ticket(to_ban, now).await;
                     }
                 }
+
+                // Advance offsets only after the line and any resulting ban writes have completed;
+                // SQLite persistence happens in batches on LogEvent::Checkpoint, periodic_tick, or shutdown.
+                if let (Some(path), Some((fp, offset))) = (log_path, checkpoint) {
+                    let pb = PathBuf::from(path);
+                    self.file_checkpoints.insert(pb.clone(), (fp, offset));
+                    self.dirty_file_checkpoints.insert(pb);
+                }
+                if let Some(cursor) = journal_cursor {
+                    self.last_journal_cursor = Some(cursor);
+                }
+                if let Some(ts) = preset_date {
+                    self.last_journal_ts = Some(ts);
+                    if self.real_backend == BackendKind::Systemd {
+                        self.journal_dirty = true;
+                        self.journal_events_since_sync += 1;
+                        if self.journal_events_since_sync >= 100
+                            || now >= self.last_journal_db_sync + 5.0
+                        {
+                            self.flush_journal_pos_to_db(now);
+                        }
+                    }
+                }
             }
         }
     }
 
-    /// Periodic 1-second maintenance tick: expire bans, clean stale failures, and periodically check action consistency.
+    /// Periodic 1-second maintenance tick: expire bans, clean stale failures, flush batched checkpoints,
+    /// and periodically check action consistency.
     pub async fn periodic_tick(&mut self, now: f64) {
         let expired = self.ban_manager.unban(now);
         for ticket in expired {
@@ -737,6 +897,7 @@ impl JailState {
             }
         }
         self.fail_manager.cleanup(now);
+        self.flush_file_checkpoints_to_db();
 
         if self.journal_dirty && now >= self.last_journal_db_sync + 5.0 {
             self.flush_journal_pos_to_db(now);
@@ -778,6 +939,7 @@ impl JailState {
         let outcome = self.ban_manager.add_ban_ticket(ticket.clone(), now);
         match outcome {
             AddBanOutcome::Added => {
+                self.pending_unban_actions.remove(&ticket.fid);
                 let stored = self
                     .ban_manager
                     .get_ticket_by_id(&ticket.fid)
@@ -955,7 +1117,7 @@ impl JailState {
     /// Manually unban specific IPs (or flush all if `ips` is `None`).
     pub async fn unban_ip(&mut self, ips: Option<&[String]>, ifexists: bool) -> Result<usize> {
         match ips {
-            None => Ok(self.flush_bans(true, false).await),
+            None => self.flush_bans(true, false).await,
             Some(targets) => {
                 let mut cnt = 0usize;
                 let mut missed = Vec::new();
@@ -1099,10 +1261,15 @@ impl JailState {
         let fm_tot = self.fail_manager.total_failures() as i64;
         let bm_cur = self.ban_manager.size() as i64;
         let bm_tot = self.ban_manager.total_bans() as i64;
+        let backend_err = self.backend_error();
 
         if flavor == "stats" {
+            let backend_label = match backend_err {
+                Some(_) => format!("{} (error)", self.backend_display_name()),
+                None => self.backend_display_name().to_owned(),
+            };
             return PickleValue::List(vec![
-                PickleValue::Str(self.backend_display_name().to_owned()),
+                PickleValue::Str(backend_label),
                 PickleValue::Tuple(vec![PickleValue::Int(fm_cur), PickleValue::Int(fm_tot)]),
                 PickleValue::Tuple(vec![PickleValue::Int(bm_cur), PickleValue::Int(bm_tot)]),
             ]);
@@ -1132,6 +1299,12 @@ impl JailState {
             filter_items.push(PickleValue::Tuple(vec![
                 PickleValue::Str("File list".to_owned()),
                 PickleValue::str_list(self.get_log_paths()),
+            ]));
+        }
+        if let Some(err) = backend_err {
+            filter_items.push(PickleValue::Tuple(vec![
+                PickleValue::Str("Backend error".to_owned()),
+                PickleValue::Str(err),
             ]));
         }
 
@@ -1186,7 +1359,7 @@ impl JailState {
         ])
     }
 
-    async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> usize {
+    async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> Result<usize> {
         let tickets = self.ban_manager.flush_ban_list();
         let mut flushed_actions: BTreeSet<String> = BTreeSet::new();
         for (act_name, act) in &mut self.actions {
@@ -1214,11 +1387,9 @@ impl JailState {
                 }
             }
         }
-        if clear_db {
-            self.db_del_ban(None);
-        }
         let log_prefix = if on_stop { "Repeal Ban" } else { "Unban" };
-        let count = tickets.len();
+        let mut unbanned = 0usize;
+        let mut first_err: Option<Error> = None;
         for ticket in tickets {
             f2b_log!(
                 LogLevel::Notice,
@@ -1229,8 +1400,15 @@ impl JailState {
                 ticket.fid
             );
             let ctx = self.build_action_context(&ticket, false);
+            let only_actions = self.pending_unban_actions.get(&ticket.fid).cloned();
+            let mut failed_actions: BTreeSet<String> = BTreeSet::new();
             for (act_name, act) in self.actions.iter_mut().rev() {
                 if flushed_actions.contains(act_name) {
+                    continue;
+                }
+                if let Some(ref needed) = only_actions
+                    && !needed.contains(act_name)
+                {
                     continue;
                 }
                 if let Err(err) = act.unban(&ctx).await {
@@ -1241,10 +1419,31 @@ impl JailState {
                         self.name,
                         ticket.fid
                     );
+                    failed_actions.insert(act_name.clone());
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
                 }
             }
+            if failed_actions.is_empty() {
+                self.pending_unban_actions.remove(&ticket.fid);
+                if clear_db {
+                    self.db_del_ban(Some(&ticket.fid));
+                }
+                unbanned += 1;
+            } else {
+                self.pending_unban_actions
+                    .insert(ticket.fid.clone(), failed_actions);
+                self.ban_manager.retain_for_retry(ticket);
+            }
         }
-        count
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        if clear_db {
+            self.db_del_ban(None);
+        }
+        Ok(unbanned)
     }
 
     async fn unban_ticket_actions(&mut self, ticket: &Ticket, log_notice: bool) -> Result<()> {
@@ -1258,8 +1457,15 @@ impl JailState {
             );
         }
         let ctx = self.build_action_context(ticket, false);
+        let only_actions = self.pending_unban_actions.get(&ticket.fid).cloned();
+        let mut failed_actions: BTreeSet<String> = BTreeSet::new();
         let mut first_err: Option<Error> = None;
         for (act_name, act) in self.actions.iter_mut().rev() {
+            if let Some(ref needed) = only_actions
+                && !needed.contains(act_name)
+            {
+                continue;
+            }
             if let Err(err) = act.unban(&ctx).await {
                 f2b_log!(
                     LogLevel::Error,
@@ -1268,14 +1474,24 @@ impl JailState {
                     self.name,
                     ticket.fid
                 );
+                failed_actions.insert(act_name.clone());
                 if first_err.is_none() {
                     first_err = Some(err);
                 }
             }
         }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(()),
+        if failed_actions.is_empty() {
+            self.pending_unban_actions.remove(&ticket.fid);
+            Ok(())
+        } else {
+            self.pending_unban_actions
+                .insert(ticket.fid.clone(), failed_actions);
+            Err(first_err.unwrap_or_else(|| {
+                Error::action(format!(
+                    "Failed to unban {} in jail '{}'",
+                    ticket.fid, self.name
+                ))
+            }))
         }
     }
 
@@ -1320,7 +1536,7 @@ impl JailState {
         }
     }
 
-    fn build_file_log_configs(&self) -> Vec<FileLogConfig> {
+    fn build_file_log_configs(&mut self) -> Vec<FileLogConfig> {
         let mut out = Vec::with_capacity(self.log_paths.len());
         let seek_cutoff = if self.filter.check_find_time() {
             Some(current_unix_seconds() - self.filter.find_time())
@@ -1346,20 +1562,57 @@ impl JailState {
                 });
                 continue;
             }
-            let (resume_fingerprint, resume_offset) = if !*tail {
-                self.db_add_log_offset(path)
-            } else {
-                (None, 0)
-            };
+            if *tail {
+                if let Ok(mut f) = File::open(path)
+                    && let Ok(meta) = f.metadata()
+                {
+                    let len = meta.len();
+                    let fp = file_first_line_sha1(&mut f, len).unwrap_or_default();
+                    self.file_checkpoints
+                        .insert(path.clone(), (fp.clone(), len));
+                    out.push(FileLogConfig {
+                        path: path.clone(),
+                        tail: true,
+                        resume_fingerprint: Some(fp),
+                        resume_offset: len,
+                        auto_seek: None,
+                    });
+                    continue;
+                }
+                out.push(FileLogConfig {
+                    path: path.clone(),
+                    tail: true,
+                    resume_fingerprint: None,
+                    resume_offset: 0,
+                    auto_seek: None,
+                });
+                continue;
+            }
+            let (resume_fingerprint, resume_offset) = self.db_add_log_offset(path);
             out.push(FileLogConfig {
                 path: path.clone(),
-                tail: *tail,
+                tail: false,
                 resume_fingerprint,
                 resume_offset,
                 auto_seek,
             });
         }
         out
+    }
+
+    fn flush_file_checkpoints_to_db(&mut self) {
+        if self.dirty_file_checkpoints.is_empty() {
+            return;
+        }
+        let dirty: Vec<PathBuf> = std::mem::take(&mut self.dirty_file_checkpoints)
+            .into_iter()
+            .collect();
+        for path in dirty {
+            if let Some((fp, off)) = self.file_checkpoints.get(&path) {
+                let path_str = path.to_string_lossy();
+                self.db_update_log(&path_str, fp, *off);
+            }
+        }
     }
 
     fn restore_tickets_from_db(&mut self, now: f64) -> Vec<Ticket> {
@@ -1599,8 +1852,11 @@ impl Jail {
         let mut st = self.state.lock().await;
         if st.alive {
             st.idle = false;
+            let sync = !st.reloading;
             drop(st);
-            self.sync_idle_signal(false).await;
+            if sync {
+                self.sync_idle_signal(false).await;
+            }
             return Ok(());
         }
 
@@ -1611,6 +1867,8 @@ impl Jail {
             "Starting jail '{}'",
             jail_name
         );
+        st.validate_backend().await?;
+        st.set_backend_error(None);
         st.db_add_jail();
 
         let ipv6_allowed = allow_ipv6();
@@ -1637,7 +1895,7 @@ impl Jail {
         let (idle_tx, idle_rx) = watch::channel(false);
         let (backend_shut_tx, backend_shut_rx) = watch::channel(false);
 
-        let backend_handle = spawn_backend_task(&st, event_tx, backend_shut_rx);
+        let backend_handle = spawn_backend_task(&mut st, event_tx, backend_shut_rx);
         let worker_handle = spawn_worker_task(
             Arc::clone(&self.state),
             event_rx,
@@ -1683,9 +1941,17 @@ impl Jail {
         }
 
         let mut st = self.state.lock().await;
+        st.flush_file_checkpoints_to_db();
         st.flush_journal_pos_to_db(current_unix_seconds());
-        if st.alive || !st.ban_manager.get_ban_list(false).is_empty() || !st.actions.is_empty() {
-            let _ = st.flush_bans(false, true).await;
+        if (st.alive || !st.ban_manager.get_ban_list(false).is_empty() || !st.actions.is_empty())
+            && let Err(err) = st.flush_bans(false, true).await
+        {
+            f2b_log!(
+                LogLevel::Error,
+                "fail2ban.actions",
+                "Failed to flush bans while stopping jail '{}': {err}",
+                st.name
+            );
         }
         let jail_name = st.name.clone();
         for (act_name, act) in st.actions.iter_mut().rev() {
@@ -1722,14 +1988,16 @@ impl Jail {
             let _ = h.await;
         }
 
-        let st = self.state.lock().await;
+        let mut st = self.state.lock().await;
         if !st.alive {
             return;
         }
+        st.flush_file_checkpoints_to_db();
+        st.set_backend_error(None);
         let (new_event_tx, new_event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let _ = replace_rx_tx.send(new_event_rx);
         let (new_shut_tx, new_shut_rx) = watch::channel(false);
-        let new_handle = spawn_backend_task(&st, new_event_tx, new_shut_rx);
+        let new_handle = spawn_backend_task(&mut st, new_event_tx, new_shut_rx);
         drop(st);
 
         let mut tasks_guard = self.tasks.lock().await;
@@ -1764,16 +2032,16 @@ impl Jail {
     }
 
     pub async fn reload_commit(&self) -> Result<()> {
-        let (changed, idle) = {
+        let (res, idle) = {
             let mut st = self.state.lock().await;
-            let changed = st.reload_commit().await?;
-            (changed, st.idle)
+            let res = st.reload_commit().await;
+            (res, st.idle)
         };
         self.sync_idle_signal(idle).await;
-        if changed {
+        if res.as_ref().is_ok_and(|&changed| changed) {
             self.restart_backend_if_alive().await;
         }
-        Ok(())
+        res.map(|_| ())
     }
 
     async fn sync_idle_signal(&self, idle: bool) {
@@ -1785,13 +2053,14 @@ impl Jail {
 }
 
 fn spawn_backend_task(
-    st: &JailState,
+    st: &mut JailState,
     event_tx: mpsc::Sender<LogEvent>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Option<JoinHandle<()>> {
     let jail_name = st.name.clone();
     let encoding = st.filter.log_encoding();
     let allow_poll_fallback = st.backend_spec.trim().eq_ignore_ascii_case("auto");
+    let health = Arc::clone(&st.backend_error);
 
     match st.real_backend {
         BackendKind::Polling => {
@@ -1802,6 +2071,9 @@ fn spawn_backend_task(
             let poller = FilterPoll::new(configs, encoding);
             Some(tokio::spawn(async move {
                 if let Err(err) = poller.run(event_tx, shutdown_rx).await {
+                    if let Ok(mut guard) = health.lock() {
+                        *guard = Some(err.to_string());
+                    }
                     f2b_log!(
                         LogLevel::Error,
                         "fail2ban.filter",
@@ -1837,33 +2109,42 @@ fn spawn_backend_task(
                             "Falling back to polling backend for jail '{jail_name}'"
                         );
                         let poller = FilterPoll::new(cfgs, encoding);
-                        let _ = poller.run(tx_fb, shut_fb).await;
+                        if let Err(fb_err) = poller.run(tx_fb, shut_fb).await
+                            && let Ok(mut guard) = health.lock()
+                        {
+                            *guard = Some(fb_err.to_string());
+                        }
+                    } else if let Ok(mut guard) = health.lock() {
+                        *guard = Some(err.to_string());
                     }
                 }
             }))
         }
         BackendKind::Systemd => {
-            let jcfg = JournalConfig {
-                matches: st.journal_matches.clone(),
-                flags: st.journal_flags,
-                path: st.journal_path.clone(),
-                files: st.journal_files.clone(),
-                namespace: st.journal_namespace.clone(),
-            };
-            let saved_ts = st.last_journal_ts.or_else(|| st.db_get_journal_pos());
-            let since_epoch = if let Some(ts) = saved_ts {
-                let floor = if st.filter.check_find_time() {
-                    current_unix_seconds() - st.filter.find_time()
-                } else {
-                    0.0
-                };
-                Some((ts + 0.000_001).max(floor))
-            } else if st.filter.check_find_time() {
-                Some(current_unix_seconds() - st.filter.find_time())
-            } else {
+            let jcfg = st.journal_config();
+            let after_cursor = st.last_journal_cursor.clone();
+            let since_epoch = if after_cursor.is_some() {
                 None
+            } else {
+                let saved_ts = st.last_journal_ts.or_else(|| st.db_get_journal_pos());
+                if let Some(ts) = saved_ts {
+                    let floor = if st.filter.check_find_time() {
+                        current_unix_seconds() - st.filter.find_time()
+                    } else {
+                        0.0
+                    };
+                    Some((ts + 0.000_001).max(floor))
+                } else if st.filter.check_find_time() {
+                    Some(current_unix_seconds() - st.filter.find_time())
+                } else {
+                    None
+                }
             };
-            let reader = FilterSystemd::new(jcfg, encoding, false).with_since(since_epoch);
+            let reader = FilterSystemd::new(jcfg, encoding, false)
+                .with_since(since_epoch)
+                .with_after_cursor(after_cursor)
+                .with_journalctl_bin(st.journalctl_bin.clone())
+                .with_health_sink(health);
             Some(tokio::spawn(async move {
                 if let Err(err) = reader.run(event_tx, shutdown_rx).await {
                     f2b_log!(
@@ -1907,6 +2188,11 @@ fn spawn_worker_task(
                     rx_closed = false;
                 }
                 _ = idle_rx.changed() => {}
+                _ = tick.tick(), if !is_idle => {
+                    let now = current_unix_seconds();
+                    let mut st = state.lock().await;
+                    st.periodic_tick(now).await;
+                }
                 maybe_ev = event_rx.recv(), if !is_idle && !rx_closed => {
                     match maybe_ev {
                         Some(ev) => {
@@ -1918,11 +2204,6 @@ fn spawn_worker_task(
                             rx_closed = true;
                         }
                     }
-                }
-                _ = tick.tick(), if !is_idle => {
-                    let now = current_unix_seconds();
-                    let mut st = state.lock().await;
-                    st.periodic_tick(now).await;
                 }
             }
         }
@@ -2160,6 +2441,7 @@ mod tests {
                     log_path: None,
                     in_operation: true,
                     checkpoint: None,
+                    journal_cursor: None,
                 },
                 1_715_675_416.0,
             )

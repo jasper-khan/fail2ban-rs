@@ -2,10 +2,11 @@
 //! `fail2ban/server/filtersystemd.py`, backed by `journalctl --output=json --follow`.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
@@ -19,6 +20,99 @@ use super::{JournalConfig, LogEvent};
 const SD_JOURNAL_SYSTEM: u32 = 4;
 /// `SD_JOURNAL_CURRENT_USER` bit flag in `libsystemd/sd-journal.h`.
 const SD_JOURNAL_CURRENT_USER: u32 = 8;
+/// How long a newly spawned `journalctl` child must stay alive without error before clearing a prior backend error.
+const HEALTHY_WINDOW: Duration = Duration::from_secs(2);
+/// Timeout for one-shot `journalctl --lines=0` configuration validation probes.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Validate and split `journalmatch` tokens on `+` into OR-groups matching `libsystemd` field rules.
+pub fn validate_journal_match_tokens(tokens: &[String]) -> Result<Vec<Vec<String>>> {
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut groups: Vec<Vec<String>> = vec![Vec::new()];
+    for tok in tokens {
+        if tok == "+" {
+            if groups.last().is_some_and(Vec::is_empty) {
+                return Err(Error::Value(
+                    "Invalid journal match: '+' can only be used between match terms".to_owned(),
+                ));
+            }
+            groups.push(Vec::new());
+            continue;
+        }
+        let Some((field, _value)) = tok.split_once('=') else {
+            return Err(Error::Value(format!(
+                "Invalid journal match {tok:?}: expected FIELD=VALUE"
+            )));
+        };
+        let bytes = field.as_bytes();
+        let valid_field = !bytes.is_empty()
+            && bytes.len() <= 64
+            && matches!(bytes[0], b'A'..=b'Z' | b'_')
+            && bytes
+                .iter()
+                .all(|&b| matches!(b, b'A'..=b'Z' | b'0'..=b'9' | b'_'));
+        if !valid_field {
+            return Err(Error::Value(format!(
+                "Invalid journal match field in {tok:?}"
+            )));
+        }
+        if let Some(last) = groups.last_mut() {
+            last.push(tok.clone());
+        }
+    }
+    if groups.last().is_some_and(Vec::is_empty) {
+        return Err(Error::Value(
+            "Invalid journal match: trailing '+' without following match terms".to_owned(),
+        ));
+    }
+    Ok(groups)
+}
+
+/// Probe a proposed [`JournalConfig`] with `journalctl --output=json --no-pager --lines=0`
+/// before adopting or replacing a live reader.
+pub async fn validate_journal_config(cfg: &JournalConfig, journalctl_bin: &str) -> Result<()> {
+    for grp in &cfg.matches {
+        validate_journal_match_tokens(grp)?;
+    }
+    let mut args = vec![
+        "--output=json".to_owned(),
+        "--no-pager".to_owned(),
+        "--lines=0".to_owned(),
+    ];
+    append_journal_source_and_matches(&mut args, cfg);
+
+    let output = tokio::time::timeout(
+        VALIDATE_TIMEOUT,
+        Command::new(journalctl_bin)
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        Error::Value(format!(
+            "Timed out validating journal reader ({journalctl_bin})"
+        ))
+    })?
+    .map_err(|err| Error::io(format!("Failed to spawn {journalctl_bin} {args:?}"), err))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let detail = if stderr.is_empty() {
+        format!("exited with {}", output.status)
+    } else {
+        stderr
+    };
+    Err(Error::Value(format!(
+        "Journal reader rejected configuration: {detail}"
+    )))
+}
 
 /// Systemd journal log reader spawning `journalctl --output=json --follow`.
 #[derive(Debug, Clone)]
@@ -27,7 +121,9 @@ pub struct FilterSystemd {
     encoding: LogEncoding,
     tail: bool,
     since_epoch: Option<f64>,
+    after_cursor: Option<String>,
     journalctl_bin: String,
+    health: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl FilterSystemd {
@@ -38,13 +134,27 @@ impl FilterSystemd {
             encoding,
             tail,
             since_epoch: None,
+            after_cursor: None,
             journalctl_bin: "journalctl".to_owned(),
+            health: None,
         }
     }
 
     /// Resume reading journal entries starting from Unix epoch `since_epoch` seconds.
     pub fn with_since(mut self, since_epoch: Option<f64>) -> Self {
         self.since_epoch = since_epoch;
+        self
+    }
+
+    /// Resume reading journal entries strictly after systemd journal `__CURSOR`.
+    pub fn with_after_cursor(mut self, cursor: Option<String>) -> Self {
+        self.after_cursor = cursor;
+        self
+    }
+
+    /// Attach a shared backend health slot so unexpected exits surface in jail status.
+    pub fn with_health_sink(mut self, health: Arc<Mutex<Option<String>>>) -> Self {
+        self.health = Some(health);
         self
     }
 
@@ -56,7 +166,20 @@ impl FilterSystemd {
 
     /// Return the resolved `journalctl` CLI arguments for this configuration.
     pub fn args(&self) -> Vec<String> {
-        build_journalctl_args(&self.config, self.since_epoch, self.tail)
+        build_journalctl_args_with_cursor(
+            &self.config,
+            self.since_epoch,
+            self.after_cursor.as_deref(),
+            self.tail,
+        )
+    }
+
+    fn set_health(&self, err: Option<String>) {
+        if let Some(ref slot) = self.health
+            && let Ok(mut guard) = slot.lock()
+        {
+            *guard = err;
+        }
     }
 
     /// Spawn `journalctl`, supervise unexpected exits with backoff, and forward
@@ -69,7 +192,7 @@ impl FilterSystemd {
         let start_wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
-        let mut in_operation = self.tail;
+        let mut in_operation = self.tail || self.after_cursor.is_some();
         let mut backoff = Duration::from_millis(100);
 
         loop {
@@ -78,32 +201,49 @@ impl FilterSystemd {
             }
 
             let args = self.args();
-            let mut child = Command::new(&self.journalctl_bin)
+            let mut child = match Command::new(&self.journalctl_bin)
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-                .map_err(|err| {
-                    Error::io(
-                        format!("Failed to spawn {} {:?}", self.journalctl_bin, args),
-                        err,
-                    )
-                })?;
+            {
+                Ok(child) => child,
+                Err(err) => {
+                    let msg = format!("Failed to spawn {} {:?}: {err}", self.journalctl_bin, args);
+                    self.set_health(Some(msg.clone()));
+                    return Err(Error::io(msg, err));
+                }
+            };
 
             let Some(stdout) = child.stdout.take() else {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                let msg = "journalctl child stdout not captured".to_owned();
+                self.set_health(Some(msg.clone()));
                 return Err(Error::io(
-                    "journalctl child stdout not captured",
+                    msg,
                     std::io::Error::other("stdout pipe unavailable"),
                 ));
             };
+            let mut stderr = child.stderr.take();
 
+            // Keep the startup cutoff fixed for this child so consecutive equal-timestamp
+            // or older `_SOURCE_REALTIME_TIMESTAMP` entries are never dropped.
+            let cutoff_since = if self.after_cursor.is_none() {
+                self.since_epoch
+            } else {
+                None
+            };
+            let mut next_cursor: Option<String> = None;
+            let mut last_ts: Option<f64> = None;
             let mut reader = BufReader::new(stdout);
             let mut line_buf = String::new();
             let mut stop_requested = false;
             let mut made_progress = false;
+            let mut health_cleared = false;
+            let healthy_timer = tokio::time::sleep(HEALTHY_WINDOW);
+            tokio::pin!(healthy_timer);
 
             loop {
                 line_buf.clear();
@@ -113,6 +253,10 @@ impl FilterSystemd {
                             stop_requested = true;
                             break;
                         }
+                    }
+                    () = &mut healthy_timer, if !health_cleared => {
+                        health_cleared = true;
+                        self.set_health(None);
                     }
                     read_res = reader.read_line(&mut line_buf) => {
                         match read_res {
@@ -125,8 +269,11 @@ impl FilterSystemd {
                                 match serde_json::from_str::<serde_json::Value>(trimmed) {
                                     Ok(val) => {
                                         if let Some((formatted, preset_date)) = format_journal_entry(&val, self.encoding) {
-                                            if let (Some(min_ts), Some(ts)) = (self.since_epoch, preset_date)
-                                                && ts < min_ts
+                                            let realtime_ts = extract_u128_field(val.get("__REALTIME_TIMESTAMP"))
+                                                .map(|us| us as f64 / 1_000_000.0)
+                                                .or(preset_date);
+                                            if let (Some(min_ts), Some(rt)) = (cutoff_since, realtime_ts)
+                                                && rt < min_ts
                                             {
                                                 continue;
                                             }
@@ -134,18 +281,25 @@ impl FilterSystemd {
                                                 if !in_operation && ts >= start_wall - 1.0 {
                                                     in_operation = true;
                                                 }
-                                                let next_since = ts + 0.000_001;
-                                                self.since_epoch = Some(
-                                                    self.since_epoch.map_or(next_since, |prev| prev.max(next_since)),
-                                                );
+                                                last_ts = Some(last_ts.map_or(ts, |prev| prev.max(ts)));
                                             }
+                                            let cursor = val
+                                                .get("__CURSOR")
+                                                .and_then(serde_json::Value::as_str)
+                                                .filter(|s| !s.is_empty())
+                                                .map(str::to_owned);
                                             made_progress = true;
+                                            if !health_cleared {
+                                                health_cleared = true;
+                                                self.set_health(None);
+                                            }
                                             let ev = LogEvent::Line {
                                                 line: formatted,
                                                 preset_date,
                                                 log_path: None,
                                                 in_operation,
                                                 checkpoint: None,
+                                                journal_cursor: cursor.clone(),
                                             };
                                             tokio::select! {
                                                 biased;
@@ -159,6 +313,9 @@ impl FilterSystemd {
                                                     if send_res.is_err() {
                                                         stop_requested = true;
                                                         break;
+                                                    }
+                                                    if let Some(c) = cursor {
+                                                        next_cursor = Some(c);
                                                     }
                                                 }
                                             }
@@ -193,11 +350,36 @@ impl FilterSystemd {
             }
 
             let status = child.wait().await;
+            let mut stderr_buf = Vec::new();
+            if let Some(ref mut err_pipe) = stderr {
+                let _ = err_pipe.take(1024).read_to_end(&mut stderr_buf).await;
+            }
+            let stderr_text = String::from_utf8_lossy(&stderr_buf).trim().to_owned();
+            let err_summary = match &status {
+                Ok(code) if stderr_text.is_empty() => format!("Journal reader exited ({code})"),
+                Ok(code) => format!("Journal reader exited ({code}): {stderr_text}"),
+                Err(err) => format!("Journal reader wait error: {err}"),
+            };
+            self.set_health(Some(err_summary.clone()));
+
+            if let Some(cursor) = next_cursor {
+                self.after_cursor = Some(cursor);
+            } else if self.after_cursor.is_none()
+                && let Some(ts) = last_ts
+            {
+                let next_since = ts + 0.000_001;
+                self.since_epoch = Some(
+                    self.since_epoch
+                        .map_or(next_since, |prev| prev.max(next_since)),
+                );
+            }
+
             log_msg(
                 LogLevel::Warning,
                 "fail2ban.filter",
                 &format!(
-                    "Journal reader exited ({status:?}), reopening journal from {:?}",
+                    "{err_summary}, reopening journal (cursor={}, since={:?})",
+                    self.after_cursor.is_some(),
                     self.since_epoch
                 ),
             );
@@ -225,13 +407,25 @@ pub fn build_journalctl_args(
     since_epoch: Option<f64>,
     tail: bool,
 ) -> Vec<String> {
+    build_journalctl_args_with_cursor(cfg, since_epoch, None, tail)
+}
+
+/// Build `journalctl` CLI arguments preferring `--after-cursor` over `--since`/`--lines`.
+pub fn build_journalctl_args_with_cursor(
+    cfg: &JournalConfig,
+    since_epoch: Option<f64>,
+    after_cursor: Option<&str>,
+    tail: bool,
+) -> Vec<String> {
     let mut args = vec![
         "--output=json".to_owned(),
         "--follow".to_owned(),
         "--no-pager".to_owned(),
     ];
 
-    if let Some(ts) = since_epoch {
+    if let Some(cursor) = after_cursor {
+        args.push(format!("--after-cursor={cursor}"));
+    } else if let Some(ts) = since_epoch {
         args.push(format!("--since={}", format_journal_since(ts)));
     } else if tail {
         args.push("--lines=0".to_owned());
@@ -239,6 +433,11 @@ pub fn build_journalctl_args(
         args.push("--lines=all".to_owned());
     }
 
+    append_journal_source_and_matches(&mut args, cfg);
+    args
+}
+
+fn append_journal_source_and_matches(args: &mut Vec<String>, cfg: &JournalConfig) {
     if !cfg.files.is_empty() {
         for file in &cfg.files {
             args.push(format!("--file={}", file.display()));
@@ -288,8 +487,6 @@ pub fn build_journalctl_args(
         }
         non_empty_groups += 1;
     }
-
-    args
 }
 
 /// Format a parsed `journalctl --output=json` object into Fail2Ban's exact syslog-like line

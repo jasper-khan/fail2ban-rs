@@ -920,7 +920,12 @@ pub fn run_cli_as(args: Vec<String>, is_server: bool) -> i32 {
             }
 
             if client.opts.test {
-                let res = preloaded_stream.unwrap_or_else(|| client.read_config(None, false));
+                let res = preloaded_stream
+                    .unwrap_or_else(|| client.read_config(None, false))
+                    .and_then(|stream| {
+                        crate::server::validate_config_stream(&stream)?;
+                        Ok(stream)
+                    });
                 let ok = match res {
                     Ok(_) => true,
                     Err(e) => {
