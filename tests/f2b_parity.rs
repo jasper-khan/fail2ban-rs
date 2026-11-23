@@ -3669,3 +3669,992 @@ async fn round4_installer_reload_unban_journal_py_db_and_runtime_flag_test() {
         rt_lines[1]
     );
 }
+
+#[tokio::test]
+async fn round5_rollback_subnet_unban_py_db_and_flush_recovery_test() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::mpsc as std_mpsc;
+    use std::time::Duration;
+
+    use fail2ban_rs::db::Fail2BanDb;
+    use fail2ban_rs::protocol::PickleValue;
+    use fail2ban_rs::server::Transmitter;
+    use fail2ban_rs::server::jail::current_unix_seconds;
+
+    let s = |v: &str| PickleValue::Str(v.to_owned());
+    let dir = tempfile::TempDir::new().unwrap();
+
+    // 1. Immediate --uninstall after an interrupted first-install backup (no published manifest,
+    //    no python.zip) must preserve untouched originals and clean up incomplete staging state.
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let pkg_name = format!("fail2ban-rs-1.1.2-linux-{arch}");
+    let pkg_root = dir.path().join("pkg").join(&pkg_name);
+    fs::create_dir_all(pkg_root.join("bin")).unwrap();
+    fs::create_dir_all(pkg_root.join("man")).unwrap();
+    fs::create_dir_all(pkg_root.join("config/filter.d/ignorecommands")).unwrap();
+    for bin in ["fail2ban-server", "fail2ban-client", "fail2ban-regex"] {
+        let p = pkg_root.join("bin").join(bin);
+        fs::write(&p, format!("RUST-{bin}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(pkg_root.join("fail2ban.service"), "RUST-service\n").unwrap();
+    fs::write(pkg_root.join("fail2ban.socket"), "RUST-socket\n").unwrap();
+    fs::write(pkg_root.join("python.zip"), "RUST-pyzip\n").unwrap();
+    for page in [
+        "fail2ban.1",
+        "fail2ban-server.1",
+        "fail2ban-client.1",
+        "fail2ban-regex.1",
+        "jail.conf.5",
+    ] {
+        fs::write(pkg_root.join("man").join(page), format!("RUST-{page}\n")).unwrap();
+    }
+    fs::write(
+        pkg_root.join("config/filter.d/ignorecommands/apache-fakegooglebot"),
+        "RUST-fakegooglebot\n",
+    )
+    .unwrap();
+    let archive = dir.path().join(format!("{pkg_name}.tar.gz"));
+    let tar_status = Command::new("tar")
+        .args([
+            "-czf",
+            archive.to_str().unwrap(),
+            "-C",
+            dir.path().join("pkg").to_str().unwrap(),
+            &pkg_name,
+        ])
+        .status()
+        .unwrap();
+    assert!(tar_status.success());
+    let sha_out = Command::new("sha256sum").arg(&archive).output().unwrap();
+    assert!(sha_out.status.success());
+    fs::write(format!("{}.sha256", archive.display()), &sha_out.stdout).unwrap();
+
+    let stock_helper_bytes = upstream_source()
+        .and_then(|u| fs::read(u.join("config/filter.d/ignorecommands/apache-fakegooglebot")).ok());
+    let orig_targets = [
+        ("usr/local/bin/fail2ban-server", "STOCK-server\n"),
+        ("usr/local/bin/fail2ban-client", "STOCK-client\n"),
+        ("usr/local/bin/fail2ban-regex", "STOCK-regex\n"),
+        (
+            "usr/local/lib/systemd/system/fail2ban.service",
+            "STOCK-service\n",
+        ),
+        (
+            "usr/local/lib/systemd/system/fail2ban.socket",
+            "STOCK-socket\n",
+        ),
+        ("usr/local/share/man/man1/fail2ban.1", "STOCK-man1\n"),
+        (
+            "usr/local/share/man/man1/fail2ban-server.1",
+            "STOCK-man-server\n",
+        ),
+        (
+            "usr/local/share/man/man1/fail2ban-client.1",
+            "STOCK-man-client\n",
+        ),
+        (
+            "usr/local/share/man/man1/fail2ban-regex.1",
+            "STOCK-man-regex\n",
+        ),
+        ("usr/local/share/man/man5/jail.conf.5", "STOCK-man5\n"),
+    ];
+    let install_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+    let run_installer = |dest: &Path, arg: &str| {
+        let out = Command::new("bash")
+            .arg(&install_script)
+            .arg(arg)
+            .env("DESTDIR", dest)
+            .env("FAIL2BAN_VERSION", "1.1.2")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "install.sh {arg} failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let seed_host = |dest: &Path| {
+        for (rel, body) in orig_targets {
+            let p = dest.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, body).unwrap();
+        }
+        if let Some(ref bytes) = stock_helper_bytes {
+            let hp = dest.join("etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot");
+            fs::create_dir_all(hp.parent().unwrap()).unwrap();
+            fs::write(&hp, bytes).unwrap();
+        }
+    };
+    let assert_stock_intact = |dest: &Path, label: &str| {
+        for (rel, body) in orig_targets {
+            let got = fs::read_to_string(dest.join(rel)).unwrap();
+            assert_eq!(got, *body, "{label}: expected original {rel} preserved");
+        }
+        if let Some(ref bytes) = stock_helper_bytes {
+            let got =
+                fs::read(dest.join("etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot"))
+                    .unwrap();
+            assert_eq!(got, *bytes, "{label}: expected stock helper preserved");
+        }
+        assert!(
+            !dest.join("usr/local/lib/fail2ban-rs").exists(),
+            "{label}: incomplete state dir should be cleaned"
+        );
+    };
+
+    // 1a. SIGKILL during backup (backup-manifest.tmp + partial backup, no manifest, no python.zip).
+    let dest_sigkill = dir.path().join("dest_r5_sigkill");
+    seed_host(&dest_sigkill);
+    let partial_bin = dest_sigkill.join("usr/local/lib/fail2ban-rs/backup/usr/local/bin");
+    fs::create_dir_all(&partial_bin).unwrap();
+    fs::write(partial_bin.join("fail2ban-server"), "STOCK-server\n").unwrap();
+    fs::write(
+        dest_sigkill.join("usr/local/lib/fail2ban-rs/backup-manifest.tmp"),
+        "usr/local/bin/fail2ban-server\n",
+    )
+    .unwrap();
+    run_installer(&dest_sigkill, "--uninstall");
+    assert_stock_intact(&dest_sigkill, "immediate rollback after SIGKILL backup");
+
+    // 1b. SIGTERM/error during backup (cleanup removed .tmp, leaving partial backup + systemd-state).
+    let dest_sigterm = dir.path().join("dest_r5_sigterm");
+    seed_host(&dest_sigterm);
+    let partial_bin_t = dest_sigterm.join("usr/local/lib/fail2ban-rs/backup/usr/local/bin");
+    fs::create_dir_all(&partial_bin_t).unwrap();
+    fs::write(partial_bin_t.join("fail2ban-server"), "STOCK-server\n").unwrap();
+    fs::write(
+        dest_sigterm.join("usr/local/lib/fail2ban-rs/systemd-state"),
+        "fail2ban.service=enabled\nfail2ban.socket=disabled\n",
+    )
+    .unwrap();
+    run_installer(&dest_sigterm, "--uninstall");
+    assert_stock_intact(&dest_sigterm, "immediate rollback after SIGTERM backup");
+
+    // 1c. Full install -> uninstall -> repeat --uninstall remains idempotent and preserves originals.
+    let dest_idem = dir.path().join("dest_r5_idempotent");
+    seed_host(&dest_idem);
+    run_installer(&dest_idem, archive.to_str().unwrap());
+    run_installer(&dest_idem, "--uninstall");
+    assert_stock_intact(&dest_idem, "first uninstall");
+    run_installer(&dest_idem, "--uninstall");
+    assert_stock_intact(&dest_idem, "second idempotent uninstall");
+
+    // 2. Subnet unban with a SQLite write lock acquired during the first IP's unban action must
+    //    keep the remaining ticket(s) in memory and SQLite so retry cleans firewall + DB.
+    let sub_db = dir.path().join("subnet_lock.sqlite3");
+    let sub_fw = dir.path().join("subnet_fw.log");
+    let sub_hit = dir.path().join("subnet_hit.flag");
+    let sub_locked = dir.path().join("subnet_locked.flag");
+    let mut tr_sub = Transmitter::default();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("dbfile"),
+            s(sub_db.to_str().unwrap()),
+        ]))
+        .await
+        .unwrap();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![s("add"), s("subj"), s("polling")]))
+        .await
+        .unwrap();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("subj"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("subj"),
+            s("addaction"),
+            s("fw"),
+        ]))
+        .await
+        .unwrap();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("subj"),
+            s("action"),
+            s("fw"),
+            s("actionban"),
+            s(&format!("echo ban:<ip> >> '{}'", sub_fw.display())),
+        ]))
+        .await
+        .unwrap();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("subj"),
+            s("action"),
+            s("fw"),
+            s("actionunban"),
+            s(&format!(
+                "echo unban:<ip> >> '{}'; if [ \"<ip>\" = \"192.0.2.10\" ]; then : > '{}'; while [ ! -f '{}' ]; do sleep 0.02; done; fi",
+                sub_fw.display(),
+                sub_hit.display(),
+                sub_locked.display()
+            )),
+        ]))
+        .await
+        .unwrap();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![s("start"), s("subj")]))
+        .await
+        .unwrap();
+    tr_sub
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("subj"),
+            s("banip"),
+            s("192.0.2.10"),
+            s("192.0.2.20"),
+        ]))
+        .await
+        .unwrap();
+
+    let (release_tx, release_rx) = std_mpsc::channel();
+    let sub_db_bg = sub_db.clone();
+    let sub_hit_bg = sub_hit.clone();
+    let sub_locked_bg = sub_locked.clone();
+    let sub_locker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !sub_hit_bg.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let conn = rusqlite::Connection::open(&sub_db_bg).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        fs::write(&sub_locked_bg, "").unwrap();
+        let _ = release_rx.recv();
+        let _ = conn.execute_batch("ROLLBACK");
+    });
+
+    let first_sub_unban = tr_sub
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("subj"),
+            s("unbanip"),
+            s("192.0.2.0/24"),
+        ]))
+        .await;
+    let _ = release_tx.send(());
+    sub_locker.join().unwrap();
+    assert!(
+        first_sub_unban.is_err(),
+        "mid-subnet SQLite lock must propagate error: {first_sub_unban:?}"
+    );
+    assert_eq!(
+        tr_sub
+            .dispatch(&PickleValue::List(vec![
+                s("get"),
+                s("subj"),
+                s("banned"),
+                s("192.0.2.10"),
+            ]))
+            .await
+            .unwrap(),
+        PickleValue::Int(0),
+        "first IP already unbanned before lock"
+    );
+    assert_eq!(
+        tr_sub
+            .dispatch(&PickleValue::List(vec![
+                s("get"),
+                s("subj"),
+                s("banned"),
+                s("192.0.2.20"),
+            ]))
+            .await
+            .unwrap(),
+        PickleValue::Int(1),
+        "second IP must remain in BanManager after DB delete failure"
+    );
+    let fw_mid = fs::read_to_string(&sub_fw).unwrap();
+    assert!(fw_mid.contains("unban:192.0.2.10"));
+    assert!(
+        !fw_mid.contains("unban:192.0.2.20"),
+        "second IP actionunban must not have run on failed DB delete"
+    );
+    {
+        let check_db = Fail2BanDb::open(sub_db.to_str().unwrap(), 86_400, 10).unwrap();
+        let active = check_db
+            .get_current_bans(Some("subj"), None, None, current_unix_seconds() as i64)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].fid.to_string(), "192.0.2.20");
+    }
+
+    // Retry subnet unban after lock release cleanly removes 192.0.2.20 from DB, memory, and firewall.
+    assert_eq!(
+        tr_sub
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("subj"),
+                s("unbanip"),
+                s("192.0.2.0/24"),
+            ]))
+            .await
+            .unwrap(),
+        PickleValue::Int(1)
+    );
+    assert_eq!(
+        tr_sub
+            .dispatch(&PickleValue::List(vec![
+                s("get"),
+                s("subj"),
+                s("banned"),
+                s("192.0.2.20"),
+            ]))
+            .await
+            .unwrap(),
+        PickleValue::Int(0)
+    );
+    let fw_after = fs::read_to_string(&sub_fw).unwrap();
+    assert!(
+        fw_after.contains("unban:192.0.2.20"),
+        "retry subnet unban must run firewall unban for remaining IP:\n{fw_after}"
+    );
+    {
+        let check_db = Fail2BanDb::open(sub_db.to_str().unwrap(), 86_400, 10).unwrap();
+        let active = check_db
+            .get_current_bans(Some("subj"), None, None, current_unix_seconds() as i64)
+            .unwrap();
+        assert!(active.is_empty());
+    }
+    let _ = tr_sub.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+    // 3. Python actions receive a functional Fail2BanDb on file-backed and :memory: DBs,
+    //    and None when persistence is disabled.
+    if upstream_source().is_some() {
+        let query_py = dir.path().join("db_query_action.py");
+        let query_out = dir.path().join("db_query.jsonl");
+        fs::write(
+            &query_py,
+            format!(
+                concat!(
+                    "import json\n",
+                    "from fail2ban.server.action import ActionBase\n",
+                    "from fail2ban.server.database import Fail2BanDb\n",
+                    "class DbQueryAction(ActionBase):\n",
+                    "    def ban(self, aInfo):\n",
+                    "        db = self._jail.database\n",
+                    "        if db is not None:\n",
+                    "            bans = [str(t.getID()) for t in db.getBans(jail=self._jail)]\n",
+                    "            cur = [str(t.getID()) for t in db.getCurrentBans(jail=self._jail)]\n",
+                    "            merged = [str(t.getID()) for t in db.getBansMerged(jail=self._jail)]\n",
+                    "            prior_ip = bans[0] if bans else None\n",
+                    "            single_merged = db.getBansMerged(ip=prior_ip, jail=self._jail) if prior_ip else None\n",
+                    "            ban_rows = db.getBan(prior_ip, jail=self._jail) if prior_ip else []\n",
+                    "            rec = dict(\n",
+                    "                ip=str(aInfo['ip']),\n",
+                    "                filename=db.filename,\n",
+                    "                is_db=isinstance(db, Fail2BanDb),\n",
+                    "                purgeage=db.purgeage,\n",
+                    "                maxmatches=db.maxMatches,\n",
+                    "                maxbantime=self._jail.getMaxBanTime(),\n",
+                    "                bans=sorted(bans),\n",
+                    "                cur=sorted(cur),\n",
+                    "                merged=sorted(merged),\n",
+                    "                single_merged=str(single_merged.getID()) if single_merged else None,\n",
+                    "                ban_rows=len(ban_rows),\n",
+                    "            )\n",
+                    "        else:\n",
+                    "            rec = dict(ip=str(aInfo['ip']), filename=None)\n",
+                    "        with open('{}', 'a') as f:\n",
+                    "            f.write(json.dumps(rec) + '\\n')\n",
+                    "Action = DbQueryAction\n",
+                ),
+                query_out.display()
+            ),
+        )
+        .unwrap();
+
+        // 3a. File-backed SQLite DB.
+        let file_db = dir.path().join("py_real.sqlite3");
+        let mut tr_file = Transmitter::default();
+        tr_file
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("dbfile"),
+                s(file_db.to_str().unwrap()),
+            ]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![s("add"), s("pyf"), s("polling")]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyf"),
+                s("addaction"),
+                s("q"),
+                s(query_py.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![s("start"), s("pyf")]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyf"),
+                s("banip"),
+                s("192.0.2.170"),
+            ]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("dbpurgeage"),
+                s("3600"),
+            ]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("dbmaxmatches"),
+                s("25"),
+            ]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyf"),
+                s("banip"),
+                s("192.0.2.171"),
+            ]))
+            .await
+            .unwrap();
+        tr_file
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyf"),
+                s("banip"),
+                s("192.0.2.172"),
+            ]))
+            .await
+            .unwrap();
+        let _ = tr_file.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+        // 3b. :memory: SQLite DB.
+        let mut tr_mem = Transmitter::default();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("dbfile"),
+                s(":memory:"),
+            ]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![s("add"), s("pym"), s("polling")]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pym"),
+                s("addaction"),
+                s("q"),
+                s(query_py.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![s("start"), s("pym")]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pym"),
+                s("banip"),
+                s("192.0.2.180"),
+            ]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pym"),
+                s("banip"),
+                s("192.0.2.181"),
+            ]))
+            .await
+            .unwrap();
+        let _ = tr_mem.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+        // 3c. Disabled DB (None).
+        let mut tr_none = Transmitter::default();
+        tr_none
+            .dispatch(&PickleValue::List(vec![s("add"), s("pyn"), s("polling")]))
+            .await
+            .unwrap();
+        tr_none
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyn"),
+                s("addaction"),
+                s("q"),
+                s(query_py.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_none
+            .dispatch(&PickleValue::List(vec![s("start"), s("pyn")]))
+            .await
+            .unwrap();
+        tr_none
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pyn"),
+                s("banip"),
+                s("192.0.2.185"),
+            ]))
+            .await
+            .unwrap();
+        let _ = tr_none.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+        let recs: Vec<serde_json::Value> = fs::read_to_string(&query_out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs.len(), 6, "all 6 ban callbacks must succeed: {recs:?}");
+        // File-backed ban #2 sees ban #1 + updated purgeage/maxmatches.
+        assert_eq!(recs[1]["filename"], file_db.to_str().unwrap());
+        assert_eq!(recs[1]["is_db"], true);
+        assert_eq!(recs[1]["purgeage"], 3600);
+        assert_eq!(recs[1]["maxmatches"], 25);
+        assert_eq!(recs[1]["bans"], serde_json::json!(["192.0.2.170"]));
+        assert_eq!(recs[1]["cur"], serde_json::json!(["192.0.2.170"]));
+        assert_eq!(recs[1]["merged"], serde_json::json!(["192.0.2.170"]));
+        assert_eq!(recs[1]["single_merged"], "192.0.2.170");
+        assert_eq!(recs[1]["ban_rows"], 1);
+        // File-backed ban #3 sees both prior bans (verifying merged cache invalidation).
+        assert_eq!(
+            recs[2]["merged"],
+            serde_json::json!(["192.0.2.170", "192.0.2.171"])
+        );
+        // :memory: ban #2 sees ban #1 from Rust's in-memory SQLite DB.
+        assert_eq!(recs[4]["filename"], ":memory:");
+        assert_eq!(recs[4]["is_db"], true);
+        assert_eq!(recs[4]["bans"], serde_json::json!(["192.0.2.180"]));
+        assert_eq!(recs[4]["cur"], serde_json::json!(["192.0.2.180"]));
+        assert_eq!(recs[4]["merged"], serde_json::json!(["192.0.2.180"]));
+        assert_eq!(recs[4]["single_merged"], "192.0.2.180");
+        assert_eq!(recs[4]["ban_rows"], 1);
+        // Disabled DB passes None cleanly.
+        assert_eq!(recs[5]["filename"], serde_json::Value::Null);
+    }
+
+    // 4. Flush exceptions follow upstream consistencyCheck recovery and stop-specific repair
+    //    decisions before selecting individual-unban fallback.
+    // 4a. Bulk unban --all (stop=False): failed flush runs check + repair and skips individual unban.
+    let broken_marker = dir.path().join("broken_bulk.flag");
+    let bulk_log = dir.path().join("flush_bulk.log");
+    let mut tr_bulk = Transmitter::default();
+    tr_bulk
+        .dispatch(&PickleValue::List(vec![s("add"), s("flb"), s("polling")]))
+        .await
+        .unwrap();
+    tr_bulk
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("flb"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+    tr_bulk
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("flb"),
+            s("addaction"),
+            s("fw"),
+        ]))
+        .await
+        .unwrap();
+    for (prop, val) in [
+        (
+            "actionstart",
+            format!("echo start >> '{}'", bulk_log.display()),
+        ),
+        (
+            "actionban",
+            format!("echo ban:<ip> >> '{}'", bulk_log.display()),
+        ),
+        (
+            "actionunban",
+            format!("echo unban:<ip> >> '{}'", bulk_log.display()),
+        ),
+        (
+            "actionflush",
+            format!("echo flush >> '{}'; exit 1", bulk_log.display()),
+        ),
+        (
+            "actioncheck",
+            format!(
+                "echo check >> '{}'; test ! -f '{}'",
+                bulk_log.display(),
+                broken_marker.display()
+            ),
+        ),
+        (
+            "actionrepair",
+            format!(
+                "echo repair >> '{}'; rm -f '{}'",
+                bulk_log.display(),
+                broken_marker.display()
+            ),
+        ),
+    ] {
+        tr_bulk
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("flb"),
+                s("action"),
+                s("fw"),
+                s(prop),
+                s(&val),
+            ]))
+            .await
+            .unwrap();
+    }
+    tr_bulk
+        .dispatch(&PickleValue::List(vec![s("start"), s("flb")]))
+        .await
+        .unwrap();
+    tr_bulk
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("flb"),
+            s("banip"),
+            s("192.0.2.190"),
+        ]))
+        .await
+        .unwrap();
+    fs::write(&broken_marker, "").unwrap();
+    assert_eq!(
+        tr_bulk
+            .dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await
+            .unwrap(),
+        PickleValue::Int(1)
+    );
+    let bulk_events = fs::read_to_string(&bulk_log).unwrap();
+    assert!(
+        bulk_events.contains("flush"),
+        "expected flush:\n{bulk_events}"
+    );
+    assert!(
+        bulk_events.contains("check"),
+        "expected check:\n{bulk_events}"
+    );
+    assert!(
+        bulk_events.contains("repair"),
+        "bulk flush error must run actionrepair:\n{bulk_events}"
+    );
+    assert!(
+        !bulk_events.contains("unban:192.0.2.190"),
+        "action with consistencyCheck must skip individual unban fallback:\n{bulk_events}"
+    );
+    assert!(
+        !broken_marker.exists(),
+        "repair must have restored environment"
+    );
+    let _ = tr_bulk.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+    // 4b. Obsolete-action cleanup on reload (stop=True): respects actionrepair_on_unban and skips
+    //     individual unban fallback while still calling actionstop.
+    let rel_log_no = dir.path().join("reload_norepair.log");
+    let rel_log_yes = dir.path().join("reload_repair.log");
+    let rel_broken = dir.path().join("reload_broken.flag");
+    fs::write(&rel_broken, "").unwrap();
+    let mut tr_rel = Transmitter::default();
+    tr_rel
+        .dispatch(&PickleValue::List(vec![s("add"), s("flr"), s("polling")]))
+        .await
+        .unwrap();
+    tr_rel
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("flr"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+    for (act_name, log_path, repair_on_unban) in [
+        ("obs_no", &rel_log_no, "false"),
+        ("obs_yes", &rel_log_yes, "true"),
+    ] {
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("flr"),
+                s("addaction"),
+                s(act_name),
+            ]))
+            .await
+            .unwrap();
+        for (prop, val) in [
+            (
+                "actionstart",
+                format!("echo start >> '{}'", log_path.display()),
+            ),
+            (
+                "actionban",
+                format!("echo ban:<ip> >> '{}'", log_path.display()),
+            ),
+            (
+                "actionunban",
+                format!("echo unban:<ip> >> '{}'", log_path.display()),
+            ),
+            (
+                "actionflush",
+                format!("echo flush >> '{}'; exit 1", log_path.display()),
+            ),
+            (
+                "actioncheck",
+                format!(
+                    "echo check >> '{}'; test ! -f '{}'",
+                    log_path.display(),
+                    rel_broken.display()
+                ),
+            ),
+            (
+                "actionrepair",
+                format!("echo repair >> '{}'", log_path.display()),
+            ),
+            (
+                "actionstop",
+                format!("echo stop >> '{}'", log_path.display()),
+            ),
+            ("actionrepair_on_unban", repair_on_unban.to_owned()),
+        ] {
+            tr_rel
+                .dispatch(&PickleValue::List(vec![
+                    s("set"),
+                    s("flr"),
+                    s("action"),
+                    s(act_name),
+                    s(prop),
+                    s(&val),
+                ]))
+                .await
+                .unwrap();
+        }
+    }
+    tr_rel
+        .dispatch(&PickleValue::List(vec![s("start"), s("flr")]))
+        .await
+        .unwrap();
+    tr_rel
+        .dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("flr"),
+            s("banip"),
+            s("192.0.2.191"),
+        ]))
+        .await
+        .unwrap();
+    // Plain reload omits both actions, triggering obsolete-action cleanup with stop=True.
+    let drop_stream = PickleValue::List(vec![
+        PickleValue::List(vec![s("add"), s("flr"), s("polling")]),
+        PickleValue::List(vec![s("set"), s("flr"), s("ignoreself"), s("false")]),
+        PickleValue::List(vec![s("start"), s("flr")]),
+    ]);
+    tr_rel
+        .dispatch(&PickleValue::List(vec![
+            s("reload"),
+            s("--all"),
+            PickleValue::List(vec![]),
+            drop_stream,
+        ]))
+        .await
+        .unwrap();
+    let no_ev = fs::read_to_string(&rel_log_no).unwrap();
+    assert!(no_ev.contains("check"), "obs_no must run check:\n{no_ev}");
+    assert!(
+        !no_ev.contains("repair"),
+        "obs_no with stop=True and actionrepair_on_unban=false must skip repair:\n{no_ev}"
+    );
+    assert!(
+        !no_ev.contains("unban:192.0.2.191"),
+        "obs_no must skip individual unban fallback:\n{no_ev}"
+    );
+    assert!(
+        no_ev.contains("stop"),
+        "obs_no must still execute actionstop:\n{no_ev}"
+    );
+    let yes_ev = fs::read_to_string(&rel_log_yes).unwrap();
+    assert!(
+        yes_ev.contains("check"),
+        "obs_yes must run check:\n{yes_ev}"
+    );
+    assert!(
+        yes_ev.contains("repair"),
+        "obs_yes with actionrepair_on_unban=true must repair on stop flush error:\n{yes_ev}"
+    );
+    assert!(
+        !yes_ev.contains("unban:192.0.2.191"),
+        "obs_yes must skip individual unban fallback:\n{yes_ev}"
+    );
+    let _ = tr_rel.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+    // 4c. Python actions on flush error: action WITH consistencyCheck receives _beforeRepair and
+    //     skips individual unban; action WITHOUT consistencyCheck falls back to individual unban.
+    if upstream_source().is_some() {
+        let py_chk_log = dir.path().join("py_flush_chk.log");
+        let py_nochk_log = dir.path().join("py_flush_nochk.log");
+        let py_chk = dir.path().join("py_flush_chk.py");
+        let py_nochk = dir.path().join("py_flush_nochk.py");
+        fs::write(
+            &py_chk,
+            format!(
+                concat!(
+                    "from fail2ban.server.action import ActionBase\n",
+                    "class FlushCheck(ActionBase):\n",
+                    "    def ban(self, aInfo):\n",
+                    "        pass\n",
+                    "    def flush(self):\n",
+                    "        raise RuntimeError('boom')\n",
+                    "    def consistencyCheck(self, beforeRepair=None):\n",
+                    "        allow = beforeRepair() if beforeRepair else True\n",
+                    "        with open('{}', 'a') as f:\n",
+                    "            f.write(f'check:{{allow}}\\n')\n",
+                    "        return True\n",
+                    "    def unban(self, aInfo):\n",
+                    "        with open('{}', 'a') as f:\n",
+                    "            f.write(f'unban:{{aInfo[\"ip\"]}}\\n')\n",
+                    "Action = FlushCheck\n",
+                ),
+                py_chk_log.display(),
+                py_chk_log.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &py_nochk,
+            format!(
+                concat!(
+                    "from fail2ban.server.action import ActionBase\n",
+                    "class FlushNoCheck(ActionBase):\n",
+                    "    def ban(self, aInfo):\n",
+                    "        pass\n",
+                    "    def flush(self):\n",
+                    "        raise RuntimeError('boom')\n",
+                    "    def unban(self, aInfo):\n",
+                    "        with open('{}', 'a') as f:\n",
+                    "            f.write(f'unban:{{aInfo[\"ip\"]}}\\n')\n",
+                    "Action = FlushNoCheck\n",
+                ),
+                py_nochk_log.display()
+            ),
+        )
+        .unwrap();
+
+        let mut tr_pyf = Transmitter::default();
+        tr_pyf
+            .dispatch(&PickleValue::List(vec![s("add"), s("flp"), s("polling")]))
+            .await
+            .unwrap();
+        tr_pyf
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("flp"),
+                s("addaction"),
+                s("withchk"),
+                s(py_chk.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_pyf
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("flp"),
+                s("addaction"),
+                s("nochk"),
+                s(py_nochk.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_pyf
+            .dispatch(&PickleValue::List(vec![s("start"), s("flp")]))
+            .await
+            .unwrap();
+        tr_pyf
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("flp"),
+                s("banip"),
+                s("192.0.2.192"),
+            ]))
+            .await
+            .unwrap();
+        // Bulk unban (stop=False): withchk sees allow=True and skips unban; nochk falls back to unban.
+        tr_pyf
+            .dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await
+            .unwrap();
+        // Re-ban and stop (stop=True): withchk sees allow=False and skips unban; nochk falls back to unban.
+        tr_pyf
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("flp"),
+                s("banip"),
+                s("192.0.2.193"),
+            ]))
+            .await
+            .unwrap();
+        let _ = tr_pyf.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+        let chk_lines: Vec<String> = fs::read_to_string(&py_chk_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            chk_lines,
+            vec!["check:True", "check:False"],
+            "Python consistencyCheck must observe stop-specific beforeRepair and skip unban"
+        );
+        let nochk_lines: Vec<String> = fs::read_to_string(&py_nochk_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            nochk_lines,
+            vec!["unban:192.0.2.192", "unban:192.0.2.193"],
+            "Python action without consistencyCheck must fall back to individual unban"
+        );
+    }
+}

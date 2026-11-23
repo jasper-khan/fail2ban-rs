@@ -2,12 +2,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value as JsonValue, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
+use crate::db::Fail2BanDb;
 use crate::error::{Error, Result};
 use crate::logging::{LogLevel, log_msg};
 use crate::protocol::{DEFAULT_TIMEOUT, MAX_FRAME_BYTES, PickleValue, decode_pickle};
@@ -21,6 +23,8 @@ pub struct PythonAction {
     stdin: ChildStdin,
     stdout: ChildStdout,
     ban_time: i64,
+    max_ban_time: i64,
+    db: Option<Arc<Mutex<Fail2BanDb>>>,
     pub(super) norestored: bool,
     pub(super) prolongable: bool,
     pub(super) flushable: bool,
@@ -36,9 +40,23 @@ impl PythonAction {
         path: &str,
         options: &str,
         ban_time: i64,
-        db_filename: Option<&str>,
+        max_ban_time: i64,
+        db: Option<Arc<Mutex<Fail2BanDb>>>,
     ) -> Result<Self> {
         let options = parse_options(options)?;
+        let db_info = match db.as_ref() {
+            Some(db_arc) => {
+                let guard = db_arc
+                    .lock()
+                    .map_err(|_| Error::database("database lock poisoned"))?;
+                Some(json!({
+                    "filename": guard.filename(),
+                    "purgeage": guard.purge_age(),
+                    "maxmatches": guard.max_matches(),
+                }))
+            }
+            None => None,
+        };
         let library = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent()?.parent().map(Path::to_path_buf))
@@ -82,6 +100,8 @@ impl PythonAction {
             stdin,
             stdout,
             ban_time,
+            max_ban_time,
+            db,
             norestored: false,
             prolongable: false,
             flushable: false,
@@ -96,7 +116,7 @@ impl PythonAction {
                 "name": name,
                 "path": path,
                 "options": options,
-                "database": db_filename
+                "database": db_info
             }))
             .await?;
         Ok(action)
@@ -110,8 +130,9 @@ impl PythonAction {
         &self.jail_name
     }
 
-    pub(crate) fn set_ban_time(&mut self, ban_time: i64) {
+    pub(crate) fn set_ban_times(&mut self, ban_time: i64, max_ban_time: i64) {
         self.ban_time = ban_time;
+        self.max_ban_time = max_ban_time;
     }
 
     pub(crate) async fn method(&mut self, key: &str, options: Option<&str>) -> Result<PickleValue> {
@@ -134,6 +155,20 @@ impl PythonAction {
             return Ok(true);
         }
         let val = self.method("consistencyCheck", None).await?;
+        Ok(is_truthy(&val))
+    }
+
+    pub(crate) async fn consistency_check_on_flush(&mut self, on_stop: bool) -> Result<bool> {
+        if !self.checkable {
+            return Ok(true);
+        }
+        let val = self
+            .request(json!({
+                "operation": "consistency_check",
+                "for_flush": true,
+                "stop": on_stop,
+            }))
+            .await?;
         Ok(is_truthy(&val))
     }
 
@@ -194,28 +229,98 @@ impl PythonAction {
 
     async fn request(&mut self, mut value: JsonValue) -> Result<PickleValue> {
         value["bantime"] = json!(self.ban_time);
+        value["max_bantime"] = json!(self.max_ban_time);
+        if let Some(ref db_arc) = self.db
+            && let Ok(guard) = db_arc.lock()
+        {
+            value["db_purge_age"] = json!(guard.purge_age());
+            value["db_max_matches"] = json!(guard.max_matches());
+        }
         let mut request = serde_json::to_vec(&value).map_err(|e| Error::action(e.to_string()))?;
         request.push(b'\n');
+        let action_name = self.name.clone();
+        let db_ref = self.db.clone();
         let exchange = timeout(DEFAULT_TIMEOUT, async {
-            self.stdin.write_all(&request).await?;
-            self.stdin.flush().await?;
-            let size = self.stdout.read_u32().await? as usize;
-            if size > MAX_FRAME_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Python action response is too large",
-                ));
+            self.stdin
+                .write_all(&request)
+                .await
+                .map_err(|e| Error::io(format!("Python action {action_name:?}"), e))?;
+            self.stdin
+                .flush()
+                .await
+                .map_err(|e| Error::io(format!("Python action {action_name:?}"), e))?;
+            loop {
+                let size = self
+                    .stdout
+                    .read_u32()
+                    .await
+                    .map_err(|e| Error::io(format!("Python action {action_name:?}"), e))?
+                    as usize;
+                if size > MAX_FRAME_BYTES {
+                    return Err(Error::io(
+                        format!("Python action {action_name:?}"),
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Python action response is too large",
+                        ),
+                    ));
+                }
+                let mut reply = vec![0; size];
+                self.stdout
+                    .read_exact(&mut reply)
+                    .await
+                    .map_err(|e| Error::io(format!("Python action {action_name:?}"), e))?;
+                let malformed = || Error::action("invalid Python action response");
+                let PickleValue::Tuple(tuple) = decode_pickle(&reply)? else {
+                    return Err(malformed());
+                };
+                let [status, first, second]: [PickleValue; 3] =
+                    tuple.try_into().map_err(|_| malformed())?;
+                if status == PickleValue::Int(2) {
+                    let PickleValue::Str(sql) = first else {
+                        return Err(malformed());
+                    };
+                    let params = match second {
+                        PickleValue::List(v) | PickleValue::Tuple(v) => v,
+                        _ => return Err(malformed()),
+                    };
+                    let db_reply = match db_ref.as_ref() {
+                        Some(db_arc) => match db_arc.lock() {
+                            Ok(guard) => match guard.execute_bridge_sql(&sql, &params) {
+                                Ok(res) => json!({
+                                    "ok": true,
+                                    "rows": res.rows,
+                                    "json_cols": res.json_cols,
+                                    "rowcount": res.rowcount,
+                                }),
+                                Err(err) => json!({ "ok": false, "error": err }),
+                            },
+                            Err(_) => json!({ "ok": false, "error": "database lock poisoned" }),
+                        },
+                        None => json!({ "ok": false, "error": "database is not configured" }),
+                    };
+                    let mut buf =
+                        serde_json::to_vec(&db_reply).map_err(|e| Error::action(e.to_string()))?;
+                    buf.push(b'\n');
+                    self.stdin
+                        .write_all(&buf)
+                        .await
+                        .map_err(|e| Error::io(format!("Python action {action_name:?}"), e))?;
+                    self.stdin
+                        .flush()
+                        .await
+                        .map_err(|e| Error::io(format!("Python action {action_name:?}"), e))?;
+                    continue;
+                }
+                return Ok((status, first, second));
             }
-            let mut reply = vec![0; size];
-            self.stdout.read_exact(&mut reply).await?;
-            Ok(reply)
         })
         .await;
-        let reply = match exchange {
-            Ok(Ok(reply)) => reply,
+        let (status, value, flags) = match exchange {
+            Ok(Ok(parts)) => parts,
             Ok(Err(e)) => {
                 let _ = self.child.start_kill();
-                return Err(Error::io(format!("Python action {:?}", self.name), e));
+                return Err(e);
             }
             Err(_) => {
                 let _ = self.child.start_kill();
@@ -226,10 +331,6 @@ impl PythonAction {
             }
         };
         let malformed = || Error::action("invalid Python action response");
-        let PickleValue::Tuple(reply) = decode_pickle(&reply)? else {
-            return Err(malformed());
-        };
-        let [status, value, flags]: [PickleValue; 3] = reply.try_into().map_err(|_| malformed())?;
         if status != PickleValue::Int(0) {
             return Err(Error::action(value.to_string_lossy()));
         }

@@ -49,6 +49,13 @@ enum OpMode {
     Reload,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InvariantOutcome {
+    Ok,
+    SkippedRepair,
+    Failed,
+}
+
 /// Fail2Ban 1.1.1 `CommandAction` executing OS shell commands.
 #[derive(Debug, Clone)]
 pub struct CommandAction {
@@ -383,6 +390,22 @@ impl CommandAction {
     /// Returns `Ok(true)` if all started families are healthy (or repaired), or
     /// `Ok(false)` if any started family could not be restored.
     pub async fn consistency_check(&mut self) -> Result<bool> {
+        self.consistency_check_inner(true, "").await
+    }
+
+    /// Run `consistencyCheck` after a failed `flush()`, skipping repair during stop/reload
+    /// unless `actionrepair_on_unban` is enabled (matching upstream `actions.py:665-672`).
+    pub async fn consistency_check_on_flush(&mut self, on_stop: bool) -> Result<bool> {
+        let allow_repair = !on_stop || self.actionrepair_on_unban;
+        self.consistency_check_inner(allow_repair, "Invariant check failed. Flush is impossible.")
+            .await
+    }
+
+    async fn consistency_check_inner(
+        &mut self,
+        allow_repair: bool,
+        skip_msg: &str,
+    ) -> Result<bool> {
         let started_families: Vec<(Family, u8)> =
             self.started.iter().map(|(&f, &s)| (f, s)).collect();
         let mut all_ok = true;
@@ -397,7 +420,11 @@ impl CommandAction {
             {
                 continue;
             }
-            if !self.invariant_check(family, true, true).await? {
+            if self
+                .invariant_check(family, allow_repair, true, skip_msg)
+                .await?
+                == InvariantOutcome::Failed
+            {
                 self.started.insert(family, 0);
                 self.clear_operation_executed("<actionstart>", family);
                 all_ok = false;
@@ -556,9 +583,15 @@ impl CommandAction {
                 let is_unban = tag == "<actionunban>";
                 let allow_repair = !is_unban || self.actionrepair_on_unban;
                 let force_start = !is_unban;
-                if !self
-                    .invariant_check(family, allow_repair, force_start)
+                if self
+                    .invariant_check(
+                        family,
+                        allow_repair,
+                        force_start,
+                        "Invariant check failed. Unban is impossible.",
+                    )
                     .await?
+                    != InvariantOutcome::Ok
                 {
                     return Err(Error::action(format!(
                         "Error executing {tag} in {}/{}: invariant check failed",
@@ -598,9 +631,10 @@ impl CommandAction {
         family: Family,
         allow_repair: bool,
         force_start: bool,
-    ) -> Result<bool> {
+        skip_msg: &str,
+    ) -> Result<InvariantOutcome> {
         if !force_start && !self.is_started(family) {
-            return Ok(true);
+            return Ok(InvariantOutcome::Ok);
         }
         let check_cmd = self.get_operation("<actioncheck>", family)?;
         if check_cmd.trim().is_empty()
@@ -609,15 +643,11 @@ impl CommandAction {
                 .await
                 .unwrap_or(false)
         {
-            return Ok(true);
+            return Ok(InvariantOutcome::Ok);
         }
         if !allow_repair {
-            f2b_log!(
-                LogLevel::Error,
-                "fail2ban.action",
-                "Invariant check failed. Unban is impossible."
-            );
-            return Ok(false);
+            f2b_log!(LogLevel::Error, "fail2ban.action", "{skip_msg}");
+            return Ok(InvariantOutcome::SkippedRepair);
         }
 
         f2b_log!(
@@ -641,7 +671,7 @@ impl CommandAction {
                     "fail2ban.action",
                     "Unable to restore environment"
                 );
-                return Ok(false);
+                return Ok(InvariantOutcome::Failed);
             }
             self.started.insert(family, STATE_STARTED);
         } else {
@@ -654,7 +684,7 @@ impl CommandAction {
             self.clear_operation_executed("<actionstart>", family);
             let policy = self.policy()?;
             if (force_start || !policy.start_on_demand) && self.start_one(family).await.is_err() {
-                return Ok(false);
+                return Ok(InvariantOutcome::Failed);
             }
         }
 
@@ -669,10 +699,10 @@ impl CommandAction {
                 "fail2ban.action",
                 "Unable to restore environment"
             );
-            return Ok(false);
+            return Ok(InvariantOutcome::Failed);
         }
 
-        Ok(true)
+        Ok(InvariantOutcome::Ok)
     }
 
     async fn execute_with_empty_ctx(&self, static_cmd: &str, family: Family) -> Result<bool> {

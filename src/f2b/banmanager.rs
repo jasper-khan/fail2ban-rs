@@ -229,8 +229,9 @@ impl BanManager {
         Some(removed)
     }
 
-    /// Remove and return all active ban tickets equal to or contained in `target` (supports CIDR/subnet).
-    pub fn remove_matching(&mut self, target: &TicketId) -> Vec<Ticket> {
+    /// Return all active ban IDs equal to or contained in `target` (supports CIDR/subnet)
+    /// in insertion order without removing them.
+    pub fn matching_ids(&self, target: &TicketId) -> Vec<TicketId> {
         let mut matches: Vec<(u64, TicketId)> = self
             .ban_list
             .iter()
@@ -242,16 +243,8 @@ impl BanManager {
                 }
             })
             .collect();
-        if matches.is_empty() {
-            return Vec::new();
-        }
         matches.sort_unstable_by_key(|(seq, _)| *seq);
-        let removed: Vec<Ticket> = matches
-            .into_iter()
-            .filter_map(|(_, id)| self.ban_list.remove(&id).map(|e| e.ticket))
-            .collect();
-        self.recompute_next_unban();
-        removed
+        matches.into_iter().map(|(_, id)| id).collect()
     }
 
     fn recompute_next_unban(&mut self) {
@@ -417,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_by_id_remove_matching_cidr_and_flush() {
+    fn remove_by_id_matching_ids_cidr_and_flush() {
         let mut bm = BanManager::new();
         let ip1 = id("192.0.2.10");
         let ip2 = id("192.0.2.20");
@@ -427,14 +420,12 @@ mod tests {
         bm.add_ban_ticket(Ticket::new(ip2.clone(), 101.0), 101.0);
         bm.add_ban_ticket(Ticket::new(outside.clone(), 102.0), 102.0);
 
-        let removed_subnet = bm.remove_matching(&id("192.0.2.0/24"));
-        assert_eq!(
-            removed_subnet
-                .into_iter()
-                .map(|t| t.fid)
-                .collect::<Vec<_>>(),
-            vec![ip1, ip2]
-        );
+        let matched_subnet = bm.matching_ids(&id("192.0.2.0/24"));
+        assert_eq!(matched_subnet, vec![ip1.clone(), ip2.clone()]);
+        assert_eq!(bm.size(), 3);
+        for id in matched_subnet {
+            assert!(bm.remove_by_id(&id).is_some());
+        }
         assert_eq!(bm.size(), 1);
         assert_eq!(bm.remove_by_id(&outside).unwrap().fid, outside);
         assert_eq!(bm.size(), 0);

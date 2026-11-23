@@ -12,6 +12,9 @@ pub use policy::{ActionPolicy, Family};
 pub use smtp::SmtpAction;
 pub use tags::{StaticTemplate, escape_tag, replace_dynamic_tags};
 
+use std::sync::{Arc, Mutex};
+
+use crate::db::Fail2BanDb;
 use crate::error::{Error, Result};
 use crate::protocol::PickleValue;
 use crate::ticket::ActionContext;
@@ -46,14 +49,24 @@ impl ActionKind {
         path: &str,
         init_json: &str,
         ban_time: i64,
-        db_filename: Option<&str>,
+        max_ban_time: i64,
+        db: Option<Arc<Mutex<Fail2BanDb>>>,
     ) -> Result<ActionKind> {
         if SmtpAction::is_stock_module(path) {
             let smtp = SmtpAction::from_json(jail_name.to_owned(), act_name.to_owned(), init_json)?;
             return Ok(Self::Smtp(smtp));
         }
         Ok(Self::Python(
-            PythonAction::load(jail_name, act_name, path, init_json, ban_time, db_filename).await?,
+            PythonAction::load(
+                jail_name,
+                act_name,
+                path,
+                init_json,
+                ban_time,
+                max_ban_time,
+                db,
+            )
+            .await?,
         ))
     }
 
@@ -253,11 +266,27 @@ impl ActionKind {
         }
     }
 
+    pub fn has_consistency_check(&self) -> bool {
+        match self {
+            Self::Command(_) => true,
+            Self::Smtp(_) => false,
+            Self::Python(a) => a.checkable,
+        }
+    }
+
     pub async fn consistency_check(&mut self) -> Result<bool> {
         match self {
             Self::Command(a) => a.consistency_check().await,
             Self::Smtp(_) => Ok(true),
             Self::Python(a) => a.consistency_check().await,
+        }
+    }
+
+    pub async fn consistency_check_on_flush(&mut self, on_stop: bool) -> Result<bool> {
+        match self {
+            Self::Command(a) => a.consistency_check_on_flush(on_stop).await,
+            Self::Smtp(_) => Ok(true),
+            Self::Python(a) => a.consistency_check_on_flush(on_stop).await,
         }
     }
 }
@@ -279,6 +308,7 @@ mod tests {
             "smtp",
             stock.to_str().unwrap(),
             r#"{"dest":"ops@example.com","matches":"matches"}"#,
+            600,
             600,
             None,
         )
@@ -305,6 +335,7 @@ mod tests {
             "example",
             other_smtp.to_str().unwrap(),
             r#"{"opt1":"world"}"#,
+            600,
             600,
             None,
         )
@@ -333,6 +364,7 @@ mod tests {
                 no_action.to_str().unwrap(),
                 "{}",
                 600,
+                600,
                 None
             )
             .await
@@ -345,6 +377,7 @@ mod tests {
                 "bad2",
                 no_method.to_str().unwrap(),
                 "{}",
+                600,
                 600,
                 None
             )

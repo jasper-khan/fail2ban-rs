@@ -747,11 +747,7 @@ impl Transmitter {
             "bantime" => {
                 let time = str2seconds_i64(&scalar(args, 0)?)?;
                 state.ban_manager.set_ban_time(time);
-                for (_, action) in &mut state.actions {
-                    if let ActionKind::Python(action) = action {
-                        action.set_ban_time(time);
-                    }
-                }
+                state.sync_python_ban_times();
                 key
             }
             "banip" => return Ok(integer(state.ban_ip(&strings(args)?).await?)),
@@ -799,6 +795,7 @@ impl Transmitter {
                 state
                     .ban_extra
                     .set_opt_value(&key["bantime.".len()..], arg(args, 0)?)?;
+                state.sync_python_ban_times();
                 key
             }
             _ => {

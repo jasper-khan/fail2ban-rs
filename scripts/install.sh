@@ -16,6 +16,18 @@ backup_manifest_tmp="$state_dir/backup-manifest.tmp"
 stock_fakegooglebot_sha="0069a4f1828849673a23841e5b796bfd88e2fcdf1f4f5854f9723e7f3989f9da"
 config="$root/etc/fail2ban"
 man="$root/usr/local/share/man"
+backup_targets=(
+    usr/local/bin/fail2ban-server
+    usr/local/bin/fail2ban-client
+    usr/local/bin/fail2ban-regex
+    usr/local/lib/systemd/system/fail2ban.service
+    usr/local/lib/systemd/system/fail2ban.socket
+    usr/local/share/man/man1/fail2ban.1
+    usr/local/share/man/man1/fail2ban-server.1
+    usr/local/share/man/man1/fail2ban-client.1
+    usr/local/share/man/man1/fail2ban-regex.1
+    usr/local/share/man/man5/jail.conf.5
+)
 
 case "${1:-}" in
     -h|--help)
@@ -111,8 +123,8 @@ restore_backed_up_files() {
 }
 
 cleanup_backup_files() {
+    local rel
     if [[ -f "$backup_manifest" ]]; then
-        local rel
         while IFS= read -r rel; do
             [[ -n "$rel" ]] || continue
             case "/$rel/" in */../*) continue ;; esac
@@ -121,6 +133,9 @@ cleanup_backup_files() {
         done < "$backup_manifest"
         rm -f -- "$backup_manifest"
     fi
+    for rel in "${backup_targets[@]}" etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot; do
+        rm -f -- "$backup_dir/$rel"
+    done
     local dir
     for dir in \
         "$backup_dir/etc/fail2ban/filter.d/ignorecommands" \
@@ -144,6 +159,15 @@ cleanup_backup_files() {
 }
 
 if [[ "${1:-}" == --uninstall ]]; then
+    if [[ ! -f "$backup_manifest" && ! -f "$python_library" ]]; then
+        # No published backup manifest and no installed python.zip means either
+        # fail2ban-rs was never installed or a first install stopped before its
+        # first overwrite; clean partial staging state without deleting originals.
+        cleanup_backup_files
+        rm -f -- "$backup_manifest_tmp" "$unit_state_tmp" "$unit_state"
+        rmdir -- "$state_dir" 2>/dev/null || true
+        exit 0
+    fi
     has_saved_state=0
     saved_service_enabled=""
     saved_socket_enabled=""
@@ -258,20 +282,10 @@ if [[ -z "$root" && ! -f "$unit_state" ]]; then
     mv -f -- "$unit_state_tmp" "$unit_state"
 fi
 if [[ ! -f "$backup_manifest" && ! -f "$python_library" ]]; then
+    cleanup_backup_files
     install -d -m 0755 "$state_dir"
     : > "$backup_manifest_tmp"
-    for rel in \
-        usr/local/bin/fail2ban-server \
-        usr/local/bin/fail2ban-client \
-        usr/local/bin/fail2ban-regex \
-        usr/local/lib/systemd/system/fail2ban.service \
-        usr/local/lib/systemd/system/fail2ban.socket \
-        usr/local/share/man/man1/fail2ban.1 \
-        usr/local/share/man/man1/fail2ban-server.1 \
-        usr/local/share/man/man1/fail2ban-client.1 \
-        usr/local/share/man/man1/fail2ban-regex.1 \
-        usr/local/share/man/man5/jail.conf.5
-    do
+    for rel in "${backup_targets[@]}"; do
         backup_existing_path "$rel" "$backup_manifest_tmp"
     done
     if grep -Fxq "$name/config/filter.d/ignorecommands/apache-fakegooglebot" "$work/members" &&

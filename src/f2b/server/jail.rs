@@ -404,7 +404,7 @@ impl JailState {
     ) -> Result<()> {
         let init_str = init_json.unwrap_or("{}");
         let ban_time = self.ban_manager.ban_time();
-        let db_filename = self.db_filename();
+        let max_ban_time = self.ban_extra.max_ban_time(ban_time);
         if let Some(pos) = self.actions.iter().position(|(n, _)| n == act_name) {
             if !self.reloading {
                 return Err(Error::invalid_command(format!(
@@ -432,7 +432,8 @@ impl JailState {
                 python_path,
                 init_str,
                 ban_time,
-                db_filename.as_deref(),
+                max_ban_time,
+                self.db.clone(),
             )
             .await?;
             let old = std::mem::replace(&mut self.actions[pos].1, replacement);
@@ -446,7 +447,8 @@ impl JailState {
             python_path,
             init_str,
             ban_time,
-            db_filename.as_deref(),
+            max_ban_time,
+            self.db.clone(),
         )
         .await?;
         self.actions.push((act_name.to_owned(), action));
@@ -454,6 +456,16 @@ impl JailState {
             self.reload_added_actions.push(act_name.to_owned());
         }
         Ok(())
+    }
+
+    pub fn sync_python_ban_times(&mut self) {
+        let ban_time = self.ban_manager.ban_time();
+        let max_ban_time = self.ban_extra.max_ban_time(ban_time);
+        for (_, act) in &mut self.actions {
+            if let ActionKind::Python(py) = act {
+                py.set_ban_times(ban_time, max_ban_time);
+            }
+        }
     }
 
     /// Remove an action by name (`delaction`).
@@ -540,8 +552,6 @@ impl JailState {
                     *act = ActionKind::Command(orig.clone());
                 } else if let Some(orig) = snap.smtp_actions.get(name) {
                     *act = ActionKind::Smtp(orig.clone());
-                } else if let ActionKind::Python(py) = act {
-                    py.set_ban_time(snap.ban_time);
                 }
             }
             self.idle = snap.was_idle;
@@ -553,6 +563,7 @@ impl JailState {
             self.fail_manager.set_max_matches(snap.fail_max_matches);
             self.ban_manager.set_ban_time(snap.ban_time);
             self.ban_extra = snap.ban_extra;
+            self.sync_python_ban_times();
             self.file_checkpoints = snap.file_checkpoints;
             self.dirty_file_checkpoints = snap.dirty_file_checkpoints;
         } else {
@@ -609,32 +620,7 @@ impl JailState {
             self.replaced_actions.clear();
 
             if !delacts.is_empty() && self.alive {
-                let mut flushed_actions: BTreeSet<String> = BTreeSet::new();
-                for (act_name, act) in &mut delacts {
-                    if act.supports_flush() {
-                        f2b_log!(
-                            LogLevel::Notice,
-                            "fail2ban.actions",
-                            "[{}] Flush ticket(s) with {}",
-                            self.name,
-                            act_name
-                        );
-                        match act.flush().await {
-                            Ok(true) => {
-                                flushed_actions.insert(act_name.clone());
-                            }
-                            Ok(false) => {}
-                            Err(err) => {
-                                f2b_log!(
-                                    LogLevel::Error,
-                                    "fail2ban.actions",
-                                    "Failed to flush bans in jail '{}' action '{act_name}': {err}",
-                                    self.name
-                                );
-                            }
-                        }
-                    }
-                }
+                let skip_unban = flush_actions_or_check(&self.name, &mut delacts, true).await;
                 let active_tickets: Vec<Ticket> = self
                     .ban_manager
                     .get_ban_list(false)
@@ -644,7 +630,7 @@ impl JailState {
                 for ticket in &active_tickets {
                     let ctx = self.build_action_context(ticket, false);
                     for (act_name, act) in &mut delacts {
-                        if flushed_actions.contains(act_name) {
+                        if skip_unban.contains(act_name) {
                             continue;
                         }
                         if let Err(err) = act.unban(&ctx).await {
@@ -1018,12 +1004,14 @@ impl JailState {
                         self.unban_ticket_actions(&ticket, true).await;
                         cnt += 1;
                     } else {
-                        let matched = self.ban_manager.remove_matching(&target);
+                        let matched = self.ban_manager.matching_ids(&target);
                         if !matched.is_empty() {
-                            for ticket in matched {
-                                self.db_del_ban(Some(&ticket.fid))?;
-                                self.unban_ticket_actions(&ticket, true).await;
-                                cnt += 1;
+                            for id in matched {
+                                self.db_del_ban(Some(&id))?;
+                                if let Some(ticket) = self.ban_manager.remove_by_id(&id) {
+                                    self.unban_ticket_actions(&ticket, true).await;
+                                    cnt += 1;
+                                }
                             }
                         } else {
                             f2b_log!(
@@ -1240,31 +1228,9 @@ impl JailState {
 
     async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> Result<usize> {
         let tickets = self.ban_manager.flush_ban_list();
-        let mut flushed_actions: BTreeSet<String> = BTreeSet::new();
-        for (act_name, act) in &mut self.actions {
-            if act.supports_flush() {
-                f2b_log!(
-                    LogLevel::Notice,
-                    "fail2ban.actions",
-                    "[{}] Flush ticket(s) with {}",
-                    self.name,
-                    act_name
-                );
-                match act.flush().await {
-                    Ok(true) => {
-                        flushed_actions.insert(act_name.clone());
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        f2b_log!(
-                            LogLevel::Error,
-                            "fail2ban.actions",
-                            "Failed to flush bans in jail '{}' action '{act_name}': {err}",
-                            self.name
-                        );
-                    }
-                }
-            }
+        let skip_unban = flush_actions_or_check(&self.name, &mut self.actions, on_stop).await;
+        for (_, act) in &self.actions {
+            self.ban_epoch = self.ban_epoch.max(act.ban_epoch());
         }
         // Match upstream Actions.__flushBan: clear jail database history and propagate DB errors.
         if clear_db {
@@ -1283,7 +1249,7 @@ impl JailState {
             );
             let ctx = self.build_action_context(&ticket, false);
             for (act_name, act) in &mut self.actions {
-                if flushed_actions.contains(act_name) {
+                if skip_unban.contains(act_name) {
                     continue;
                 }
                 if let Err(err) = act.unban(&ctx).await {
@@ -1579,12 +1545,6 @@ impl JailState {
         }
     }
 
-    fn db_filename(&self) -> Option<String> {
-        let db_arc = self.db.as_ref()?;
-        let guard = db_arc.lock().ok()?;
-        Some(guard.filename().to_owned())
-    }
-
     fn db_del_ban(&self, id: Option<&TicketId>) -> Result<()> {
         if let Some(ref db_arc) = self.db {
             let guard = db_arc
@@ -1634,13 +1594,64 @@ impl JailState {
     }
 }
 
+/// Run `flush()` across `actions` following upstream `Actions.__flushBan` (`actions.py:652-676`),
+/// invoking `consistencyCheck` on flush errors when available and returning the names of actions
+/// excluded from per-ticket `unban()` fallback.
+async fn flush_actions_or_check(
+    jail_name: &str,
+    actions: &mut [(String, ActionKind)],
+    on_stop: bool,
+) -> BTreeSet<String> {
+    let mut skip_unban = BTreeSet::new();
+    for (act_name, act) in actions {
+        if !act.supports_flush() {
+            continue;
+        }
+        f2b_log!(
+            LogLevel::Notice,
+            "fail2ban.actions",
+            "[{jail_name}] Flush ticket(s) with {act_name}"
+        );
+        match act.flush().await {
+            Ok(true) => {
+                skip_unban.insert(act_name.clone());
+            }
+            Ok(false) => {}
+            Err(err) => {
+                f2b_log!(
+                    LogLevel::Error,
+                    "fail2ban.actions",
+                    "Failed to flush bans in jail '{jail_name}' action '{act_name}': {err}"
+                );
+                f2b_log!(
+                    LogLevel::Info,
+                    "fail2ban.actions",
+                    "No flush occurred, do consistency check"
+                );
+                if act.has_consistency_check() {
+                    if let Err(chk_err) = act.consistency_check_on_flush(on_stop).await {
+                        f2b_log!(
+                            LogLevel::Error,
+                            "fail2ban.actions",
+                            "Consistency check error for jail '{jail_name}' action '{act_name}': {chk_err}"
+                        );
+                    }
+                    skip_unban.insert(act_name.clone());
+                }
+            }
+        }
+    }
+    skip_unban
+}
+
 async fn build_action(
     jail_name: &str,
     act_name: &str,
     python_path: Option<&str>,
     init_json: &str,
     ban_time: i64,
-    db_filename: Option<&str>,
+    max_ban_time: i64,
+    db: Option<Arc<std::sync::Mutex<Fail2BanDb>>>,
 ) -> Result<ActionKind> {
     match python_path {
         Some(path) => {
@@ -1650,7 +1661,8 @@ async fn build_action(
                 path,
                 init_json,
                 ban_time,
-                db_filename,
+                max_ban_time,
+                db,
             )
             .await
         }
