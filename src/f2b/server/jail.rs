@@ -168,10 +168,10 @@ pub struct JailState {
     last_journal_db_sync: f64,
     journalctl_bin: String,
     backend_error: Arc<std::sync::Mutex<Option<String>>>,
-    pending_unban_actions: BTreeMap<TicketId, BTreeSet<String>>,
     reloading: bool,
     reload_logs: Option<BTreeSet<PathBuf>>,
-    reload_actions: Option<BTreeMap<String, (Option<String>, bool)>>,
+    reload_actions: Option<Vec<(String, Option<String>)>>,
+    reload_added_actions: Vec<String>,
     replaced_actions: Vec<(String, ActionKind)>,
     reload_snapshot: Option<ReloadSnapshot>,
 }
@@ -253,10 +253,10 @@ impl JailState {
             last_journal_db_sync: 0.0,
             journalctl_bin: "journalctl".to_owned(),
             backend_error: Arc::new(std::sync::Mutex::new(None)),
-            pending_unban_actions: BTreeMap::new(),
             reloading: false,
             reload_logs: None,
             reload_actions: None,
+            reload_added_actions: Vec::new(),
             replaced_actions: Vec::new(),
             reload_snapshot: None,
         })
@@ -395,7 +395,7 @@ impl JailState {
         Ok(())
     }
 
-    /// Add or reload an action.
+    /// Add or reload an action, matching upstream `Actions.add` (`fail2ban/server/actions.py:131-150`).
     pub async fn add_action(
         &mut self,
         act_name: &str,
@@ -404,54 +404,54 @@ impl JailState {
     ) -> Result<()> {
         let init_str = init_json.unwrap_or("{}");
         let ban_time = self.ban_manager.ban_time();
+        let db_filename = self.db_filename();
         if let Some(pos) = self.actions.iter().position(|(n, _)| n == act_name) {
             if !self.reloading {
                 return Err(Error::invalid_command(format!(
                     "Action {act_name} already exists"
                 )));
             }
-            let same_kind = match (&self.actions[pos].1, python_path) {
-                (ActionKind::Command(_), None) => true,
-                (ActionKind::Smtp(_), Some(path)) => {
-                    crate::action::SmtpAction::is_stock_module(path)
+            if self.actions[pos].1.has_reload() {
+                if self.actions[pos].1.has_clear_all_params() {
+                    self.actions[pos].1.clear_all_params().await?;
+                    if let Some(ref mut reload_acts) = self.reload_actions {
+                        if let Some((_, existing_opts)) =
+                            reload_acts.iter_mut().find(|(n, _)| n == act_name)
+                        {
+                            *existing_opts = init_json.map(str::to_owned);
+                        } else {
+                            reload_acts.push((act_name.to_owned(), init_json.map(str::to_owned)));
+                        }
+                    }
                 }
-                (ActionKind::Python(action), Some(path)) => {
-                    action.can_in_place_reload(path, init_str)
-                }
-                _ => false,
-            };
-            if same_kind {
-                self.actions[pos].1.clear_all_params().await?;
-                if let ActionKind::Smtp(ref mut smtp) = self.actions[pos].1
-                    && let Some(raw) = init_json
-                {
-                    *smtp = crate::action::SmtpAction::from_json(
-                        self.name.clone(),
-                        act_name.to_owned(),
-                        raw,
-                    )?;
-                }
-            } else {
-                let replacement =
-                    build_action(&self.name, act_name, python_path, init_str, ban_time).await?;
-                let old = std::mem::replace(&mut self.actions[pos].1, replacement);
-                self.replaced_actions.push((act_name.to_owned(), old));
+                return Ok(());
             }
-            if let Some(ref mut kept) = self.reload_actions {
-                kept.insert(
-                    act_name.to_owned(),
-                    (init_json.map(str::to_owned), !same_kind),
-                );
-            }
+            let replacement = build_action(
+                &self.name,
+                act_name,
+                python_path,
+                init_str,
+                ban_time,
+                db_filename.as_deref(),
+            )
+            .await?;
+            let old = std::mem::replace(&mut self.actions[pos].1, replacement);
+            self.replaced_actions.push((act_name.to_owned(), old));
             return Ok(());
         }
 
-        let action = build_action(&self.name, act_name, python_path, init_str, ban_time).await?;
+        let action = build_action(
+            &self.name,
+            act_name,
+            python_path,
+            init_str,
+            ban_time,
+            db_filename.as_deref(),
+        )
+        .await?;
         self.actions.push((act_name.to_owned(), action));
-        if self.reloading
-            && let Some(ref mut kept) = self.reload_actions
-        {
-            kept.insert(act_name.to_owned(), (init_json.map(str::to_owned), true));
+        if self.reloading {
+            self.reload_added_actions.push(act_name.to_owned());
         }
         Ok(())
     }
@@ -464,9 +464,6 @@ impl JailState {
             )));
         };
         self.actions.remove(pos);
-        for pending in self.pending_unban_actions.values_mut() {
-            pending.remove(act_name);
-        }
         Ok(())
     }
 
@@ -518,21 +515,18 @@ impl JailState {
         let existing_logs: BTreeSet<PathBuf> =
             self.log_paths.iter().map(|(p, _)| p.clone()).collect();
         self.reload_logs = Some(existing_logs);
-        self.reload_actions = Some(BTreeMap::new());
+        self.reload_actions = Some(Vec::new());
+        self.reload_added_actions.clear();
         self.replaced_actions.clear();
     }
 
-    /// Roll back an in-progress reload when the reload command stream or action handoff fails.
+    /// Roll back an in-progress reload when the reload command stream or action reload fails.
     pub fn reload_abort(&mut self) -> bool {
         self.reload_logs = None;
-        if let Some(kept) = self.reload_actions.take() {
-            for (name, (_, is_new)) in &kept {
-                if *is_new
-                    && !self.replaced_actions.iter().any(|(n, _)| n == name)
-                    && let Some(pos) = self.actions.iter().position(|(n, _)| n == name)
-                {
-                    self.actions.remove(pos);
-                }
+        self.reload_actions = None;
+        for name in self.reload_added_actions.drain(..).rev() {
+            if let Some(pos) = self.actions.iter().position(|(n, _)| n == &name) {
+                self.actions.remove(pos);
             }
         }
         for (name, old_act) in self.replaced_actions.drain(..).rev() {
@@ -568,8 +562,9 @@ impl JailState {
         self.idle
     }
 
-    /// Finalize reload phase: validate handoff, initialize new actions and replay active tickets,
-    /// reload retained actions, and retire obsolete logs & actions only after replacement succeeds.
+    /// Finalize reload phase matching upstream `Actions.reload(begin=False)`
+    /// (`fail2ban/server/actions.py:157-170`): reload retained actions, then flush/unban,
+    /// stop, and remove actions absent from `_reload_actions`, and retire obsolete logs.
     ///
     /// Returns `true` if the log backend configuration changed and needs restart.
     pub async fn reload_commit(&mut self) -> Result<bool> {
@@ -584,161 +579,93 @@ impl JailState {
             return Err(err);
         }
 
-        if let Some(kept_actions) = self.reload_actions.take() {
-            let active_tickets: Vec<Ticket> = self
-                .ban_manager
-                .get_ban_list(false)
-                .into_iter()
-                .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
-                .collect();
-
-            let ipv6_allowed = allow_ipv6();
-            let mut started_new: Vec<(usize, String, Vec<Ticket>)> = Vec::new();
-            let mut handoff_err: Option<Error> = None;
-
-            for idx in 0..self.actions.len() {
-                let act_name = self.actions[idx].0.clone();
-                let Some((options, is_new)) = kept_actions.get(&act_name).cloned() else {
-                    // Obsolete action: keep intact until all replacements start and replay cleanly.
-                    continue;
-                };
-                if is_new {
-                    if self.alive {
-                        // Enroll before calling start() so a partially started dual-stack action
-                        // stops its successful family half if another family fails to start.
-                        started_new.push((idx, act_name.clone(), Vec::new()));
-                        if let Err(err) = self.actions[idx].1.start(ipv6_allowed).await {
-                            if matches!(&self.actions[idx].1, ActionKind::Smtp(_)) {
-                                started_new.pop();
-                            }
-                            f2b_log!(
-                                LogLevel::Error,
-                                "fail2ban.actions",
-                                "Failed to start jail '{}' action '{act_name}': {err}",
-                                self.name
-                            );
-                            handoff_err = Some(err);
-                            break;
-                        }
-                        if !self.actions[idx].1.norestored() {
-                            for ticket in &active_tickets {
-                                let ctx = self.build_action_context(ticket, false);
-                                if let Err(err) = self.actions[idx].1.ban(&ctx).await {
-                                    f2b_log!(
-                                        LogLevel::Error,
-                                        "fail2ban.actions",
-                                        "Failed to replay ban {} on action '{act_name}' in '{}': {err}",
-                                        ticket.fid,
-                                        self.name
-                                    );
-                                    handoff_err = Some(err);
-                                    break;
-                                }
-                                if let Some((_, _, replayed)) = started_new.last_mut() {
-                                    replayed.push(ticket.clone());
-                                }
-                            }
-                            if handoff_err.is_some() {
-                                break;
-                            }
-                        }
-                    }
-                } else if let Err(err) = self.actions[idx].1.reload(options.as_deref()).await {
+        if let Some(reload_acts) = self.reload_actions.take() {
+            for (act_name, options) in &reload_acts {
+                if let Some(act) = self.get_action_mut(act_name)
+                    && let Err(err) = act.reload(options.as_deref()).await
+                {
                     f2b_log!(
                         LogLevel::Error,
                         "fail2ban.actions",
                         "Failed to reload jail '{}' action '{act_name}': {err}",
                         self.name
                     );
-                    handoff_err = Some(err);
-                    break;
+                    self.reload_abort();
+                    return Err(err);
                 }
             }
 
-            if let Some(err) = handoff_err {
-                // Roll back newly started replacements without touching existing working actions.
-                for (idx, _, replayed) in started_new.into_iter().rev() {
-                    for ticket in replayed.iter().rev() {
-                        let ctx = self.build_action_context(ticket, false);
-                        let _ = self.actions[idx].1.unban(&ctx).await;
-                    }
-                    let _ = self.actions[idx].1.stop().await;
-                }
-                self.reload_actions = Some(kept_actions);
-                self.reload_abort();
-                return Err(err);
-            }
-
-            let mut retired: Vec<(String, ActionKind)> = std::mem::take(&mut self.replaced_actions);
+            let kept_names: BTreeSet<&str> = reload_acts.iter().map(|(n, _)| n.as_str()).collect();
+            let mut delacts: Vec<(String, ActionKind)> = Vec::new();
             let mut idx = 0usize;
             while idx < self.actions.len() {
-                if kept_actions.contains_key(&self.actions[idx].0) {
+                if kept_names.contains(self.actions[idx].0.as_str()) {
                     idx += 1;
                 } else {
-                    retired.push(self.actions.remove(idx));
+                    delacts.push(self.actions.remove(idx));
                 }
             }
+            self.reload_added_actions.clear();
+            self.replaced_actions.clear();
 
-            for (act_name, mut act) in retired {
-                let to_unban: Vec<&Ticket> = active_tickets
-                    .iter()
-                    .filter(|t| {
-                        self.pending_unban_actions
-                            .get(&t.fid)
-                            .is_none_or(|needed| needed.contains(&act_name))
-                    })
-                    .collect();
-                for pending in self.pending_unban_actions.values_mut() {
-                    pending.remove(&act_name);
-                }
-                if !self.alive {
-                    continue;
-                }
-                if !to_unban.is_empty() {
-                    let mut flushed = false;
+            if !delacts.is_empty() && self.alive {
+                let mut flushed_actions: BTreeSet<String> = BTreeSet::new();
+                for (act_name, act) in &mut delacts {
                     if act.supports_flush() {
+                        f2b_log!(
+                            LogLevel::Notice,
+                            "fail2ban.actions",
+                            "[{}] Flush ticket(s) with {}",
+                            self.name,
+                            act_name
+                        );
                         match act.flush().await {
-                            Ok(ok) => flushed = ok,
+                            Ok(true) => {
+                                flushed_actions.insert(act_name.clone());
+                            }
+                            Ok(false) => {}
                             Err(err) => {
                                 f2b_log!(
                                     LogLevel::Error,
                                     "fail2ban.actions",
-                                    "Failed to flush removed action '{act_name}' in '{}': {err}",
+                                    "Failed to flush bans in jail '{}' action '{act_name}': {err}",
                                     self.name
                                 );
                             }
                         }
                     }
-                    if !flushed {
-                        for ticket in to_unban {
-                            let ctx = self.build_action_context(ticket, false);
-                            if let Err(err) = act.unban(&ctx).await {
-                                f2b_log!(
-                                    LogLevel::Error,
-                                    "fail2ban.actions",
-                                    "Failed to unban {} on removed action '{act_name}': {err}",
-                                    ticket.fid
-                                );
-                            }
+                }
+                let active_tickets: Vec<Ticket> = self
+                    .ban_manager
+                    .get_ban_list(false)
+                    .into_iter()
+                    .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
+                    .collect();
+                for ticket in &active_tickets {
+                    let ctx = self.build_action_context(ticket, false);
+                    for (act_name, act) in &mut delacts {
+                        if flushed_actions.contains(act_name) {
+                            continue;
+                        }
+                        if let Err(err) = act.unban(&ctx).await {
+                            f2b_log!(
+                                LogLevel::Error,
+                                "fail2ban.actions",
+                                "Failed to execute unban jail '{}' action '{act_name}' for {}: {err}",
+                                self.name,
+                                ticket.fid
+                            );
                         }
                     }
                 }
-                if let Err(err) = act.stop().await {
-                    f2b_log!(
-                        LogLevel::Error,
-                        "fail2ban.actions",
-                        "Failed to stop removed action '{act_name}' in '{}': {err}",
-                        self.name
-                    );
-                }
-            }
-
-            // Include every newly replayed action in subsequent partial-unban cleanup so
-            // retrying a per-IP unban never leaves a replacement action blocking the IP.
-            for (_, act_name, replayed) in started_new {
-                for ticket in replayed {
-                    if let Some(pending) = self.pending_unban_actions.get_mut(&ticket.fid) {
-                        pending.insert(act_name.clone());
+                for (act_name, mut act) in delacts.into_iter().rev() {
+                    if let Err(err) = act.stop().await {
+                        f2b_log!(
+                            LogLevel::Error,
+                            "fail2ban.actions",
+                            "Failed to stop jail '{}' action '{act_name}': {err}",
+                            self.name
+                        );
                     }
                 }
             }
@@ -856,9 +783,7 @@ impl JailState {
         let expired = self.ban_manager.unban(now);
         for ticket in expired {
             // Keep expired entries in SQLite `bips` (cleaned by `purge`) so `bantime.increment` sees prior bans.
-            if self.unban_ticket_actions(&ticket, true).await.is_err() {
-                self.ban_manager.retain_for_retry(ticket);
-            }
+            self.unban_ticket_actions(&ticket, true).await;
         }
         self.fail_manager.cleanup(now);
         self.flush_file_checkpoints_to_db();
@@ -903,7 +828,6 @@ impl JailState {
         let outcome = self.ban_manager.add_ban_ticket(ticket.clone(), now);
         match outcome {
             AddBanOutcome::Added => {
-                self.pending_unban_actions.remove(&ticket.fid);
                 let stored = self
                     .ban_manager
                     .get_ticket_by_id(&ticket.fid)
@@ -1031,7 +955,6 @@ impl JailState {
                 .ban_manager
                 .get_ban_list(false)
                 .into_iter()
-                .filter(|id| !self.pending_unban_actions.contains_key(id))
                 .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
                 .collect();
             let mut max_epoch = self.ban_epoch;
@@ -1079,39 +1002,30 @@ impl JailState {
         Ok((self.ban_manager.total_bans().saturating_sub(before)) as usize)
     }
 
-    /// Manually unban specific IPs (or flush all if `ips` is `None`).
+    /// Manually unban specific IPs (or flush all if `ips` is `None`), matching upstream
+    /// `Actions.removeBannedIP` (`fail2ban/server/actions.py:245-300`).
     pub async fn unban_ip(&mut self, ips: Option<&[String]>, ifexists: bool) -> Result<usize> {
         match ips {
-            None => Ok(self.flush_bans(true, false).await),
+            None => self.flush_bans(true, false).await,
             Some(targets) => {
                 let mut cnt = 0usize;
                 let mut missed = Vec::new();
                 for raw in targets {
                     let target = TicketId::parse(raw);
+                    // Always delete ip from database (also if currently not banned), propagating DB errors.
+                    self.db_del_ban(Some(&target))?;
                     if let Some(ticket) = self.ban_manager.remove_by_id(&target) {
-                        if let Err(err) = self.unban_ticket_actions(&ticket, true).await {
-                            self.ban_manager.retain_for_retry(ticket);
-                            return Err(err);
-                        }
-                        self.db_del_ban(Some(&target));
+                        self.unban_ticket_actions(&ticket, true).await;
                         cnt += 1;
                     } else {
                         let matched = self.ban_manager.remove_matching(&target);
                         if !matched.is_empty() {
-                            let mut iter = matched.into_iter();
-                            while let Some(ticket) = iter.next() {
-                                if let Err(err) = self.unban_ticket_actions(&ticket, true).await {
-                                    self.ban_manager.retain_for_retry(ticket);
-                                    for rest in iter {
-                                        self.ban_manager.retain_for_retry(rest);
-                                    }
-                                    return Err(err);
-                                }
-                                self.db_del_ban(Some(&ticket.fid));
+                            for ticket in matched {
+                                self.db_del_ban(Some(&ticket.fid))?;
+                                self.unban_ticket_actions(&ticket, true).await;
                                 cnt += 1;
                             }
                         } else {
-                            self.db_del_ban(Some(&target));
                             f2b_log!(
                                 LogLevel::Notice,
                                 "fail2ban.actions",
@@ -1324,7 +1238,7 @@ impl JailState {
         ])
     }
 
-    async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> usize {
+    async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> Result<usize> {
         let tickets = self.ban_manager.flush_ban_list();
         let mut flushed_actions: BTreeSet<String> = BTreeSet::new();
         for (act_name, act) in &mut self.actions {
@@ -1352,9 +1266,9 @@ impl JailState {
                 }
             }
         }
-        // Match upstream Actions.__flushBan: clear jail database history unconditionally on bulk unban.
+        // Match upstream Actions.__flushBan: clear jail database history and propagate DB errors.
         if clear_db {
-            self.db_del_ban(None);
+            self.db_del_ban(None)?;
         }
         let log_prefix = if on_stop { "Repeal Ban" } else { "Unban" };
         let mut unbanned = 0usize;
@@ -1368,14 +1282,8 @@ impl JailState {
                 ticket.fid
             );
             let ctx = self.build_action_context(&ticket, false);
-            let only_actions = self.pending_unban_actions.remove(&ticket.fid);
-            for (act_name, act) in self.actions.iter_mut().rev() {
+            for (act_name, act) in &mut self.actions {
                 if flushed_actions.contains(act_name) {
-                    continue;
-                }
-                if let Some(ref needed) = only_actions
-                    && !needed.contains(act_name)
-                {
                     continue;
                 }
                 if let Err(err) = act.unban(&ctx).await {
@@ -1390,11 +1298,10 @@ impl JailState {
             }
             unbanned += 1;
         }
-        self.pending_unban_actions.clear();
-        unbanned
+        Ok(unbanned)
     }
 
-    async fn unban_ticket_actions(&mut self, ticket: &Ticket, log_notice: bool) -> Result<()> {
+    async fn unban_ticket_actions(&mut self, ticket: &Ticket, log_notice: bool) {
         if log_notice {
             f2b_log!(
                 LogLevel::Notice,
@@ -1405,15 +1312,7 @@ impl JailState {
             );
         }
         let ctx = self.build_action_context(ticket, false);
-        let only_actions = self.pending_unban_actions.get(&ticket.fid).cloned();
-        let mut failed_actions: BTreeSet<String> = BTreeSet::new();
-        let mut first_err: Option<Error> = None;
-        for (act_name, act) in self.actions.iter_mut().rev() {
-            if let Some(ref needed) = only_actions
-                && !needed.contains(act_name)
-            {
-                continue;
-            }
+        for (act_name, act) in &mut self.actions {
             if let Err(err) = act.unban(&ctx).await {
                 f2b_log!(
                     LogLevel::Error,
@@ -1422,24 +1321,7 @@ impl JailState {
                     self.name,
                     ticket.fid
                 );
-                failed_actions.insert(act_name.clone());
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
             }
-        }
-        if failed_actions.is_empty() {
-            self.pending_unban_actions.remove(&ticket.fid);
-            Ok(())
-        } else {
-            self.pending_unban_actions
-                .insert(ticket.fid.clone(), failed_actions);
-            Err(first_err.unwrap_or_else(|| {
-                Error::action(format!(
-                    "Failed to unban {} in jail '{}'",
-                    ticket.fid, self.name
-                ))
-            }))
         }
     }
 
@@ -1697,18 +1579,28 @@ impl JailState {
         }
     }
 
-    fn db_del_ban(&self, id: Option<&TicketId>) {
-        if let Some(ref db_arc) = self.db
-            && let Ok(guard) = db_arc.lock()
-            && let Err(err) = guard.del_ban(&self.name, id)
-        {
-            f2b_log!(
-                LogLevel::Error,
-                "fail2ban.jail",
-                "Failed to delete active ban in '{}' from database: {err}",
-                self.name
-            );
+    fn db_filename(&self) -> Option<String> {
+        let db_arc = self.db.as_ref()?;
+        let guard = db_arc.lock().ok()?;
+        Some(guard.filename().to_owned())
+    }
+
+    fn db_del_ban(&self, id: Option<&TicketId>) -> Result<()> {
+        if let Some(ref db_arc) = self.db {
+            let guard = db_arc
+                .lock()
+                .map_err(|_| Error::database("database lock poisoned"))?;
+            if let Err(err) = guard.del_ban(&self.name, id) {
+                f2b_log!(
+                    LogLevel::Error,
+                    "fail2ban.jail",
+                    "Failed to delete active ban in '{}' from database: {err}",
+                    self.name
+                );
+                return Err(err);
+            }
         }
+        Ok(())
     }
 
     fn db_failure_found_boost(&self, ticket: &mut Ticket) -> u64 {
@@ -1748,10 +1640,19 @@ async fn build_action(
     python_path: Option<&str>,
     init_json: &str,
     ban_time: i64,
+    db_filename: Option<&str>,
 ) -> Result<ActionKind> {
     match python_path {
         Some(path) => {
-            ActionKind::from_python_spec(jail_name, act_name, path, init_json, ban_time).await
+            ActionKind::from_python_spec(
+                jail_name,
+                act_name,
+                path,
+                init_json,
+                ban_time,
+                db_filename,
+            )
+            .await
         }
         None => Ok(ActionKind::command(
             jail_name.to_owned(),

@@ -118,6 +118,13 @@ for line in sys.stdin:
         bantime = request["bantime"]
         if request["operation"] == "load":
             jail.name = request["jail"]
+            db_filename = request.get("database")
+            # shortcut: exposes database.filename only; forward DB queries if a Python action needs them
+            jail.database = (
+                SimpleNamespace(filename=db_filename)
+                if db_filename is not None
+                else None
+            )
             action = load_action(request)
             value = None
         else:

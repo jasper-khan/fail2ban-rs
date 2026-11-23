@@ -17,8 +17,6 @@ use crate::ticket::{ActionContext, TicketId};
 pub struct PythonAction {
     name: String,
     jail_name: String,
-    path: PathBuf,
-    init_options: JsonValue,
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
@@ -38,6 +36,7 @@ impl PythonAction {
         path: &str,
         options: &str,
         ban_time: i64,
+        db_filename: Option<&str>,
     ) -> Result<Self> {
         let options = parse_options(options)?;
         let library = std::env::current_exe()
@@ -79,8 +78,6 @@ impl PythonAction {
         let mut action = Self {
             name: name.to_owned(),
             jail_name: jail.to_owned(),
-            path: PathBuf::from(path),
-            init_options: options.clone(),
             child,
             stdin,
             stdout,
@@ -98,7 +95,8 @@ impl PythonAction {
                 "jail": jail,
                 "name": name,
                 "path": path,
-                "options": options
+                "options": options,
+                "database": db_filename
             }))
             .await?;
         Ok(action)
@@ -116,21 +114,8 @@ impl PythonAction {
         self.ban_time = ban_time;
     }
 
-    pub(crate) fn can_in_place_reload(&self, path: &str, init_options: &str) -> bool {
-        if self.path != Path::new(path) {
-            return false;
-        }
-        if self.reloadable {
-            return true;
-        }
-        parse_options(init_options).is_ok_and(|opts| opts == self.init_options)
-    }
-
     pub(crate) async fn method(&mut self, key: &str, options: Option<&str>) -> Result<PickleValue> {
         let parsed = parse_options(options.unwrap_or("{}"))?;
-        if key == "reload" && options.is_some() {
-            self.init_options = parsed.clone();
-        }
         self.request(json!({
             "operation": "method",
             "key": key,

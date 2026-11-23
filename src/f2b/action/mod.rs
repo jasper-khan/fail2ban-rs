@@ -46,13 +46,14 @@ impl ActionKind {
         path: &str,
         init_json: &str,
         ban_time: i64,
+        db_filename: Option<&str>,
     ) -> Result<ActionKind> {
         if SmtpAction::is_stock_module(path) {
             let smtp = SmtpAction::from_json(jail_name.to_owned(), act_name.to_owned(), init_json)?;
             return Ok(Self::Smtp(smtp));
         }
         Ok(Self::Python(
-            PythonAction::load(jail_name, act_name, path, init_json, ban_time).await?,
+            PythonAction::load(jail_name, act_name, path, init_json, ban_time, db_filename).await?,
         ))
     }
 
@@ -120,6 +121,22 @@ impl ActionKind {
             Self::Command(a) => a.supports_flush(),
             Self::Smtp(_) => false,
             Self::Python(a) => a.flushable,
+        }
+    }
+
+    pub fn has_reload(&self) -> bool {
+        match self {
+            Self::Command(_) => true,
+            Self::Smtp(_) => false,
+            Self::Python(a) => a.reloadable,
+        }
+    }
+
+    pub fn has_clear_all_params(&self) -> bool {
+        match self {
+            Self::Command(_) => true,
+            Self::Smtp(_) => false,
+            Self::Python(a) => a.has_clear_all_params,
         }
     }
 
@@ -263,6 +280,7 @@ mod tests {
             stock.to_str().unwrap(),
             r#"{"dest":"ops@example.com","matches":"matches"}"#,
             600,
+            None,
         )
         .await
         .unwrap();
@@ -288,6 +306,7 @@ mod tests {
             other_smtp.to_str().unwrap(),
             r#"{"opt1":"world"}"#,
             600,
+            None,
         )
         .await
         .unwrap();
@@ -308,15 +327,29 @@ mod tests {
         // Invalid Python action modules must fail with clear upstream errors.
         let no_action = reference.join("fail2ban/tests/files/action.d/action_noAction.py");
         assert!(
-            ActionKind::from_python_spec("sshd", "bad1", no_action.to_str().unwrap(), "{}", 600)
-                .await
-                .is_err()
+            ActionKind::from_python_spec(
+                "sshd",
+                "bad1",
+                no_action.to_str().unwrap(),
+                "{}",
+                600,
+                None
+            )
+            .await
+            .is_err()
         );
         let no_method = reference.join("fail2ban/tests/files/action.d/action_nomethod.py");
         assert!(
-            ActionKind::from_python_spec("sshd", "bad2", no_method.to_str().unwrap(), "{}", 600)
-                .await
-                .is_err()
+            ActionKind::from_python_spec(
+                "sshd",
+                "bad2",
+                no_method.to_str().unwrap(),
+                "{}",
+                600,
+                None
+            )
+            .await
+            .is_err()
         );
     }
 }

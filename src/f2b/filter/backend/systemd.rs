@@ -410,7 +410,17 @@ impl FilterSystemd {
                 return Ok(());
             }
 
-            let args = self.args();
+            // Catch up without --follow first when starting in non-operation mode so EOF marks
+            // the initial end of matching records (including an empty match), matching upstream
+            // FilterSystemd.run entering inOperationMode immediately on empty/drained initial reads.
+            let follow = in_operation;
+            let args = build_journalctl_args_inner(
+                &self.config,
+                self.since_epoch,
+                self.after_cursor.as_deref(),
+                self.tail,
+                follow,
+            );
             let mut child = match Command::new(&self.journalctl_bin)
                 .args(&args)
                 .stdout(Stdio::piped())
@@ -566,6 +576,24 @@ impl FilterSystemd {
             }
 
             let status = child.wait().await;
+            if !follow && status.as_ref().is_ok_and(|code| code.success()) {
+                self.set_health(None);
+                if let Some(cursor) = next_cursor {
+                    self.after_cursor = Some(cursor);
+                } else if self.after_cursor.is_none()
+                    && let Some(ts) = last_ts
+                {
+                    let next_since = ts + 0.000_001;
+                    self.since_epoch = Some(
+                        self.since_epoch
+                            .map_or(next_since, |prev| prev.max(next_since)),
+                    );
+                }
+                in_operation = true;
+                backoff = Duration::from_millis(100);
+                continue;
+            }
+
             let mut stderr_buf = Vec::new();
             if let Some(ref mut err_pipe) = stderr {
                 let _ = err_pipe.take(1024).read_to_end(&mut stderr_buf).await;
@@ -633,11 +661,21 @@ pub fn build_journalctl_args_with_cursor(
     after_cursor: Option<&str>,
     tail: bool,
 ) -> Vec<String> {
-    let mut args = vec![
-        "--output=json".to_owned(),
-        "--follow".to_owned(),
-        "--no-pager".to_owned(),
-    ];
+    build_journalctl_args_inner(cfg, since_epoch, after_cursor, tail, true)
+}
+
+fn build_journalctl_args_inner(
+    cfg: &JournalConfig,
+    since_epoch: Option<f64>,
+    after_cursor: Option<&str>,
+    tail: bool,
+    follow: bool,
+) -> Vec<String> {
+    let mut args = vec!["--output=json".to_owned()];
+    if follow {
+        args.push("--follow".to_owned());
+    }
+    args.push("--no-pager".to_owned());
 
     if let Some(cursor) = after_cursor {
         args.push(format!("--after-cursor={cursor}"));
@@ -673,6 +711,14 @@ fn append_journal_source_and_matches(args: &mut Vec<String>, cfg: &JournalConfig
             } else {
                 args.push(format!("--directory={}", path.display()));
             }
+        } else if let Some(flags) = resolved.flags
+            && (flags & SD_JOURNAL_RUNTIME_ONLY) != 0
+        {
+            // shortcut: journalctl has no --runtime flag; --directory=<runtime>/journal requires the dir to exist
+            args.push(format!(
+                "--directory={}",
+                system_runtime_logs_dir().join("journal").display()
+            ));
         }
 
         if let Some(flags) = resolved.flags {
@@ -970,6 +1016,49 @@ mod tests {
         let rot_args = build_journalctl_args(&rot_cfg, None, false);
         assert!(rot_args.contains(&format!("--directory={}", dir.path().display())));
         assert!(!rot_args.iter().any(|a| a.starts_with("--file=")));
+
+        // Runtime-only flag (bit 2) preserves runtime directory restriction when rotated=on
+        // and when active-file discovery falls back (or returns only runtime files).
+        let runtime_dir = system_runtime_logs_dir().join("journal");
+        let runtime_dir_arg = format!("--directory={}", runtime_dir.display());
+        let runtime_file_prefix = format!("--file={}", runtime_dir.display());
+
+        let mut rt_rot_params = BTreeMap::new();
+        rt_rot_params.insert("journalflags".to_owned(), "2".to_owned());
+        rt_rot_params.insert("rotated".to_owned(), "on".to_owned());
+        let rt_rot_cfg = parse_systemd_journal_options(&rt_rot_params, Vec::new())
+            .unwrap()
+            .config;
+        let rt_rot_args = build_journalctl_args(&rt_rot_cfg, None, false);
+        assert!(
+            rt_rot_args.contains(&runtime_dir_arg),
+            "journalflags=2,rotated=on must restrict to runtime dir: {rt_rot_args:?}"
+        );
+        assert!(!rt_rot_args.iter().any(|a| a.starts_with("--file=")));
+
+        let mut rt_sys_params = BTreeMap::new();
+        rt_sys_params.insert("journalflags".to_owned(), "6".to_owned());
+        rt_sys_params.insert("rotated".to_owned(), "on".to_owned());
+        let rt_sys_cfg = parse_systemd_journal_options(&rt_sys_params, Vec::new())
+            .unwrap()
+            .config;
+        let rt_sys_args = build_journalctl_args(&rt_sys_cfg, None, false);
+        assert!(rt_sys_args.contains(&runtime_dir_arg));
+        assert!(rt_sys_args.contains(&"--system".to_owned()));
+
+        let mut rt_def_params = BTreeMap::new();
+        rt_def_params.insert("journalflags".to_owned(), "2".to_owned());
+        let rt_def_cfg = parse_systemd_journal_options(&rt_def_params, Vec::new())
+            .unwrap()
+            .config;
+        let rt_def_args = build_journalctl_args(&rt_def_cfg, None, false);
+        assert!(
+            rt_def_args.contains(&runtime_dir_arg)
+                || rt_def_args
+                    .iter()
+                    .any(|a| a.starts_with(&runtime_file_prefix)),
+            "journalflags=2 must restrict to runtime journal source even on fallback: {rt_def_args:?}"
+        );
     }
 
     #[test]

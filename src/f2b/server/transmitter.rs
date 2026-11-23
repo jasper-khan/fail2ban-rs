@@ -473,23 +473,12 @@ impl Transmitter {
 
     async fn unban(&self, ips: Option<&[String]>) -> Result<usize> {
         let mut count = 0;
-        let mut first_err: Option<Error> = None;
         for name in &self.jail_order {
             if let Some(jail) = self.jails.get(name) {
-                match jail.state.lock().await.unban_ip(ips, true).await {
-                    Ok(n) => count += n,
-                    Err(err) => {
-                        if first_err.is_none() {
-                            first_err = Some(err);
-                        }
-                    }
-                }
+                count += jail.state.lock().await.unban_ip(ips, true).await?;
             }
         }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(count),
-        }
+        Ok(count)
     }
 
     async fn banned(&self, ips: &[String]) -> Result<Value> {

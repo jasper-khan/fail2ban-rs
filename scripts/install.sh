@@ -9,8 +9,11 @@ bin="$root/usr/local/bin"
 units="$root/usr/local/lib/systemd/system"
 python_library="$state_dir/python.zip"
 unit_state="$state_dir/systemd-state"
+unit_state_tmp="$state_dir/systemd-state.tmp"
 backup_dir="$state_dir/backup"
 backup_manifest="$state_dir/backup-manifest"
+backup_manifest_tmp="$state_dir/backup-manifest.tmp"
+stock_fakegooglebot_sha="0069a4f1828849673a23841e5b796bfd88e2fcdf1f4f5854f9723e7f3989f9da"
 config="$root/etc/fail2ban"
 man="$root/usr/local/share/man"
 
@@ -69,15 +72,22 @@ restore_unit_state() {
     esac
 }
 
+is_stock_fakegooglebot() {
+    local path="$1"
+    [[ ! -L "$path" && -f "$path" ]] &&
+        printf '%s  %s\n' "$stock_fakegooglebot_sha" "$path" | sha256sum --status -c -
+}
+
 backup_existing_path() {
     local rel="$1"
+    local manifest="$2"
     local src="$root/$rel"
     local dst="$backup_dir/$rel"
     if [[ -e "$src" || -L "$src" ]]; then
         mkdir -p -- "$(dirname -- "$dst")"
         rm -f -- "$dst"
         cp -a -- "$src" "$dst"
-        printf '%s\n' "$rel" >> "$backup_manifest"
+        printf '%s\n' "$rel" >> "$manifest"
     fi
 }
 
@@ -189,7 +199,7 @@ if [[ "${1:-}" == --uninstall ]]; then
         fi
     fi
     cleanup_backup_files
-    rm -f -- "$unit_state"
+    rm -f -- "$backup_manifest_tmp" "$unit_state_tmp" "$unit_state"
     rmdir -- "$state_dir" 2>/dev/null || true
     exit 0
 fi
@@ -216,6 +226,7 @@ cleanup() {
     rm -f -- "$work/checksum"
     rm -f -- "$work/members"
     rm -f -- "$work/member"
+    rm -f -- "$backup_manifest_tmp" "$unit_state_tmp"
     rmdir -- "$work"
 }
 trap cleanup EXIT
@@ -243,13 +254,12 @@ if [[ -z "$root" && ! -f "$unit_state" ]]; then
     svc_state=$(capture_unit_state fail2ban.service)
     sock_state=$(capture_unit_state fail2ban.socket)
     install -d -m 0755 "$state_dir"
-    printf 'fail2ban.service=%s\nfail2ban.socket=%s\n' "$svc_state" "$sock_state" > "$unit_state"
+    printf 'fail2ban.service=%s\nfail2ban.socket=%s\n' "$svc_state" "$sock_state" > "$unit_state_tmp"
+    mv -f -- "$unit_state_tmp" "$unit_state"
 fi
-take_backup=0
 if [[ ! -f "$backup_manifest" && ! -f "$python_library" ]]; then
-    take_backup=1
     install -d -m 0755 "$state_dir"
-    : > "$backup_manifest"
+    : > "$backup_manifest_tmp"
     for rel in \
         usr/local/bin/fail2ban-server \
         usr/local/bin/fail2ban-client \
@@ -262,8 +272,14 @@ if [[ ! -f "$backup_manifest" && ! -f "$python_library" ]]; then
         usr/local/share/man/man1/fail2ban-regex.1 \
         usr/local/share/man/man5/jail.conf.5
     do
-        backup_existing_path "$rel"
+        backup_existing_path "$rel" "$backup_manifest_tmp"
     done
+    if grep -Fxq "$name/config/filter.d/ignorecommands/apache-fakegooglebot" "$work/members" &&
+        is_stock_fakegooglebot "$config/filter.d/ignorecommands/apache-fakegooglebot"; then
+        backup_existing_path "etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot" "$backup_manifest_tmp"
+    fi
+    # Publish manifest only after every overwrite target is safely copied.
+    mv -f -- "$backup_manifest_tmp" "$backup_manifest"
 fi
 for binary in fail2ban-server fail2ban-client fail2ban-regex; do
     install_member "bin/$binary" 0755 "$bin/$binary"
@@ -289,11 +305,7 @@ while IFS= read -r member; do
             mode=0644
             if [[ "$relative" == filter.d/ignorecommands/apache-fakegooglebot ]]; then
                 mode=0755
-                if [[ -f "$dest" ]] && printf '%s  %s\n' \
-                    0069a4f1828849673a23841e5b796bfd88e2fcdf1f4f5854f9723e7f3989f9da "$dest" | sha256sum --status -c -; then
-                    if [[ "$take_backup" -eq 1 ]]; then
-                        backup_existing_path "etc/fail2ban/$relative"
-                    fi
+                if is_stock_fakegooglebot "$dest"; then
                     install_member "config/$relative" "$mode" "$dest"
                 fi
             fi
