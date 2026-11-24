@@ -619,29 +619,36 @@ impl JailState {
             self.reload_added_actions.clear();
             self.replaced_actions.clear();
 
+            let mut delact_flush_err = None;
             if !delacts.is_empty() && self.alive {
-                let skip_unban = flush_actions_or_check(&self.name, &mut delacts, true).await;
-                let active_tickets: Vec<Ticket> = self
-                    .ban_manager
-                    .get_ban_list(false)
-                    .into_iter()
-                    .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
-                    .collect();
-                for ticket in &active_tickets {
-                    let ctx = self.build_action_context(ticket, false);
-                    for (act_name, act) in &mut delacts {
-                        if skip_unban.contains(act_name) {
-                            continue;
+                match flush_actions_or_check(&self.name, &mut delacts, true).await {
+                    Ok(skip_unban) => {
+                        let active_tickets: Vec<Ticket> = self
+                            .ban_manager
+                            .get_ban_list(false)
+                            .into_iter()
+                            .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
+                            .collect();
+                        for ticket in &active_tickets {
+                            let ctx = self.build_action_context(ticket, false);
+                            for (act_name, act) in &mut delacts {
+                                if skip_unban.contains(act_name) {
+                                    continue;
+                                }
+                                if let Err(err) = act.unban(&ctx).await {
+                                    f2b_log!(
+                                        LogLevel::Error,
+                                        "fail2ban.actions",
+                                        "Failed to execute unban jail '{}' action '{act_name}' for {}: {err}",
+                                        self.name,
+                                        ticket.fid
+                                    );
+                                }
+                            }
                         }
-                        if let Err(err) = act.unban(&ctx).await {
-                            f2b_log!(
-                                LogLevel::Error,
-                                "fail2ban.actions",
-                                "Failed to execute unban jail '{}' action '{act_name}' for {}: {err}",
-                                self.name,
-                                ticket.fid
-                            );
-                        }
+                    }
+                    Err(err) => {
+                        delact_flush_err = Some(err);
                     }
                 }
                 for (act_name, mut act) in delacts.into_iter().rev() {
@@ -654,6 +661,16 @@ impl JailState {
                         );
                     }
                 }
+            }
+            if let Some(err) = delact_flush_err {
+                if let Some(obsolete_logs) = self.reload_logs.take() {
+                    for path in obsolete_logs {
+                        self.del_log_path(&path);
+                    }
+                }
+                self.reloading = false;
+                self.reload_snapshot = None;
+                return Err(err);
             }
         }
 
@@ -996,19 +1013,29 @@ impl JailState {
             Some(targets) => {
                 let mut cnt = 0usize;
                 let mut missed = Vec::new();
-                for raw in targets {
+                let mut removed_any = false;
+                let mut db_err = None;
+                'targets: for raw in targets {
                     let target = TicketId::parse(raw);
                     // Always delete ip from database (also if currently not banned), propagating DB errors.
-                    self.db_del_ban(Some(&target))?;
-                    if let Some(ticket) = self.ban_manager.remove_by_id(&target) {
+                    if let Err(err) = self.db_del_ban(Some(&target)) {
+                        db_err = Some(err);
+                        break 'targets;
+                    }
+                    if let Some(ticket) = self.ban_manager.remove_by_id_deferred(&target) {
+                        removed_any = true;
                         self.unban_ticket_actions(&ticket, true).await;
                         cnt += 1;
                     } else {
                         let matched = self.ban_manager.matching_ids(&target);
                         if !matched.is_empty() {
                             for id in matched {
-                                self.db_del_ban(Some(&id))?;
-                                if let Some(ticket) = self.ban_manager.remove_by_id(&id) {
+                                if let Err(err) = self.db_del_ban(Some(&id)) {
+                                    db_err = Some(err);
+                                    break 'targets;
+                                }
+                                if let Some(ticket) = self.ban_manager.remove_by_id_deferred(&id) {
+                                    removed_any = true;
                                     self.unban_ticket_actions(&ticket, true).await;
                                     cnt += 1;
                                 }
@@ -1024,6 +1051,12 @@ impl JailState {
                             }
                         }
                     }
+                }
+                if removed_any {
+                    self.ban_manager.recompute_next_unban();
+                }
+                if let Some(err) = db_err {
+                    return Err(err);
                 }
                 if !missed.is_empty() {
                     let rendered =
@@ -1227,15 +1260,17 @@ impl JailState {
     }
 
     async fn flush_bans(&mut self, clear_db: bool, on_stop: bool) -> Result<usize> {
-        let tickets = self.ban_manager.flush_ban_list();
-        let skip_unban = flush_actions_or_check(&self.name, &mut self.actions, on_stop).await;
+        let flush_res = flush_actions_or_check(&self.name, &mut self.actions, on_stop).await;
         for (_, act) in &self.actions {
             self.ban_epoch = self.ban_epoch.max(act.ban_epoch());
         }
-        // Match upstream Actions.__flushBan: clear jail database history and propagate DB errors.
+        let skip_unban = flush_res?;
+        // Match upstream Actions.__flushBan: clear jail database history after flush/check
+        // and before draining in-memory tickets or running per-ticket unbans so retries recover.
         if clear_db {
             self.db_del_ban(None)?;
         }
+        let tickets = self.ban_manager.flush_ban_list();
         let log_prefix = if on_stop { "Repeal Ban" } else { "Unban" };
         let mut unbanned = 0usize;
         for ticket in tickets {
@@ -1601,7 +1636,7 @@ async fn flush_actions_or_check(
     jail_name: &str,
     actions: &mut [(String, ActionKind)],
     on_stop: bool,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>> {
     let mut skip_unban = BTreeSet::new();
     for (act_name, act) in actions {
         if !act.supports_flush() {
@@ -1635,13 +1670,14 @@ async fn flush_actions_or_check(
                             "fail2ban.actions",
                             "Consistency check error for jail '{jail_name}' action '{act_name}': {chk_err}"
                         );
+                        return Err(chk_err);
                     }
                     skip_unban.insert(act_name.clone());
                 }
             }
         }
     }
-    skip_unban
+    Ok(skip_unban)
 }
 
 async fn build_action(

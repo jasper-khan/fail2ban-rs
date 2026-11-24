@@ -11,10 +11,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 
 use crate::error::{Error, Result};
-use crate::protocol::PickleValue;
 use crate::ticket::{Ticket, TicketId};
 
 /// Default purge age in seconds (24 hours), matching upstream Fail2Ban 1.1.1.
@@ -677,25 +678,74 @@ impl Fail2BanDb {
         Ok(del_bans + del_bips)
     }
 
+    /// Run a Python `:memory:` bridge transaction under the SQLite connection lock.
+    /// Commits iff `f` returns `true`; otherwise drops the transaction to roll back.
+    pub(crate) fn with_bridge_transaction<F>(&self, f: F) -> std::result::Result<(), String>
+    where
+        F: FnOnce(&Transaction<'_>) -> bool,
+    {
+        let mut conn = self.lock_conn().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if f(&tx) {
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn execute_bridge_sql(
         &self,
         sql: &str,
-        params: &[PickleValue],
+        params: &[serde_json::Value],
     ) -> std::result::Result<BridgeSqlResult, String> {
         let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        Self::execute_bridge_sql_on(&conn, sql, params)
+    }
+
+    pub(crate) fn execute_bridge_sql_on(
+        conn: &Connection,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> std::result::Result<BridgeSqlResult, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let bound: Vec<SqlValue> = params
-            .iter()
-            .map(|v| match v {
-                PickleValue::None => SqlValue::Null,
-                PickleValue::Bool(b) => SqlValue::Integer(i64::from(*b)),
-                PickleValue::Int(i) => SqlValue::Integer(*i),
-                PickleValue::Float(f) => SqlValue::Real(*f),
-                PickleValue::Str(s) => SqlValue::Text(s.clone()),
-                PickleValue::Bytes(b) => SqlValue::Blob(b.clone()),
-                other => SqlValue::Text(other.to_string_lossy()),
-            })
-            .collect();
+        let mut bound = Vec::with_capacity(params.len());
+        for v in params {
+            let sql_val = match v {
+                serde_json::Value::Null => SqlValue::Null,
+                serde_json::Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        SqlValue::Integer(i)
+                    } else if let Some(u) = n.as_u64() {
+                        i64::try_from(u)
+                            .map(SqlValue::Integer)
+                            .unwrap_or_else(|_| SqlValue::Real(u as f64))
+                    } else {
+                        SqlValue::Real(n.as_f64().unwrap_or(0.0))
+                    }
+                }
+                serde_json::Value::String(s) => SqlValue::Text(s.clone()),
+                serde_json::Value::Object(map)
+                    if map.len() == 1 && map.contains_key("__bytes__") =>
+                {
+                    let Some(serde_json::Value::Array(arr)) = map.get("__bytes__") else {
+                        return Err("invalid __bytes__ SQL parameter".to_owned());
+                    };
+                    let mut bytes = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let byte = item
+                            .as_u64()
+                            .and_then(|n| u8::try_from(n).ok())
+                            .ok_or_else(|| "invalid byte in __bytes__ SQL parameter".to_owned())?;
+                        bytes.push(byte);
+                    }
+                    SqlValue::Blob(bytes)
+                }
+                other => SqlValue::Text(other.to_string()),
+            };
+            bound.push(sql_val);
+        }
         let col_count = stmt.column_count();
         if col_count == 0 {
             let changed = stmt

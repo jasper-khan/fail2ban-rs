@@ -103,6 +103,20 @@ backup_existing_path() {
     fi
 }
 
+verify_backed_up_files() {
+    [[ -f "$backup_manifest" ]] || return 0
+    local rel src
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        case "/$rel/" in
+            */../*) die "Invalid backup manifest entry: $rel" ;;
+        esac
+        [[ "$rel" != /* ]] || die "Invalid backup manifest entry: $rel"
+        src="$backup_dir/$rel"
+        [[ -e "$src" || -L "$src" ]] || die "Missing backup file for rollback: $src"
+    done < "$backup_manifest"
+}
+
 restore_backed_up_files() {
     [[ -f "$backup_manifest" ]] || return 0
     local rel src dst
@@ -124,16 +138,20 @@ restore_backed_up_files() {
 
 cleanup_backup_files() {
     local rel
+    local -a manifest_entries=()
     if [[ -f "$backup_manifest" ]]; then
         while IFS= read -r rel; do
             [[ -n "$rel" ]] || continue
             case "/$rel/" in */../*) continue ;; esac
             [[ "$rel" != /* ]] || continue
-            rm -f -- "$backup_dir/$rel"
+            manifest_entries+=("$rel")
         done < "$backup_manifest"
+        # Retire the manifest before removing any backup copies so an interrupted
+        # cleanup retry never treats restored live originals as removable.
         rm -f -- "$backup_manifest"
     fi
-    for rel in "${backup_targets[@]}" etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot; do
+    rm -f -- "$backup_manifest_tmp"
+    for rel in ${manifest_entries[@]+"${manifest_entries[@]}"} "${backup_targets[@]}" etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot; do
         rm -f -- "$backup_dir/$rel"
     done
     local dir
@@ -164,10 +182,11 @@ if [[ "${1:-}" == --uninstall ]]; then
         # fail2ban-rs was never installed or a first install stopped before its
         # first overwrite; clean partial staging state without deleting originals.
         cleanup_backup_files
-        rm -f -- "$backup_manifest_tmp" "$unit_state_tmp" "$unit_state"
+        rm -f -- "$unit_state_tmp" "$unit_state"
         rmdir -- "$state_dir" 2>/dev/null || true
         exit 0
     fi
+    verify_backed_up_files
     has_saved_state=0
     saved_service_enabled=""
     saved_socket_enabled=""
@@ -223,7 +242,7 @@ if [[ "${1:-}" == --uninstall ]]; then
         fi
     fi
     cleanup_backup_files
-    rm -f -- "$backup_manifest_tmp" "$unit_state_tmp" "$unit_state"
+    rm -f -- "$unit_state_tmp" "$unit_state"
     rmdir -- "$state_dir" 2>/dev/null || true
     exit 0
 fi

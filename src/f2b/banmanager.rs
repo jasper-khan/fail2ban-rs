@@ -224,9 +224,15 @@ impl BanManager {
 
     /// Remove and return the active ban ticket for `id` if present.
     pub fn remove_by_id(&mut self, id: &TicketId) -> Option<Ticket> {
-        let removed = self.ban_list.remove(id).map(|e| e.ticket)?;
+        let removed = self.remove_by_id_deferred(id)?;
         self.recompute_next_unban();
         Some(removed)
+    }
+
+    /// Remove and return the active ban ticket for `id` without recomputing `next_unban_time`.
+    /// Callers using this in a batch must call [`Self::recompute_next_unban`] before returning.
+    pub fn remove_by_id_deferred(&mut self, id: &TicketId) -> Option<Ticket> {
+        self.ban_list.remove(id).map(|e| e.ticket)
     }
 
     /// Return all active ban IDs equal to or contained in `target` (supports CIDR/subnet)
@@ -247,7 +253,8 @@ impl BanManager {
         matches.into_iter().map(|(_, id)| id).collect()
     }
 
-    fn recompute_next_unban(&mut self) {
+    /// Recompute the earliest expiration timestamp across all active bans.
+    pub fn recompute_next_unban(&mut self) {
         self.next_unban_time = self
             .ban_list
             .values()
@@ -435,5 +442,34 @@ mod tests {
         let flushed = bm.flush_ban_list();
         assert_eq!(flushed.len(), 2);
         assert_eq!(bm.size(), 0);
+    }
+
+    #[test]
+    fn deferred_batch_remove_recomputes_next_unban_on_exit() {
+        let mut bm = BanManager::new();
+        bm.set_ban_time(100);
+        let early1 = id("192.0.2.1");
+        let early2 = id("192.0.2.2");
+        let later = id("198.51.100.9");
+
+        bm.add_ban_ticket(Ticket::new(early1.clone(), 10.0), 10.0); // ends at 110
+        bm.add_ban_ticket(Ticket::new(early2.clone(), 20.0), 20.0); // ends at 120
+        bm.add_ban_ticket(Ticket::new(later.clone(), 50.0), 50.0); // ends at 150
+
+        // Simulate partial batch removal (e.g. early1 removed, then batch aborts).
+        assert!(bm.remove_by_id_deferred(&early1).is_some());
+        bm.recompute_next_unban();
+        assert!(bm.unban(115.0).is_empty());
+        assert_eq!(bm.size(), 2);
+
+        // Remove early2 via deferred removal and recompute once on exit.
+        assert!(bm.remove_by_id_deferred(&early2).is_some());
+        bm.recompute_next_unban();
+        assert!(bm.unban(150.0).is_empty());
+        let expired = bm.unban(151.0);
+        assert_eq!(
+            expired.into_iter().map(|t| t.fid).collect::<Vec<_>>(),
+            vec![later]
+        );
     }
 }

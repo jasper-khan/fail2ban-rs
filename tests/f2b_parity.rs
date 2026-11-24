@@ -4658,3 +4658,694 @@ async fn round5_rollback_subnet_unban_py_db_and_flush_recovery_test() {
         );
     }
 }
+
+#[tokio::test]
+async fn round6_rollback_unban_cidr_and_py_db_tx_test() {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::mpsc as std_mpsc;
+    use std::time::{Duration, Instant};
+
+    use fail2ban_rs::db::Fail2BanDb;
+    use fail2ban_rs::protocol::PickleValue;
+    use fail2ban_rs::server::Transmitter;
+    use fail2ban_rs::server::jail::current_unix_seconds;
+
+    let s = |v: &str| PickleValue::Str(v.to_owned());
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Installer rollback verification & safe retry after manifest retirement.
+    {
+        let root = dir.path().join("r6-root");
+        let stage = dir.path().join("r6-stage");
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => panic!("unsupported test arch: {other}"),
+        };
+        let pkg = format!("fail2ban-rs-1.1.2-linux-{arch}");
+        let pkg_root = stage.join(&pkg);
+        fs::create_dir_all(pkg_root.join("bin")).unwrap();
+        fs::create_dir_all(pkg_root.join("man")).unwrap();
+        fs::create_dir_all(pkg_root.join("config/filter.d")).unwrap();
+        for bin in ["fail2ban-server", "fail2ban-client", "fail2ban-regex"] {
+            fs::write(pkg_root.join("bin").join(bin), format!("rs-{bin}\n")).unwrap();
+        }
+        fs::write(pkg_root.join("fail2ban.service"), "rs-service\n").unwrap();
+        fs::write(pkg_root.join("fail2ban.socket"), "rs-socket\n").unwrap();
+        fs::write(pkg_root.join("python.zip"), "rs-pyzip\n").unwrap();
+        for page in [
+            "fail2ban.1",
+            "fail2ban-server.1",
+            "fail2ban-client.1",
+            "fail2ban-regex.1",
+            "jail.conf.5",
+        ] {
+            fs::write(pkg_root.join("man").join(page), format!("rs-{page}\n")).unwrap();
+        }
+        fs::write(pkg_root.join("config/jail.conf"), "[DEFAULT]\n").unwrap();
+
+        let archive = stage.join(format!("{pkg}.tar.gz"));
+        let tar_ok = Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(&stage)
+            .arg(&pkg)
+            .status()
+            .unwrap();
+        assert!(tar_ok.success());
+        let sha_out = Command::new("sha256sum").arg(&archive).output().unwrap();
+        assert!(sha_out.status.success());
+        fs::write(format!("{}.sha256", archive.display()), sha_out.stdout).unwrap();
+
+        // Seed pre-existing stock Fail2Ban binary and unit.
+        fs::create_dir_all(root.join("usr/local/bin")).unwrap();
+        fs::create_dir_all(root.join("usr/local/lib/systemd/system")).unwrap();
+        fs::write(root.join("usr/local/bin/fail2ban-server"), "orig-server\n").unwrap();
+        fs::write(
+            root.join("usr/local/lib/systemd/system/fail2ban.service"),
+            "orig-service\n",
+        )
+        .unwrap();
+
+        let install_sh = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+        let inst = Command::new("bash")
+            .arg(&install_sh)
+            .arg(&archive)
+            .env("DESTDIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            inst.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&inst.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/bin/fail2ban-server")).unwrap(),
+            "rs-fail2ban-server\n"
+        );
+
+        // 1a. Missing backup entry with manifest still present must fail BEFORE deleting live files.
+        let backup_srv =
+            root.join("usr/local/lib/fail2ban-rs/backup/usr/local/bin/fail2ban-server");
+        let saved_backup = fs::read(&backup_srv).unwrap();
+        fs::remove_file(&backup_srv).unwrap();
+        let bad_uninst = Command::new("bash")
+            .arg(&install_sh)
+            .arg("--uninstall")
+            .env("DESTDIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            !bad_uninst.status.success(),
+            "uninstall with missing backup must abort before deleting live files"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/bin/fail2ban-server")).unwrap(),
+            "rs-fail2ban-server\n",
+            "aborted rollback must not delete live fail2ban-server"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/lib/systemd/system/fail2ban.service")).unwrap(),
+            "rs-service\n",
+            "aborted rollback must not delete live fail2ban.service"
+        );
+
+        // 1b. Restore backup copy, perform normal rollback, then simulate interrupted cleanup
+        //     after manifest retirement (leftover backup copy, no manifest, no python.zip).
+        fs::write(&backup_srv, &saved_backup).unwrap();
+        let ok_uninst = Command::new("bash")
+            .arg(&install_sh)
+            .arg("--uninstall")
+            .env("DESTDIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            ok_uninst.status.success(),
+            "uninstall failed: {}",
+            String::from_utf8_lossy(&ok_uninst.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/bin/fail2ban-server")).unwrap(),
+            "orig-server\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/lib/systemd/system/fail2ban.service")).unwrap(),
+            "orig-service\n"
+        );
+
+        fs::create_dir_all(backup_srv.parent().unwrap()).unwrap();
+        fs::write(&backup_srv, "leftover-copy\n").unwrap();
+        let retry_uninst = Command::new("bash")
+            .arg(&install_sh)
+            .arg("--uninstall")
+            .env("DESTDIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            retry_uninst.status.success(),
+            "post-manifest retry failed: {}",
+            String::from_utf8_lossy(&retry_uninst.stderr)
+        );
+        assert!(
+            !backup_srv.exists(),
+            "retry must clean leftover backup copies"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/bin/fail2ban-server")).unwrap(),
+            "orig-server\n",
+            "retry after manifest retirement must preserve restored originals"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/lib/systemd/system/fail2ban.service")).unwrap(),
+            "orig-service\n"
+        );
+    }
+
+    // 2. `unban --all` on a per-IP action (no actionflush, like ufw) under SQLite write lock:
+    //    must retain in-memory tickets and skip actionunban until lock clears, then recover on retry.
+    {
+        let db_path = dir.path().join("r6_ufw_lock.sqlite3");
+        let unban_log = dir.path().join("r6_ufw_unban.log");
+        let mut tr = Transmitter::default();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("dbfile"),
+            s(db_path.to_str().unwrap()),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("add"), s("ufwj"), s("polling")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("ufwj"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("ufwj"),
+            s("addaction"),
+            s("ufwlike"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("ufwj"),
+            s("action"),
+            s("ufwlike"),
+            s("actionban"),
+            s("true"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("ufwj"),
+            s("action"),
+            s("ufwlike"),
+            s("actionunban"),
+            s(&format!(
+                "printf '%s\\n' '<ip>' >> '{}'",
+                unban_log.display()
+            )),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("start"), s("ufwj")]))
+            .await
+            .unwrap();
+        for ip in ["192.0.2.211", "192.0.2.212"] {
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("ufwj"),
+                s("banip"),
+                s(ip),
+            ]))
+            .await
+            .unwrap();
+        }
+
+        let (locked_tx, locked_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let lock_path = db_path.clone();
+        let locker = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&lock_path).unwrap();
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv();
+            let _ = conn.execute_batch("ROLLBACK");
+        });
+        locked_rx.recv().unwrap();
+        let locked_res = tr
+            .dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await;
+        let _ = release_tx.send(());
+        locker.join().unwrap();
+        assert!(
+            locked_res.is_err(),
+            "unban --all must fail when SQLite is write-locked: {locked_res:?}"
+        );
+        assert!(
+            !unban_log.exists(),
+            "per-IP actionunban must not run when DB delete fails under lock"
+        );
+        let still_banned = tr
+            .dispatch(&PickleValue::List(vec![s("get"), s("ufwj"), s("banip")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            still_banned,
+            PickleValue::List(vec![s("192.0.2.211"), s("192.0.2.212")]),
+            "in-memory tickets must remain intact for retry after SQLite lock failure"
+        );
+
+        let retry_res = tr
+            .dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await
+            .unwrap();
+        assert_eq!(retry_res, PickleValue::Int(2));
+        let unbanned_ips: Vec<String> = fs::read_to_string(&unban_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(unbanned_ips, vec!["192.0.2.211", "192.0.2.212"]);
+        let check_db = Fail2BanDb::open(db_path.to_str().unwrap(), 86_400, 10).unwrap();
+        assert!(
+            check_db
+                .get_current_bans(Some("ufwj"), None, None, current_unix_seconds() as i64)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+
+    // 3. Large CIDR unban + partial DB failure expiry recomputation.
+    {
+        let db_path = dir.path().join("r6_cidr.sqlite3");
+        let mut tr = Transmitter::default();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("dbfile"),
+            s(db_path.to_str().unwrap()),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("add"), s("cidrj"), s("polling")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("cidrj"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("start"), s("cidrj")]))
+            .await
+            .unwrap();
+
+        let mut ban_cmd = vec![s("set"), s("cidrj"), s("banip")];
+        for host in 1..=254u8 {
+            ban_cmd.push(s(&format!("198.51.100.{host}")));
+        }
+        ban_cmd.push(s("203.0.113.9"));
+        let added = tr.dispatch(&PickleValue::List(ban_cmd)).await.unwrap();
+        assert_eq!(added, PickleValue::Int(255));
+
+        let unbanned = tr
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("cidrj"),
+                s("unbanip"),
+                s("198.51.100.0/24"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(unbanned, PickleValue::Int(254));
+        assert_eq!(
+            tr.dispatch(&PickleValue::List(vec![s("get"), s("cidrj"), s("banip")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s("203.0.113.9")])
+        );
+        let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+
+    // 4-6. Python action tests (require FAIL2BAN_111_SOURCE):
+    if std::env::var_os("FAIL2BAN_111_SOURCE").is_some() {
+        // 4. Finding 2: Python action whose flush() and consistencyCheck() both raise must
+        //    propagate the exception BEFORE deleting SQLite rows or draining tickets.
+        let py_err_db = dir.path().join("r6_py_chk_err.sqlite3");
+        let py_err_log = dir.path().join("r6_py_chk_err.log");
+        let py_err_mod = dir.path().join("py_chk_err.py");
+        fs::write(
+            &py_err_mod,
+            format!(
+                concat!(
+                    "from fail2ban.server.action import ActionBase\n",
+                    "class FailingCheck(ActionBase):\n",
+                    "    def ban(self, aInfo):\n",
+                    "        pass\n",
+                    "    def flush(self):\n",
+                    "        raise RuntimeError('flush boom')\n",
+                    "    def consistencyCheck(self, beforeRepair=None):\n",
+                    "        raise RuntimeError('check boom')\n",
+                    "    def unban(self, aInfo):\n",
+                    "        with open('{}', 'a') as f:\n",
+                    "            f.write(f'unban:{{aInfo[\"ip\"]}}\\n')\n",
+                    "Action = FailingCheck\n",
+                ),
+                py_err_log.display()
+            ),
+        )
+        .unwrap();
+
+        let mut tr_chk = Transmitter::default();
+        tr_chk
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("dbfile"),
+                s(py_err_db.to_str().unwrap()),
+            ]))
+            .await
+            .unwrap();
+        tr_chk
+            .dispatch(&PickleValue::List(vec![s("add"), s("chkj"), s("polling")]))
+            .await
+            .unwrap();
+        tr_chk
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("chkj"),
+                s("ignoreself"),
+                s("false"),
+            ]))
+            .await
+            .unwrap();
+        tr_chk
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("chkj"),
+                s("addaction"),
+                s("broken"),
+                s(py_err_mod.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_chk
+            .dispatch(&PickleValue::List(vec![s("start"), s("chkj")]))
+            .await
+            .unwrap();
+        tr_chk
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("chkj"),
+                s("banip"),
+                s("192.0.2.210"),
+            ]))
+            .await
+            .unwrap();
+
+        let err_res = tr_chk
+            .dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await;
+        assert!(
+            err_res.is_err(),
+            "unban --all must propagate consistencyCheck exception: {err_res:?}"
+        );
+        assert_eq!(
+            tr_chk
+                .dispatch(&PickleValue::List(vec![s("get"), s("chkj"), s("banip")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s("192.0.2.210")]),
+            "tickets must remain in BanManager after consistencyCheck exception"
+        );
+        {
+            let check_db = Fail2BanDb::open(py_err_db.to_str().unwrap(), 86_400, 10).unwrap();
+            let active = check_db
+                .get_current_bans(Some("chkj"), None, None, current_unix_seconds() as i64)
+                .unwrap();
+            assert_eq!(
+                active.len(),
+                1,
+                "SQLite records must remain intact after consistencyCheck exception"
+            );
+        }
+        // Per-IP unban still works against the retained ticket and cleans DB + firewall.
+        tr_chk
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("chkj"),
+                s("unbanip"),
+                s("192.0.2.210"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&py_err_log).unwrap().trim(),
+            "unban:192.0.2.210"
+        );
+        let _ = tr_chk.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+        // 5 & 6. `:memory:` DB: background thread reads after start() returns + transaction
+        //        atomicity on exception rollback, mid-transaction crash, and public delBan().
+        let bg_out = dir.path().join("r6_bg_reads.log");
+        let py_mem_mod = dir.path().join("py_mem_tx.py");
+        fs::write(
+            &py_mem_mod,
+            format!(
+                concat!(
+                    "import os, threading, time\n",
+                    "from fail2ban.server.action import ActionBase\n",
+                    "class MemDbAction(ActionBase):\n",
+                    "    def __init__(self, jail, name):\n",
+                    "        super().__init__(jail, name)\n",
+                    "        self._stop_ev = threading.Event()\n",
+                    "        self._worker = None\n",
+                    "    def start(self):\n",
+                    "        if self._name != 'memact':\n",
+                    "            return\n",
+                    "        def loop():\n",
+                    "            while not self._stop_ev.is_set():\n",
+                    "                bans = self._jail.database.getBans(jail=self._jail)\n",
+                    "                ips = sorted(str(t.getIP()) for t in bans)\n",
+                    "                if '192.0.2.220' in ips:\n",
+                    "                    with open('{}', 'w') as f:\n",
+                    "                        f.write(','.join(ips))\n",
+                    "                    return\n",
+                    "                time.sleep(0.02)\n",
+                    "        self._worker = threading.Thread(target=loop, daemon=True)\n",
+                    "        self._worker.start()\n",
+                    "    def stop(self):\n",
+                    "        self._stop_ev.set()\n",
+                    "        if self._worker is not None:\n",
+                    "            self._worker.join(timeout=2.0)\n",
+                    "    def ban(self, aInfo):\n",
+                    "        pass\n",
+                    "    def unban(self, aInfo):\n",
+                    "        pass\n",
+                    "    def count_tables(self):\n",
+                    "        db = self._jail.database\n",
+                    "        with db._lock:\n",
+                    "            cur = db._db.cursor()\n",
+                    "            bips = cur.execute('SELECT COUNT(*) FROM bips WHERE jail = ?', (self._jail.name,)).fetchone()[0]\n",
+                    "            bans = cur.execute('SELECT COUNT(*) FROM bans WHERE jail = ?', (self._jail.name,)).fetchone()[0]\n",
+                    "            return f'{{bips}}:{{bans}}'\n",
+                    "    def partial_rollback(self, ip='192.0.2.220'):\n",
+                    "        db = self._jail.database\n",
+                    "        try:\n",
+                    "            with db._lock:\n",
+                    "                with db._db:\n",
+                    "                    cur = db._db.cursor()\n",
+                    "                    cur.execute('DELETE FROM bips WHERE jail = ? AND ip = ?', (self._jail.name, ip))\n",
+                    "                    raise RuntimeError('abort mid tx')\n",
+                    "        except RuntimeError:\n",
+                    "            return 'rolled_back'\n",
+                    "    def del_public(self, ip='192.0.2.221'):\n",
+                    "        self._jail.database.delBan(self._jail, ip)\n",
+                    "        return 'deleted'\n",
+                    "    def crash_mid_tx(self, ip='192.0.2.220'):\n",
+                    "        db = self._jail.database\n",
+                    "        with db._lock:\n",
+                    "            with db._db:\n",
+                    "                cur = db._db.cursor()\n",
+                    "                cur.execute('DELETE FROM bips WHERE jail = ? AND ip = ?', (self._jail.name, ip))\n",
+                    "                os._exit(1)\n",
+                    "Action = MemDbAction\n",
+                ),
+                bg_out.display()
+            ),
+        )
+        .unwrap();
+
+        let mut tr_mem = Transmitter::default();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("dbfile"),
+                s(":memory:"),
+            ]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![s("add"), s("memj"), s("polling")]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("memj"),
+                s("ignoreself"),
+                s("false"),
+            ]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("memj"),
+                s("addaction"),
+                s("memact"),
+                s(py_mem_mod.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("memj"),
+                s("addaction"),
+                s("observer"),
+                s(py_mem_mod.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_mem
+            .dispatch(&PickleValue::List(vec![s("start"), s("memj")]))
+            .await
+            .unwrap();
+        // start() has returned; background worker thread now reads :memory: DB independently.
+        tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("memj"),
+                s("banip"),
+                s("192.0.2.220"),
+                s("192.0.2.221"),
+            ]))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !bg_out.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            bg_out.exists(),
+            "background Python thread must read :memory: DB after start() returns"
+        );
+        assert!(fs::read_to_string(&bg_out).unwrap().contains("192.0.2.220"));
+
+        // Verify exception inside `with db._db:` rolls back partial `bips` deletion.
+        assert_eq!(
+            tr_mem
+                .dispatch(&PickleValue::List(vec![
+                    s("set"),
+                    s("memj"),
+                    s("action"),
+                    s("memact"),
+                    s("partial_rollback"),
+                ]))
+                .await
+                .unwrap(),
+            s("rolled_back")
+        );
+        assert_eq!(
+            tr_mem
+                .dispatch(&PickleValue::List(vec![
+                    s("set"),
+                    s("memj"),
+                    s("action"),
+                    s("observer"),
+                    s("count_tables"),
+                ]))
+                .await
+                .unwrap(),
+            s("2:2"),
+            "exception rollback must restore bips row"
+        );
+
+        // Verify public delBan() atomically removes both bips and bans for 192.0.2.221.
+        assert_eq!(
+            tr_mem
+                .dispatch(&PickleValue::List(vec![
+                    s("set"),
+                    s("memj"),
+                    s("action"),
+                    s("memact"),
+                    s("del_public"),
+                ]))
+                .await
+                .unwrap(),
+            s("deleted")
+        );
+        assert_eq!(
+            tr_mem
+                .dispatch(&PickleValue::List(vec![
+                    s("set"),
+                    s("memj"),
+                    s("action"),
+                    s("observer"),
+                    s("count_tables"),
+                ]))
+                .await
+                .unwrap(),
+            s("1:1"),
+            "delBan() must remove matching bips and bans rows together"
+        );
+
+        // Verify crashing mid-transaction (os._exit after DELETE FROM bips) rolls back in Rust.
+        let crash_res = tr_mem
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("memj"),
+                s("action"),
+                s("memact"),
+                s("crash_mid_tx"),
+            ]))
+            .await;
+        assert!(
+            crash_res.is_err(),
+            "crashing Python action must return error: {crash_res:?}"
+        );
+        assert_eq!(
+            tr_mem
+                .dispatch(&PickleValue::List(vec![
+                    s("set"),
+                    s("memj"),
+                    s("action"),
+                    s("observer"),
+                    s("count_tables"),
+                ]))
+                .await
+                .unwrap(),
+            s("1:1"),
+            "mid-transaction Python crash must roll back DELETE FROM bips"
+        );
+        let _ = tr_mem.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+}

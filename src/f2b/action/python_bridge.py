@@ -2,9 +2,11 @@ import json
 import logging
 import os
 import pickle
+import socket
 import sqlite3
 import struct
 import sys
+import threading
 from types import SimpleNamespace
 
 
@@ -14,6 +16,9 @@ os.dup2(2, 1)
 sys.stdout = sys.stderr
 if sys.argv[1]:
     sys.path.insert(0, sys.argv[1])
+db_fd = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+if db_fd is not None:
+    os.set_inheritable(db_fd, False)
 logging.basicConfig(level=1, format="%(levelno)d %(name)s %(message)s")
 
 
@@ -24,10 +29,33 @@ def send_frame(value):
     reply_pipe.flush()
 
 
+def _recv_exact(sock, n):
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise sqlite3.OperationalError("database bridge closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _encode_sql_param(val, dumps_safe):
+    if isinstance(val, dict):
+        val = dumps_safe(val)
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return {"__bytes__": list(bytes(val))}
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    return str(val)
+
+
 class _RpcCursor:
     arraysize = 1
 
-    def __init__(self):
+    def __init__(self, conn):
+        self._conn = conn
         self._rows = []
         self._pos = 0
         self.rowcount = -1
@@ -35,16 +63,8 @@ class _RpcCursor:
     def execute(self, sql, parameters=()):
         from fail2ban.server.database import _json_dumps_safe, _json_loads_safe
 
-        adapted = [
-            _json_dumps_safe(v) if isinstance(v, dict) else v for v in parameters
-        ]
-        send_frame((2, sql, adapted))
-        line = sys.stdin.readline()
-        if not line:
-            raise sqlite3.OperationalError("database bridge closed")
-        reply = json.loads(line)
-        if not reply["ok"]:
-            raise sqlite3.OperationalError(reply["error"])
+        adapted = [_encode_sql_param(v, _json_dumps_safe) for v in parameters]
+        reply = self._conn._call({"op": "exec", "sql": sql, "params": adapted})
         json_cols = reply["json_cols"]
         rows = []
         for raw_row in reply["rows"]:
@@ -92,20 +112,76 @@ class _RpcCursor:
 
 
 class _RpcConnection:
+    def __init__(self, fd):
+        if fd is None:
+            raise sqlite3.OperationalError("database bridge socket not configured")
+        self._sock = socket.socket(fileno=fd)
+        self._lock = threading.RLock()
+        self._tx_depth = 0
+        self._tx_aborted = False
+        self._closed = False
+
+    def _call(self, payload):
+        with self._lock:
+            if self._closed:
+                raise sqlite3.OperationalError("database bridge closed")
+            encoded = json.dumps(payload).encode("utf-8")
+            try:
+                self._sock.sendall(struct.pack("!I", len(encoded)) + encoded)
+                size = struct.unpack("!I", _recv_exact(self._sock, 4))[0]
+                body = _recv_exact(self._sock, size)
+            except OSError as exc:
+                raise sqlite3.OperationalError(f"database bridge I/O error: {exc}") from exc
+            reply = json.loads(body.decode("utf-8"))
+            if not reply.get("ok"):
+                raise sqlite3.OperationalError(reply.get("error", "database bridge error"))
+            return reply
+
     def __enter__(self):
-        return self
+        self._lock.acquire()
+        try:
+            if self._tx_depth == 0:
+                self._tx_aborted = False
+                self._call({"op": "begin"})
+            self._tx_depth += 1
+            return self
+        except BaseException:
+            self._lock.release()
+            raise
 
     def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is not None:
+                self._tx_aborted = True
+            self._tx_depth -= 1
+            if self._tx_depth == 0:
+                op = "rollback" if self._tx_aborted else "commit"
+                self._tx_aborted = False
+                try:
+                    self._call({"op": op})
+                except sqlite3.OperationalError:
+                    if exc_type is None:
+                        raise
+        finally:
+            self._lock.release()
         return False
 
     def cursor(self):
-        return _RpcCursor()
+        return _RpcCursor(self)
 
     def commit(self):
         pass
 
+    def rollback(self):
+        with self._lock:
+            if self._tx_depth > 0:
+                self._tx_aborted = True
+
     def close(self):
-        pass
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._sock.close()
 
 
 def open_database(info):
@@ -117,7 +193,7 @@ def open_database(info):
         def _connectDB(self, checkIntegrity=False):
             self._bansMergedCache = {}
             if self._dbFilename == ":memory:":
-                self._db = _RpcConnection()
+                self._db = _RpcConnection(db_fd)
                 return
             self._db = sqlite3.connect(
                 self._dbFilename,
