@@ -92,8 +92,9 @@ impl Transmitter {
             "stop" => {
                 match args.first() {
                     None => {
-                        self.stop_all().await?;
+                        let res = self.stop_all().await;
                         self.stopping = true;
+                        res?;
                     }
                     Some(value) if value.as_str() == Some("--all") => self.stop_all().await?,
                     Some(value) => {

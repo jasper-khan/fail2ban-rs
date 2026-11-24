@@ -41,11 +41,14 @@ def _recv_exact(sock, n):
     return b"".join(chunks)
 
 
+MAX_DB_FRAME_BYTES = 4 * 1024 * 1024
+
+
 def _encode_sql_param(val, dumps_safe):
     if isinstance(val, dict):
-        val = dumps_safe(val)
+        return dumps_safe(val)
     if isinstance(val, (bytes, bytearray, memoryview)):
-        return {"__bytes__": list(bytes(val))}
+        return bytes(val)
     if val is None or isinstance(val, (bool, int, float, str)):
         return val
     return str(val)
@@ -64,21 +67,21 @@ class _RpcCursor:
         from fail2ban.server.database import _json_dumps_safe, _json_loads_safe
 
         adapted = [_encode_sql_param(v, _json_dumps_safe) for v in parameters]
-        reply = self._conn._call({"op": "exec", "sql": sql, "params": adapted})
-        json_cols = reply["json_cols"]
+        raw_rows, json_cols, rowcount = self._conn._exec(sql, adapted)
         rows = []
-        for raw_row in reply["rows"]:
+        for raw_row in raw_rows:
             row = []
             for idx, val in enumerate(raw_row):
-                if idx < len(json_cols) and json_cols[idx] and isinstance(val, str):
-                    val = _json_loads_safe(val.encode("utf-8", "replace"))
-                elif isinstance(val, dict) and "__bytes__" in val:
-                    val = bytes(val["__bytes__"])
+                if idx < len(json_cols) and json_cols[idx]:
+                    if isinstance(val, bytes):
+                        val = _json_loads_safe(val)
+                    elif isinstance(val, str):
+                        val = _json_loads_safe(val.encode("utf-8", "replace"))
                 row.append(val)
             rows.append(tuple(row))
         self._rows = rows
         self._pos = 0
-        self.rowcount = reply["rowcount"]
+        self.rowcount = rowcount
         return self
 
     def __iter__(self):
@@ -118,47 +121,56 @@ class _RpcConnection:
         self._sock = socket.socket(fileno=fd)
         self._lock = threading.RLock()
         self._tx_depth = 0
-        self._tx_aborted = False
+        self._in_tx = False
         self._closed = False
 
-    def _call(self, payload):
+    def _encode_frame(self, payload):
+        encoded = pickle.dumps(payload, protocol=4)
+        if len(encoded) > MAX_DB_FRAME_BYTES:
+            raise sqlite3.OperationalError(
+                f"database bridge request exceeds {MAX_DB_FRAME_BYTES} byte frame limit"
+            )
+        return encoded
+
+    def _call_encoded(self, encoded):
         with self._lock:
             if self._closed:
                 raise sqlite3.OperationalError("database bridge closed")
-            encoded = json.dumps(payload).encode("utf-8")
             try:
                 self._sock.sendall(struct.pack("!I", len(encoded)) + encoded)
                 size = struct.unpack("!I", _recv_exact(self._sock, 4))[0]
                 body = _recv_exact(self._sock, size)
             except OSError as exc:
                 raise sqlite3.OperationalError(f"database bridge I/O error: {exc}") from exc
-            reply = json.loads(body.decode("utf-8"))
-            if not reply.get("ok"):
-                raise sqlite3.OperationalError(reply.get("error", "database bridge error"))
-            return reply
+            ok, data = pickle.loads(body)
+            if not ok:
+                raise sqlite3.OperationalError(str(data))
+            return data
+
+    def _call(self, payload):
+        return self._call_encoded(self._encode_frame(payload))
+
+    def _exec(self, sql, adapted):
+        encoded = self._encode_frame(("exec", sql, adapted))
+        with self._lock:
+            if self._tx_depth > 0 and not self._in_tx:
+                self._call(("begin",))
+                self._in_tx = True
+            return self._call_encoded(encoded)
 
     def __enter__(self):
         self._lock.acquire()
-        try:
-            if self._tx_depth == 0:
-                self._tx_aborted = False
-                self._call({"op": "begin"})
-            self._tx_depth += 1
-            return self
-        except BaseException:
-            self._lock.release()
-            raise
+        self._tx_depth += 1
+        return self
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if exc_type is not None:
-                self._tx_aborted = True
             self._tx_depth -= 1
-            if self._tx_depth == 0:
-                op = "rollback" if self._tx_aborted else "commit"
-                self._tx_aborted = False
+            if self._in_tx and (exc_type is not None or self._tx_depth == 0):
+                op = "rollback" if exc_type is not None else "commit"
+                self._in_tx = False
                 try:
-                    self._call({"op": op})
+                    self._call((op,))
                 except sqlite3.OperationalError:
                     if exc_type is None:
                         raise
@@ -170,17 +182,22 @@ class _RpcConnection:
         return _RpcCursor(self)
 
     def commit(self):
-        pass
+        with self._lock:
+            if self._in_tx:
+                self._in_tx = False
+                self._call(("commit",))
 
     def rollback(self):
         with self._lock:
-            if self._tx_depth > 0:
-                self._tx_aborted = True
+            if self._in_tx:
+                self._in_tx = False
+                self._call(("rollback",))
 
     def close(self):
         with self._lock:
             if not self._closed:
                 self._closed = True
+                self._in_tx = False
                 self._sock.close()
 
 

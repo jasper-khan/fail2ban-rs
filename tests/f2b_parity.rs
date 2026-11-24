@@ -5349,3 +5349,900 @@ async fn round6_rollback_unban_cidr_and_py_db_tx_test() {
         let _ = tr_mem.dispatch(&PickleValue::List(vec![s("stop")])).await;
     }
 }
+
+#[tokio::test]
+async fn round7_flush_rollback_reload_stop_manifest_and_py_db_test() {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::mpsc as std_mpsc;
+    use std::time::{Duration, Instant};
+
+    use fail2ban_rs::db::Fail2BanDb;
+    use fail2ban_rs::protocol::PickleValue;
+    use fail2ban_rs::server::Transmitter;
+    use fail2ban_rs::server::jail::current_unix_seconds;
+
+    let s = |v: &str| PickleValue::Str(v.to_owned());
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Finding #3: `--uninstall` must fail closed before deleting live or saved backup files
+    //    when python.zip and saved backup copies exist without backup-manifest.
+    {
+        let root = dir.path().join("r7-root");
+        let stage = dir.path().join("r7-stage");
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => panic!("unsupported test arch: {other}"),
+        };
+        let pkg = format!("fail2ban-rs-1.1.2-linux-{arch}");
+        let pkg_root = stage.join(&pkg);
+        fs::create_dir_all(pkg_root.join("bin")).unwrap();
+        fs::create_dir_all(pkg_root.join("man")).unwrap();
+        fs::create_dir_all(pkg_root.join("config/filter.d")).unwrap();
+        for bin in ["fail2ban-server", "fail2ban-client", "fail2ban-regex"] {
+            fs::write(pkg_root.join("bin").join(bin), format!("rs-{bin}\n")).unwrap();
+        }
+        fs::write(pkg_root.join("fail2ban.service"), "rs-service\n").unwrap();
+        fs::write(pkg_root.join("fail2ban.socket"), "rs-socket\n").unwrap();
+        fs::write(pkg_root.join("python.zip"), "rs-pyzip\n").unwrap();
+        for page in [
+            "fail2ban.1",
+            "fail2ban-server.1",
+            "fail2ban-client.1",
+            "fail2ban-regex.1",
+            "jail.conf.5",
+        ] {
+            fs::write(pkg_root.join("man").join(page), format!("rs-{page}\n")).unwrap();
+        }
+        fs::write(pkg_root.join("config/jail.conf"), "[DEFAULT]\n").unwrap();
+
+        let archive = stage.join(format!("{pkg}.tar.gz"));
+        assert!(
+            Command::new("tar")
+                .args(["-czf"])
+                .arg(&archive)
+                .args(["-C"])
+                .arg(&stage)
+                .arg(&pkg)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha_out = Command::new("sha256sum").arg(&archive).output().unwrap();
+        assert!(sha_out.status.success());
+        fs::write(format!("{}.sha256", archive.display()), sha_out.stdout).unwrap();
+
+        fs::create_dir_all(root.join("usr/local/bin")).unwrap();
+        fs::write(root.join("usr/local/bin/fail2ban-server"), "orig-server\n").unwrap();
+
+        let install_sh = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+        let inst = Command::new("bash")
+            .arg(&install_sh)
+            .arg(&archive)
+            .env("DESTDIR", &root)
+            .output()
+            .unwrap();
+        assert!(inst.status.success());
+
+        let manifest = root.join("usr/local/lib/fail2ban-rs/backup-manifest");
+        let backup_srv =
+            root.join("usr/local/lib/fail2ban-rs/backup/usr/local/bin/fail2ban-server");
+        fs::remove_file(&manifest).unwrap();
+
+        let uninst = Command::new("bash")
+            .arg(&install_sh)
+            .arg("--uninstall")
+            .env("DESTDIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            !uninst.status.success(),
+            "uninstall without manifest while backup copies and python.zip exist must fail closed"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/bin/fail2ban-server")).unwrap(),
+            "rs-fail2ban-server\n",
+            "fail-closed uninstall must not delete live installation"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_srv).unwrap(),
+            "orig-server\n",
+            "fail-closed uninstall must preserve saved backup originals"
+        );
+    }
+
+    // 2. Finding #1A: `unban --all` on a bulk-flush action under SQLite write lock must reapply
+    //    flushed tickets before returning the DB error so firewall state matches BanManager.
+    {
+        let db_path = dir.path().join("r7_flush_lock.sqlite3");
+        let fw_state = dir.path().join("r7_fw_state.txt");
+        let mut tr = Transmitter::default();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("dbfile"),
+            s(db_path.to_str().unwrap()),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("add"), s("fwj"), s("polling")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("fwj"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("fwj"),
+            s("addaction"),
+            s("bulkfw"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("fwj"),
+            s("action"),
+            s("bulkfw"),
+            s("actionstart"),
+            s(&format!(": > '{}'", fw_state.display())),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("fwj"),
+            s("action"),
+            s("bulkfw"),
+            s("actionban"),
+            s(&format!(
+                "printf '%s\\n' '<ip>' >> '{}'",
+                fw_state.display()
+            )),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("fwj"),
+            s("action"),
+            s("bulkfw"),
+            s("actionflush"),
+            s(&format!(": > '{}'", fw_state.display())),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("start"), s("fwj")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("fwj"),
+            s("banip"),
+            s("192.0.2.10"),
+            s("192.0.2.11"),
+        ]))
+        .await
+        .unwrap();
+
+        let (locked_tx, locked_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let lock_path = db_path.clone();
+        let locker = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&lock_path).unwrap();
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv();
+            let _ = conn.execute_batch("ROLLBACK");
+        });
+        locked_rx.recv().unwrap();
+        let err = tr
+            .dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await;
+        let _ = release_tx.send(());
+        locker.join().unwrap();
+        assert!(err.is_err());
+
+        let fw_after_fail: Vec<String> = fs::read_to_string(&fw_state)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            fw_after_fail,
+            vec!["192.0.2.10", "192.0.2.11"],
+            "failed unban --all must reapply flushed rules to match retained bans"
+        );
+        assert_eq!(
+            tr.dispatch(&PickleValue::List(vec![s("get"), s("fwj"), s("banip")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s("192.0.2.10"), s("192.0.2.11")])
+        );
+
+        let retry = tr
+            .dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+            .await
+            .unwrap();
+        assert_eq!(retry, PickleValue::Int(2));
+        assert!(fs::read_to_string(&fw_state).unwrap().is_empty());
+        let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+
+    // 3. CIDR unban mid-batch DB error integration test (partial removal + retry).
+    {
+        let db_path = dir.path().join("r7_cidr_partial.sqlite3");
+        let mut tr = Transmitter::default();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("dbfile"),
+            s(db_path.to_str().unwrap()),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("add"), s("pcidr"), s("polling")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("pcidr"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("start"), s("pcidr")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("pcidr"),
+            s("banip"),
+            s("198.51.100.1"),
+            s("198.51.100.2"),
+            s("198.51.100.3"),
+        ]))
+        .await
+        .unwrap();
+
+        let trig_conn = rusqlite::Connection::open(&db_path).unwrap();
+        trig_conn
+            .execute_batch(
+                "CREATE TRIGGER fail_second_ip BEFORE DELETE ON bips \
+                 WHEN OLD.ip = '198.51.100.2' \
+                 BEGIN SELECT RAISE(ABORT, 'inject mid-batch failure'); END;",
+            )
+            .unwrap();
+
+        let partial = tr
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pcidr"),
+                s("unbanip"),
+                s("198.51.100.0/24"),
+            ]))
+            .await;
+        assert!(partial.is_err());
+        assert_eq!(
+            tr.dispatch(&PickleValue::List(vec![s("get"), s("pcidr"), s("banip")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s("198.51.100.2"), s("198.51.100.3")]),
+            "mid-batch CIDR failure must leave unremoved tickets intact"
+        );
+
+        trig_conn
+            .execute_batch("DROP TRIGGER fail_second_ip;")
+            .unwrap();
+        drop(trig_conn);
+        let retry = tr
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("pcidr"),
+                s("unbanip"),
+                s("198.51.100.0/24"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(retry, PickleValue::Int(2));
+        let check_db = Fail2BanDb::open(db_path.to_str().unwrap(), 86_400, 10).unwrap();
+        assert!(
+            check_db
+                .get_current_bans(Some("pcidr"), None, None, current_unix_seconds() as i64)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+
+    if std::env::var_os("FAIL2BAN_111_SOURCE").is_some() {
+        // 4. Finding #1B + #4: bulk-flush Action 1 + throwing Python Action 2 + per-IP Action 3.
+        //    - During `unban --all`: Action 1 is reapplied after Action 2 throws; tickets stay.
+        //    - During `stop <jail>`: Action 2 error does NOT strand Action 3 per-IP unbans, and
+        //      the stop error is still reported.
+        let py_throw = dir.path().join("r7_throw.py");
+        let fail_flag = dir.path().join("r7_throw.flag");
+        fs::write(&fail_flag, "1").unwrap();
+        fs::write(
+            &py_throw,
+            format!(
+                concat!(
+                    "import os\n",
+                    "from fail2ban.server.action import ActionBase\n",
+                    "class ThrowAction(ActionBase):\n",
+                    "    def ban(self, aInfo):\n",
+                    "        pass\n",
+                    "    def unban(self, aInfo):\n",
+                    "        pass\n",
+                    "    def flush(self):\n",
+                    "        if os.path.exists('{}'):\n",
+                    "            raise RuntimeError('flush boom')\n",
+                    "        return True\n",
+                    "    def consistencyCheck(self, beforeRepair=None):\n",
+                    "        if os.path.exists('{}'):\n",
+                    "            raise RuntimeError('check boom')\n",
+                    "        return True\n",
+                    "Action = ThrowAction\n",
+                ),
+                fail_flag.display(),
+                fail_flag.display()
+            ),
+        )
+        .unwrap();
+
+        let fw1_state = dir.path().join("r7_fw1_state.txt");
+        let ufw_unban_log = dir.path().join("r7_ufw_stop.log");
+        let mut tr = Transmitter::default();
+        tr.dispatch(&PickleValue::List(vec![s("add"), s("mixj"), s("polling")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("addaction"),
+            s("fw1"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("action"),
+            s("fw1"),
+            s("actionstart"),
+            s(&format!(": > '{}'", fw1_state.display())),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("action"),
+            s("fw1"),
+            s("actionban"),
+            s(&format!(
+                "printf '%s\\n' '<ip>' >> '{}'",
+                fw1_state.display()
+            )),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("action"),
+            s("fw1"),
+            s("actionflush"),
+            s(&format!(": > '{}'", fw1_state.display())),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("addaction"),
+            s("badpy"),
+            s(py_throw.to_str().unwrap()),
+            s("{}"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("addaction"),
+            s("perip"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("action"),
+            s("perip"),
+            s("actionban"),
+            s("true"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("action"),
+            s("perip"),
+            s("actionunban"),
+            s(&format!(
+                "printf '%s\\n' '<ip>' >> '{}'",
+                ufw_unban_log.display()
+            )),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("start"), s("mixj")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("mixj"),
+            s("banip"),
+            s("192.0.2.30"),
+            s("192.0.2.31"),
+        ]))
+        .await
+        .unwrap();
+
+        // Finding #1B: unban --all fails on badpy and reapplies fw1.
+        assert!(
+            tr.dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
+                .await
+                .is_err()
+        );
+        let fw1_after: Vec<String> = fs::read_to_string(&fw1_state)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            fw1_after,
+            vec!["192.0.2.30", "192.0.2.31"],
+            "fw1 must have bans restored when badpy consistencyCheck throws"
+        );
+        assert!(!ufw_unban_log.exists());
+
+        // Finding #4: shutdown (`stop`) reports badpy error but still unbans unrelated perip.
+        let stop_res = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+        assert!(stop_res.is_err(), "stop must report failing action error");
+        let perip_lines: Vec<String> = fs::read_to_string(&ufw_unban_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            perip_lines,
+            vec!["192.0.2.30", "192.0.2.31"],
+            "shutdown must still unban unaffected per-IP action"
+        );
+        let post_stop_ping = tr.dispatch(&PickleValue::List(vec![s("ping")])).await;
+        assert!(
+            post_stop_ping.is_err(),
+            "full stop must still mark transmitter stopping even when an action flush fails: {post_stop_ping:?}"
+        );
+
+        // 5. Finding #2: failed reload (switching log A -> B while removing a throwing action)
+        //    must abort cleanly, keep the action and log A, and switch to log B on retry.
+        let log_a = dir.path().join("r7_log_a.log");
+        let log_b = dir.path().join("r7_log_b.log");
+        fs::write(&log_a, "").unwrap();
+        fs::write(&log_b, "").unwrap();
+        let mut tr_rel = Transmitter::default();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![s("add"), s("relj"), s("polling")]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("ignoreself"),
+                s("false"),
+            ]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("maxretry"),
+                s("1"),
+            ]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("datepattern"),
+                s("EPOCH"),
+            ]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("addfailregex"),
+                s("^\\s*bad <HOST>$"),
+            ]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("addlogpath"),
+                s(log_a.to_str().unwrap()),
+            ]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("addaction"),
+                s("keepfw"),
+            ]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("addaction"),
+                s("rmpy"),
+                s(py_throw.to_str().unwrap()),
+                s("{}"),
+            ]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![s("start"), s("relj")]))
+            .await
+            .unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("banip"),
+                s("192.0.2.40"),
+            ]))
+            .await
+            .unwrap();
+
+        let reload_to_b = PickleValue::List(vec![
+            PickleValue::List(vec![s("add"), s("relj"), s("polling")]),
+            PickleValue::List(vec![s("set"), s("relj"), s("ignoreself"), s("false")]),
+            PickleValue::List(vec![s("set"), s("relj"), s("maxretry"), s("1")]),
+            PickleValue::List(vec![s("set"), s("relj"), s("datepattern"), s("EPOCH")]),
+            PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("addfailregex"),
+                s("^\\s*bad <HOST>$"),
+            ]),
+            PickleValue::List(vec![
+                s("set"),
+                s("relj"),
+                s("addlogpath"),
+                s(log_b.to_str().unwrap()),
+            ]),
+            PickleValue::List(vec![s("set"), s("relj"), s("addaction"), s("keepfw")]),
+            PickleValue::List(vec![s("start"), s("relj")]),
+        ]);
+
+        // First reload fails because fail_flag exists -> must abort and retain rmpy + log_a.
+        assert!(
+            tr_rel
+                .dispatch(&PickleValue::List(vec![
+                    s("reload"),
+                    s("--all"),
+                    PickleValue::List(vec![]),
+                    reload_to_b.clone(),
+                ]))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tr_rel
+                .dispatch(&PickleValue::List(vec![s("get"), s("relj"), s("actions")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s("keepfw"), s("rmpy")]),
+            "failed reload must preserve obsolete action instead of discarding/stopping it"
+        );
+        assert_eq!(
+            tr_rel
+                .dispatch(&PickleValue::List(vec![s("get"), s("relj"), s("logpath")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s(log_a.to_str().unwrap())]),
+            "failed reload must restore log_a so retry detects log_a -> log_b change"
+        );
+
+        // Clear transient failure and retry -> succeeds and backend switches to log_b.
+        fs::remove_file(&fail_flag).unwrap();
+        tr_rel
+            .dispatch(&PickleValue::List(vec![
+                s("reload"),
+                s("--all"),
+                PickleValue::List(vec![]),
+                reload_to_b,
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            tr_rel
+                .dispatch(&PickleValue::List(vec![s("get"), s("relj"), s("actions")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s("keepfw")])
+        );
+        assert_eq!(
+            tr_rel
+                .dispatch(&PickleValue::List(vec![s("get"), s("relj"), s("logpath")]))
+                .await
+                .unwrap(),
+            PickleValue::List(vec![s(log_b.to_str().unwrap())])
+        );
+        let now_ts = current_unix_seconds() as i64;
+        fs::write(&log_b, format!("{now_ts} bad 192.0.2.41\n")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_b = false;
+        while Instant::now() < deadline {
+            let banned = tr_rel
+                .dispatch(&PickleValue::List(vec![s("get"), s("relj"), s("banip")]))
+                .await
+                .unwrap();
+            if let PickleValue::List(ref items) = banned
+                && items.contains(&s("192.0.2.41"))
+            {
+                saw_b = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            saw_b,
+            "retried reload must restart backend onto log_b and ban failures written there"
+        );
+        let _ = tr_rel.dispatch(&PickleValue::List(vec![s("stop")])).await;
+
+        // 6. Findings #6, #7, #8: `:memory:` Python DB bridge:
+        //    - #6: DB-free command on Action B does not block on Action A's active background tx.
+        //    - #7: Explicit commit() survives a later exception inside `with db._db:`.
+        //    - #8: 2 MiB BLOB round-trips cleanly; 5 MiB BLOB fails locally without closing conn.
+        let py_mem2 = dir.path().join("r7_py_mem.py");
+        fs::write(
+            &py_mem2,
+            concat!(
+                "import sqlite3, threading, time\n",
+                "from fail2ban.server.action import ActionBase\n",
+                "class MemTestAction(ActionBase):\n",
+                "    def __init__(self, jail, name):\n",
+                "        super().__init__(jail, name)\n",
+                "        self._tx_ready = threading.Event()\n",
+                "        self._tx_release = threading.Event()\n",
+                "        self._bg = None\n",
+                "    def ban(self, aInfo):\n",
+                "        pass\n",
+                "    def unban(self, aInfo):\n",
+                "        pass\n",
+                "    def ping_fast(self):\n",
+                "        return 'pong'\n",
+                "    def start_hold_tx(self):\n",
+                "        def hold():\n",
+                "            db = self._jail.database\n",
+                "            with db._lock:\n",
+                "                with db._db:\n",
+                "                    cur = db._db.cursor()\n",
+                "                    cur.execute('SELECT 1')\n",
+                "                    self._tx_ready.set()\n",
+                "                    self._tx_release.wait(timeout=3.0)\n",
+                "        self._bg = threading.Thread(target=hold, daemon=True)\n",
+                "        self._bg.start()\n",
+                "        assert self._tx_ready.wait(timeout=2.0)\n",
+                "        return 'holding'\n",
+                "    def release_hold_tx(self):\n",
+                "        self._tx_release.set()\n",
+                "        if self._bg is not None:\n",
+                "            self._bg.join(timeout=2.0)\n",
+                "        return 'released'\n",
+                "    def test_explicit_commit_and_rollback(self):\n",
+                "        db = self._jail.database\n",
+                "        with db._lock:\n",
+                "            with db._db:\n",
+                "                cur = db._db.cursor()\n",
+                "                cur.execute('CREATE TABLE IF NOT EXISTS r7_kv(k TEXT PRIMARY KEY, v BLOB)')\n",
+                "            try:\n",
+                "                with db._db:\n",
+                "                    cur = db._db.cursor()\n",
+                "                    cur.execute('INSERT INTO r7_kv VALUES(?, ?)', ('kept', b'ok1'))\n",
+                "                    db._db.commit()\n",
+                "                    cur.execute('INSERT INTO r7_kv VALUES(?, ?)', ('discarded', b'no2'))\n",
+                "                    raise RuntimeError('after commit')\n",
+                "            except RuntimeError:\n",
+                "                pass\n",
+                "            with db._db:\n",
+                "                cur = db._db.cursor()\n",
+                "                cur.execute('INSERT INTO r7_kv VALUES(?, ?)', ('rb_me', b'no3'))\n",
+                "                db._db.rollback()\n",
+                "                cur.execute('INSERT INTO r7_kv VALUES(?, ?)', ('kept2', b'ok4'))\n",
+                "            cur = db._db.cursor()\n",
+                "            rows = sorted(r[0] for r in cur.execute('SELECT k FROM r7_kv').fetchall())\n",
+                "            return ','.join(rows)\n",
+                "    def test_blob_2mb_and_oversize(self):\n",
+                "        db = self._jail.database\n",
+                "        two_mb = bytes([0x5a]) * (2 * 1024 * 1024)\n",
+                "        five_mb = bytes([0x3c]) * (5 * 1024 * 1024)\n",
+                "        with db._lock:\n",
+                "            with db._db:\n",
+                "                cur = db._db.cursor()\n",
+                "                cur.execute('CREATE TABLE IF NOT EXISTS r7_blobs(id INT PRIMARY KEY, b BLOB)')\n",
+                "                cur.execute('INSERT OR REPLACE INTO r7_blobs VALUES(1, ?)', (two_mb,))\n",
+                "            cur = db._db.cursor()\n",
+                "            got = cur.execute('SELECT b FROM r7_blobs WHERE id = 1').fetchone()[0]\n",
+                "            assert isinstance(got, bytes) and len(got) == len(two_mb) and got == two_mb\n",
+                "            rejected = False\n",
+                "            try:\n",
+                "                with db._db:\n",
+                "                    cur = db._db.cursor()\n",
+                "                    cur.execute('INSERT OR REPLACE INTO r7_blobs VALUES(2, ?)', (five_mb,))\n",
+                "            except sqlite3.OperationalError:\n",
+                "                rejected = True\n",
+                "            assert rejected\n",
+                "            # Connection must still be alive and usable after oversize rejection.\n",
+                "            db.delBan(self._jail, '192.0.2.250')\n",
+                "            still_one = cur.execute('SELECT COUNT(*) FROM r7_blobs').fetchone()[0]\n",
+                "            return f'ok:{still_one}'\n",
+                "Action = MemTestAction\n",
+            ),
+        )
+        .unwrap();
+
+        let mut tr_m = Transmitter::default();
+        tr_m.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("dbfile"),
+            s(":memory:"),
+        ]))
+        .await
+        .unwrap();
+        tr_m.dispatch(&PickleValue::List(vec![s("add"), s("m7"), s("polling")]))
+            .await
+            .unwrap();
+        tr_m.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("m7"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        tr_m.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("m7"),
+            s("addaction"),
+            s("act_a"),
+            s(py_mem2.to_str().unwrap()),
+            s("{}"),
+        ]))
+        .await
+        .unwrap();
+        tr_m.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("m7"),
+            s("addaction"),
+            s("act_b"),
+            s(py_mem2.to_str().unwrap()),
+            s("{}"),
+        ]))
+        .await
+        .unwrap();
+        tr_m.dispatch(&PickleValue::List(vec![s("start"), s("m7")]))
+            .await
+            .unwrap();
+
+        // Finding #6: hold a tx in act_a's background thread and call ping_fast on act_b.
+        assert_eq!(
+            tr_m.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("m7"),
+                s("action"),
+                s("act_a"),
+                s("start_hold_tx"),
+            ]))
+            .await
+            .unwrap(),
+            s("holding")
+        );
+        let t0 = Instant::now();
+        let pong = tr_m
+            .dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("m7"),
+                s("action"),
+                s("act_b"),
+                s("ping_fast"),
+            ]))
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(pong, s("pong"));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "DB-free command on act_b must not block on act_a's open tx: {elapsed:?}"
+        );
+        assert_eq!(
+            tr_m.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("m7"),
+                s("action"),
+                s("act_a"),
+                s("release_hold_tx"),
+            ]))
+            .await
+            .unwrap(),
+            s("released")
+        );
+
+        // Finding #7: explicit commit() and rollback() inside `with db._db:`.
+        assert_eq!(
+            tr_m.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("m7"),
+                s("action"),
+                s("act_a"),
+                s("test_explicit_commit_and_rollback"),
+            ]))
+            .await
+            .unwrap(),
+            s("kept,kept2")
+        );
+
+        // Finding #8: 2 MiB BLOB round-trip + >4 MiB rejection keeping connection usable.
+        tr_m.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("m7"),
+            s("banip"),
+            s("192.0.2.250"),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(
+            tr_m.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("m7"),
+                s("action"),
+                s("act_a"),
+                s("test_blob_2mb_and_oversize"),
+            ]))
+            .await
+            .unwrap(),
+            s("ok:1")
+        );
+        let _ = tr_m.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+}

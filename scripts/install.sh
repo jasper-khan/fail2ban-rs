@@ -103,8 +103,24 @@ backup_existing_path() {
     fi
 }
 
+has_saved_backup_files() {
+    [[ -d "$backup_dir" ]] || return 1
+    local rel
+    for rel in "${backup_targets[@]}" etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot; do
+        if [[ -e "$backup_dir/$rel" || -L "$backup_dir/$rel" ]]; then
+            return 0
+        fi
+    done
+    [[ -n "$(find "$backup_dir" -mindepth 1 \( -type f -o -type l \) -print -quit 2>/dev/null)" ]]
+}
+
 verify_backed_up_files() {
-    [[ -f "$backup_manifest" ]] || return 0
+    if [[ ! -f "$backup_manifest" ]]; then
+        if has_saved_backup_files; then
+            die "Missing backup manifest ($backup_manifest) while saved originals exist under $backup_dir; refusing to delete live or backup files."
+        fi
+        return 0
+    fi
     local rel src
     while IFS= read -r rel; do
         [[ -n "$rel" ]] || continue

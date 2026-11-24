@@ -7,16 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use crate::db::{BridgeSqlResult, Fail2BanDb};
+use crate::db::{BridgeSqlResult, DbMetadata, Fail2BanDb};
 use crate::error::{Error, Result};
 use crate::logging::{LogLevel, log_msg};
-use crate::protocol::{DEFAULT_TIMEOUT, MAX_FRAME_BYTES, PickleValue, decode_pickle};
+use crate::protocol::{
+    DEFAULT_TIMEOUT, MAX_FRAME_BYTES, PickleValue, decode_pickle, encode_pickle_v4,
+};
 use crate::ticket::{ActionContext, TicketId};
 
 #[derive(Debug)]
@@ -28,7 +29,7 @@ pub struct PythonAction {
     stdout: ChildStdout,
     ban_time: i64,
     max_ban_time: i64,
-    db: Option<Arc<Mutex<Fail2BanDb>>>,
+    db_meta: Option<Arc<DbMetadata>>,
     pub(super) norestored: bool,
     pub(super) prolongable: bool,
     pub(super) flushable: bool,
@@ -48,22 +49,24 @@ impl PythonAction {
         db: Option<Arc<Mutex<Fail2BanDb>>>,
     ) -> Result<Self> {
         let options = parse_options(options)?;
-        let (db_info, use_memory_bridge) = match db.as_ref() {
+        let (db_info, db_meta, use_memory_bridge) = match db.as_ref() {
             Some(db_arc) => {
                 let guard = db_arc
                     .lock()
                     .map_err(|_| Error::database("database lock poisoned"))?;
                 let is_mem = guard.filename() == ":memory:";
+                let meta = guard.metadata();
                 (
                     Some(json!({
                         "filename": guard.filename(),
                         "purgeage": guard.purge_age(),
                         "maxmatches": guard.max_matches(),
                     })),
+                    Some(meta),
                     is_mem,
                 )
             }
-            None => (None, false),
+            None => (None, None, false),
         };
         let library = std::env::current_exe()
             .ok()
@@ -147,7 +150,7 @@ impl PythonAction {
             stdout,
             ban_time,
             max_ban_time,
-            db,
+            db_meta,
             norestored: false,
             prolongable: false,
             flushable: false,
@@ -276,11 +279,9 @@ impl PythonAction {
     async fn request(&mut self, mut value: JsonValue) -> Result<PickleValue> {
         value["bantime"] = json!(self.ban_time);
         value["max_bantime"] = json!(self.max_ban_time);
-        if let Some(ref db_arc) = self.db
-            && let Ok(guard) = db_arc.lock()
-        {
-            value["db_purge_age"] = json!(guard.purge_age());
-            value["db_max_matches"] = json!(guard.max_matches());
+        if let Some(ref meta) = self.db_meta {
+            value["db_purge_age"] = json!(meta.purge_age());
+            value["db_max_matches"] = json!(meta.max_matches());
         }
         let mut request = serde_json::to_vec(&value).map_err(|e| Error::action(e.to_string()))?;
         request.push(b'\n');
@@ -395,26 +396,32 @@ fn log_fields(line: &str) -> Option<(LogLevel, &str, &str)> {
     ))
 }
 
-#[derive(Deserialize)]
-struct DbBridgeRequest {
-    op: String,
-    #[serde(default)]
-    sql: String,
-    #[serde(default)]
-    params: Vec<JsonValue>,
+enum DbBridgeRequest {
+    Begin,
+    Commit,
+    Rollback,
+    Exec {
+        sql: String,
+        params: Vec<PickleValue>,
+    },
+    Unknown(String),
 }
 
-fn db_ok_reply(res: BridgeSqlResult) -> JsonValue {
-    json!({
-        "ok": true,
-        "rows": res.rows,
-        "json_cols": res.json_cols,
-        "rowcount": res.rowcount,
-    })
+fn db_ok_empty() -> PickleValue {
+    PickleValue::Tuple(vec![PickleValue::Bool(true), PickleValue::None])
 }
 
-fn db_err_reply(err: impl Into<String>) -> JsonValue {
-    json!({ "ok": false, "error": err.into() })
+fn db_ok_reply(res: BridgeSqlResult) -> PickleValue {
+    let rows = PickleValue::List(res.rows.into_iter().map(PickleValue::Tuple).collect());
+    let json_cols = PickleValue::List(res.json_cols.into_iter().map(PickleValue::Bool).collect());
+    PickleValue::Tuple(vec![
+        PickleValue::Bool(true),
+        PickleValue::Tuple(vec![rows, json_cols, PickleValue::Int(res.rowcount)]),
+    ])
+}
+
+fn db_err_reply(err: impl Into<String>) -> PickleValue {
+    PickleValue::Tuple(vec![PickleValue::Bool(false), PickleValue::Str(err.into())])
 }
 
 fn read_db_frame(stream: &mut StdUnixStream) -> std::io::Result<DbBridgeRequest> {
@@ -429,13 +436,50 @@ fn read_db_frame(stream: &mut StdUnixStream) -> std::io::Result<DbBridgeRequest>
     }
     let mut buf = vec![0u8; size];
     stream.read_exact(&mut buf)?;
-    serde_json::from_slice(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid Python DB bridge request",
+        )
+    };
+    let val = decode_pickle(&buf).map_err(|_| invalid())?;
+    let PickleValue::Tuple(mut items) = val else {
+        return Err(invalid());
+    };
+    if items.is_empty() {
+        return Err(invalid());
+    }
+    let PickleValue::Str(op) = items.remove(0) else {
+        return Err(invalid());
+    };
+    match op.as_str() {
+        "begin" => Ok(DbBridgeRequest::Begin),
+        "commit" => Ok(DbBridgeRequest::Commit),
+        "rollback" => Ok(DbBridgeRequest::Rollback),
+        "exec" => {
+            if items.len() != 2 {
+                return Err(invalid());
+            }
+            let PickleValue::Str(sql) = items.remove(0) else {
+                return Err(invalid());
+            };
+            let params = match items.remove(0) {
+                PickleValue::List(v) | PickleValue::Tuple(v) => v,
+                _ => return Err(invalid()),
+            };
+            Ok(DbBridgeRequest::Exec { sql, params })
+        }
+        _ => Ok(DbBridgeRequest::Unknown(op)),
+    }
 }
 
-fn write_db_frame(stream: &mut StdUnixStream, reply: &JsonValue) -> std::io::Result<()> {
-    let payload = serde_json::to_vec(reply)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+fn write_db_frame(stream: &mut StdUnixStream, reply: &PickleValue) -> std::io::Result<()> {
+    let mut payload = encode_pickle_v4(reply);
+    if payload.len() > MAX_FRAME_BYTES {
+        payload = encode_pickle_v4(&db_err_reply(format!(
+            "database bridge response exceeds {MAX_FRAME_BYTES} byte frame limit"
+        )));
+    }
     let len = u32::try_from(payload.len())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "reply too large"))?;
     stream.write_all(&len.to_be_bytes())?;
@@ -449,15 +493,15 @@ fn serve_memory_db(mut stream: StdUnixStream, db: Arc<Mutex<Fail2BanDb>>) {
         let Ok(req) = read_db_frame(&mut stream) else {
             break;
         };
-        match req.op.as_str() {
-            "begin" => {
+        match req {
+            DbBridgeRequest::Begin => {
                 if !serve_memory_db_tx(&mut stream, &db) {
                     break;
                 }
             }
-            "exec" => {
+            DbBridgeRequest::Exec { sql, params } => {
                 let reply = match db.lock() {
-                    Ok(guard) => match guard.execute_bridge_sql(&req.sql, &req.params) {
+                    Ok(guard) => match guard.execute_bridge_sql(&sql, &params) {
                         Ok(res) => db_ok_reply(res),
                         Err(err) => db_err_reply(err),
                     },
@@ -467,12 +511,12 @@ fn serve_memory_db(mut stream: StdUnixStream, db: Arc<Mutex<Fail2BanDb>>) {
                     break;
                 }
             }
-            "commit" | "rollback" => {
-                if write_db_frame(&mut stream, &json!({ "ok": true })).is_err() {
+            DbBridgeRequest::Commit | DbBridgeRequest::Rollback => {
+                if write_db_frame(&mut stream, &db_ok_empty()).is_err() {
                     break;
                 }
             }
-            other => {
+            DbBridgeRequest::Unknown(other) => {
                 if write_db_frame(
                     &mut stream,
                     &db_err_reply(format!("unknown db bridge op: {other}")),
@@ -494,7 +538,7 @@ fn serve_memory_db_tx(stream: &mut StdUnixStream, db: &Arc<Mutex<Fail2BanDb>>) -
     let mut keep_alive = true;
     let mut disconnected = false;
     let tx_res = guard.with_bridge_transaction(|tx| {
-        if write_db_frame(stream, &json!({ "ok": true })).is_err() {
+        if write_db_frame(stream, &db_ok_empty()).is_err() {
             keep_alive = false;
             disconnected = true;
             return false;
@@ -506,9 +550,9 @@ fn serve_memory_db_tx(stream: &mut StdUnixStream, db: &Arc<Mutex<Fail2BanDb>>) -
                 disconnected = true;
                 return false;
             };
-            match req.op.as_str() {
-                "exec" => {
-                    let reply = match Fail2BanDb::execute_bridge_sql_on(tx, &req.sql, &req.params) {
+            match req {
+                DbBridgeRequest::Exec { sql, params } => {
+                    let reply = match Fail2BanDb::execute_bridge_sql_on(tx, &sql, &params) {
                         Ok(res) => db_ok_reply(res),
                         Err(err) => db_err_reply(err),
                     };
@@ -518,9 +562,21 @@ fn serve_memory_db_tx(stream: &mut StdUnixStream, db: &Arc<Mutex<Fail2BanDb>>) -
                         return false;
                     }
                 }
-                "commit" => return true,
-                "rollback" => return false,
-                other => {
+                DbBridgeRequest::Commit => return true,
+                DbBridgeRequest::Rollback => return false,
+                DbBridgeRequest::Begin => {
+                    if write_db_frame(
+                        stream,
+                        &db_err_reply("nested begin inside active transaction"),
+                    )
+                    .is_err()
+                    {
+                        keep_alive = false;
+                        disconnected = true;
+                        return false;
+                    }
+                }
+                DbBridgeRequest::Unknown(other) => {
                     if write_db_frame(
                         stream,
                         &db_err_reply(format!("unexpected db bridge op in transaction: {other}")),
@@ -540,7 +596,7 @@ fn serve_memory_db_tx(stream: &mut StdUnixStream, db: &Arc<Mutex<Fail2BanDb>>) -
         return false;
     }
     let reply = match tx_res {
-        Ok(()) => json!({ "ok": true }),
+        Ok(()) => db_ok_empty(),
         Err(err) => db_err_reply(err),
     };
     if write_db_frame(stream, &reply).is_err() {
