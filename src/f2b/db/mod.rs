@@ -202,6 +202,34 @@ impl Fail2BanDb {
         Ok(())
     }
 
+    /// Commit the configured jail membership before replacing any running jail.
+    pub(crate) fn prepare_reload(
+        &self,
+        enable: &[String],
+        disable: &[String],
+        reset: bool,
+    ) -> Result<()> {
+        if enable.is_empty() && disable.is_empty() && !reset {
+            return Ok(());
+        }
+        let mut conn = self.lock_conn()?;
+        let mut update = || -> rusqlite::Result<()> {
+            let tx = conn.transaction()?;
+            if reset {
+                tx.execute("UPDATE jails SET enabled = 0", [])?;
+            } else {
+                for name in disable {
+                    tx.execute("UPDATE jails SET enabled = 0 WHERE name = ?1", [name])?;
+                }
+            }
+            for name in enable {
+                tx.execute(UPSERT_JAIL, [name])?;
+            }
+            tx.commit()
+        };
+        update().map_err(|e| sql_error("preparing reload", &e))
+    }
+
     /// Mark a jail disabled (`enabled = 0`), matching upstream `Fail2BanDb.delJail`.
     pub fn del_jail(&self, jail: &str) -> Result<()> {
         let conn = self.lock_conn()?;

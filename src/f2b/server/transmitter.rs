@@ -359,49 +359,52 @@ impl Transmitter {
                 }
             }
         }
-        if result.is_ok()
-            && let Some(new_db) = staged_db
-        {
-            if let Err(err) = self.stop_all().await {
-                result = Err(err);
-            } else {
-                self.db = new_db;
-                if let Err(err) = self.with_db(|db| db.del_all_jails()) {
-                    result = Err(err);
+        let retired: Vec<_> = leftover
+            .into_iter()
+            .filter_map(|(name, state)| state.untouched.then_some(name))
+            .collect();
+        if result.is_ok() {
+            result = match &staged_db {
+                Some(new_db) => {
+                    let prepared = new_db
+                        .as_ref()
+                        .map(|db| {
+                            db.lock()
+                                .map_err(|_| Error::database("database lock poisoned"))?
+                                .prepare_reload(&staged_order, &[], true)
+                        })
+                        .transpose();
+                    prepared
+                        .and_then(|_| self.with_db(|db| db.del_all_jails()))
+                        .map(|_| ())
                 }
-            }
+                None => self
+                    .with_db(|db| db.prepare_reload(&staged_order, &retired, false))
+                    .map(|_| ()),
+            };
         }
         if result.is_ok() {
+            if let Some(new_db) = staged_db {
+                self.db = new_db;
+            }
             for name in staged_order {
                 let Some(candidate) = staged_jails.remove(&name) else {
                     continue;
                 };
-                if self.jails.contains_key(&name)
-                    && let Err(err) = self.remove_jail(&name).await
-                {
-                    result = Err(err);
-                    break;
-                }
-                if let Err(err) = self.with_db(|db| db.add_jail(&name)) {
-                    result = Err(err);
-                    break;
-                }
-                self.jails.insert(name.clone(), candidate);
-                if !self.jail_order.iter().any(|existing| existing == &name) {
+                if let Some(old) = self.jails.get(&name) {
+                    old.stop().await?;
+                } else {
                     self.jail_order.push(name.clone());
                 }
-                if staged_to_start.contains(&name)
-                    && let Err(err) = self.jails[&name].start().await
-                {
-                    result = Err(err);
-                    break;
+                if staged_to_start.contains(&name) {
+                    candidate.start_validated().await;
                 }
+                self.jails.insert(name, candidate);
             }
-        }
-        if result.is_ok() {
-            for (name, state) in leftover {
-                if state.untouched && self.jails.contains_key(&name) {
-                    result = result.and(self.remove_jail(&name).await);
+            for name in retired {
+                if let Some(old) = self.jails.remove(&name) {
+                    self.jail_order.retain(|existing| existing != &name);
+                    old.stop().await?;
                 }
             }
         } else {

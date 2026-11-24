@@ -24,8 +24,12 @@ const INOTIFY_FILE_MASK: u32 = nix::libc::IN_MODIFY
     | nix::libc::IN_DELETE_SELF
     | nix::libc::IN_MOVE_SELF;
 
-const INOTIFY_DIR_MASK: u32 =
-    nix::libc::IN_MODIFY | nix::libc::IN_ATTRIB | nix::libc::IN_MOVED_TO | nix::libc::IN_CREATE;
+const INOTIFY_DIR_MASK: u32 = nix::libc::IN_MODIFY
+    | nix::libc::IN_ATTRIB
+    | nix::libc::IN_MOVED_TO
+    | nix::libc::IN_CREATE
+    | nix::libc::IN_MOVE_SELF
+    | nix::libc::IN_DELETE_SELF;
 
 const DEFAULT_PENDING_RETRY: Duration = Duration::from_secs(5);
 const READ_BUF_BYTES: usize = 32 * 1024;
@@ -238,10 +242,7 @@ impl FilterPyinotify {
     }
 
     fn register_dir_watch(&mut self, fd: &InotifyFd, file_path: &Path) {
-        let dir = match file_path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
+        let dir = watch_parent(file_path).to_owned();
         self.dir_children
             .entry(dir.clone())
             .or_default()
@@ -265,7 +266,7 @@ impl FilterPyinotify {
         }
     }
 
-    fn register_file_watch(&mut self, fd: &InotifyFd, file_path: &Path) {
+    fn register_file_watch(&mut self, fd: &InotifyFd, file_path: &Path) -> bool {
         match fd.add_watch(file_path, INOTIFY_FILE_MASK) {
             Ok(wd) => {
                 if let Some(prev_wd) = self.path_to_file_wd.insert(file_path.to_path_buf(), wd)
@@ -275,6 +276,7 @@ impl FilterPyinotify {
                     fd.remove_watch(prev_wd);
                 }
                 self.file_wds.insert(wd, file_path.to_path_buf());
+                true
             }
             Err(err) => {
                 log_msg(
@@ -282,7 +284,16 @@ impl FilterPyinotify {
                     "fail2ban.filter",
                     &format!("Cannot add inotify watch on {:?}: {err}", file_path),
                 );
+                false
             }
+        }
+    }
+
+    fn refresh_file_watch(&mut self, fd: &InotifyFd, path: &Path) {
+        if self.register_file_watch(fd, path) && self.dir_to_wd.contains_key(watch_parent(path)) {
+            self.pending.remove(path);
+        } else if let Some(cfg) = self.configs.get(path) {
+            self.pending.insert(path.to_owned(), cfg.clone());
         }
     }
 
@@ -305,8 +316,7 @@ impl FilterPyinotify {
                     out.push(wf.checkpoint_event());
                 }
                 self.watched.insert(path.clone(), wf);
-                self.pending.remove(&path);
-                self.register_file_watch(fd, &path);
+                self.refresh_file_watch(fd, &path);
             }
             Err(err) => {
                 if err.kind() != io::ErrorKind::NotFound {
@@ -326,8 +336,11 @@ impl FilterPyinotify {
         let pending_list: Vec<FileLogConfig> = self.pending.values().cloned().collect();
         for cfg in pending_list {
             self.register_dir_watch(fd, &cfg.path);
-            // Newly appeared files read from offset 0 so initial lines are never skipped.
-            self.try_open_file(fd, cfg, Some(false), &mut events);
+            if self.watched.contains_key(&cfg.path) {
+                self.process_path_event(fd, &cfg.path, true, &mut events);
+            } else {
+                self.try_open_file(fd, cfg, Some(false), &mut events);
+            }
         }
         events
     }
@@ -357,6 +370,24 @@ impl FilterPyinotify {
                     path,
                     (ev.mask & (nix::libc::IN_DELETE_SELF | nix::libc::IN_MOVE_SELF)) != 0,
                 ));
+                continue;
+            }
+            if ev.mask
+                & (nix::libc::IN_MOVE_SELF | nix::libc::IN_DELETE_SELF | nix::libc::IN_IGNORED)
+                != 0
+                && let Some(dir) = self.dir_wds.remove(&ev.wd)
+            {
+                self.dir_to_wd.remove(&dir);
+                if ev.mask & nix::libc::IN_IGNORED == 0 {
+                    fd.remove_watch(ev.wd);
+                }
+                if let Some(paths) = self.dir_children.get(&dir) {
+                    for path in paths {
+                        if let Some(cfg) = self.configs.get(path) {
+                            self.pending.insert(path.clone(), cfg.clone());
+                        }
+                    }
+                }
                 continue;
             }
             if let Some(dir) = self.dir_wds.get(&ev.wd)
@@ -402,13 +433,19 @@ impl FilterPyinotify {
         if let Some(wf) = self.watched.get_mut(path) {
             wf.collect_events(out);
             if refresh_watch || !self.path_to_file_wd.contains_key(path) {
-                self.register_file_watch(fd, path);
+                self.refresh_file_watch(fd, path);
             }
         } else if let Some(cfg) = self.pending.get(path).cloned() {
             // File just created after startup -> read from offset 0.
             self.try_open_file(fd, cfg, Some(false), out);
         }
     }
+}
+
+fn watch_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn read_inotify_batch(fd: RawFd, buf: &mut [u8]) -> io::Result<Vec<DecodedInotifyEvent>> {
@@ -521,6 +558,58 @@ mod tests {
         assert_eq!(parsed[1].wd, 4);
         assert_eq!(parsed[1].mask, nix::libc::IN_CREATE);
         assert_eq!(parsed[1].name.as_deref(), Some(Path::new("auth.log")));
+    }
+
+    #[tokio::test]
+    async fn follows_replaced_parent_and_drains_old_file_once() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("logs");
+        let moved = root.path().join("previous");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("service.log");
+        fs::write(&path, "first\n").unwrap();
+        let config = FileLogConfig {
+            path: path.clone(),
+            tail: false,
+            resume_fingerprint: None,
+            resume_offset: 0,
+            auto_seek: None,
+        };
+        let backend = FilterPyinotify::with_pending_retry(
+            vec![config],
+            LogEncoding::Utf8,
+            Duration::from_millis(30),
+        );
+        let (tx, mut rx) = mpsc::channel(32);
+        let (shutdown, stop) = watch::channel(false);
+        let task = tokio::spawn(backend.run(tx, stop));
+        async fn next_line(rx: &mut mpsc::Receiver<LogEvent>) -> String {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let LogEvent::Line { line, .. } = rx.recv().await.unwrap() {
+                        return line;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+        assert_eq!(next_line(&mut rx).await, "first");
+        fs::rename(&parent, &moved).unwrap();
+        let mut old = fs::OpenOptions::new()
+            .append(true)
+            .open(moved.join("service.log"))
+            .unwrap();
+        writeln!(old, "old tail").unwrap();
+        assert_eq!(next_line(&mut rx).await, "old tail");
+        fs::create_dir(&parent).unwrap();
+        fs::write(&path, "replacement\n").unwrap();
+        assert_eq!(next_line(&mut rx).await, "replacement");
+        let mut current = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(current, "append").unwrap();
+        assert_eq!(next_line(&mut rx).await, "append");
+        shutdown.send(true).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -344,6 +344,56 @@ fn active_files_snapshot(cfg: &JournalConfig) -> Vec<(PathBuf, u64, u64)> {
     .collect()
 }
 
+const JOURNAL_FIELDS: &str = "--output-fields=MESSAGE,_HOSTNAME,SYSLOG_IDENTIFIER,_COMM,SYSLOG_PID,_PID,_SOURCE_REALTIME_TIMESTAMP,_SOURCE_MONOTONIC_TIMESTAMP";
+const MAX_JSON_RECORD: usize = 8 * 1024 * 1024;
+
+/// A partial JSON line belongs to the reader, including across timer wakeups.
+#[derive(Default)]
+pub(crate) struct JournalRecord {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl JournalRecord {
+    pub(crate) fn consume(&mut self, chunk: &[u8]) -> (usize, Option<serde_json::Value>) {
+        let newline = memchr::memchr(b'\n', chunk);
+        let len = newline.unwrap_or(chunk.len());
+        if !self.oversized {
+            if len > MAX_JSON_RECORD - self.bytes.len() {
+                self.oversized = true;
+                log_msg(
+                    LogLevel::Warning,
+                    "fail2ban.filter",
+                    "Skipping oversized journal record",
+                );
+            } else {
+                self.bytes.extend_from_slice(&chunk[..len]);
+            }
+        }
+        if newline.is_none() && !chunk.is_empty() {
+            return (len, None);
+        }
+        let value = if self.oversized || self.bytes.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice(&self.bytes) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    log_msg(
+                        LogLevel::Debug,
+                        "fail2ban.filter",
+                        &format!("Skipping malformed journal JSON: {err}"),
+                    );
+                    None
+                }
+            }
+        };
+        self.bytes.clear();
+        self.oversized = false;
+        (len + usize::from(newline.is_some()), value)
+    }
+}
+
 /// Systemd journal log reader spawning `journalctl --output=json --follow`.
 #[derive(Debug, Clone)]
 pub struct FilterSystemd {
@@ -495,7 +545,7 @@ impl FilterSystemd {
             let mut next_cursor: Option<String> = None;
             let mut last_ts: Option<f64> = None;
             let mut reader = BufReader::new(stdout);
-            let mut line_buf = String::new();
+            let mut record = JournalRecord::default();
             let mut stop_requested = false;
             let mut rotated_reopen = false;
             let mut made_progress = false;
@@ -509,7 +559,6 @@ impl FilterSystemd {
             rotate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
-                line_buf.clear();
                 tokio::select! {
                     res = shutdown.changed() => {
                         if res.is_err() || *shutdown.borrow() {
@@ -527,80 +576,70 @@ impl FilterSystemd {
                             break;
                         }
                     }
-                    read_res = reader.read_line(&mut line_buf) => {
+                    read_res = reader.fill_buf() => {
                         match read_res {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let trimmed = line_buf.trim();
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
-                                match serde_json::from_str::<serde_json::Value>(trimmed) {
-                                    Ok(val) => {
-                                        if let Some((formatted, preset_date)) = format_journal_entry(&val, self.encoding) {
-                                            let realtime_us = extract_u128_field(val.get("__REALTIME_TIMESTAMP"))
-                                                .or_else(|| {
-                                                    preset_date
-                                                        .filter(|ts| ts.is_finite() && *ts >= 0.0)
-                                                        .map(|ts| (ts * 1_000_000.0).round() as u128)
-                                                });
-                                            if let (Some(min_us), Some(rt_us)) = (cutoff_since_us, realtime_us)
-                                                && rt_us < min_us
-                                            {
-                                                continue;
+                            Ok(chunk) => {
+                                let eof = chunk.is_empty();
+                                let (used, value) = record.consume(chunk);
+                                reader.consume(used);
+                                if let Some(val) = value
+                                    && let Some((formatted, preset_date)) = format_journal_entry(&val, self.encoding)
+                                {
+                                    let realtime_us = extract_u128_field(val.get("__REALTIME_TIMESTAMP"))
+                                        .or_else(|| {
+                                            preset_date
+                                                .filter(|ts| ts.is_finite() && *ts >= 0.0)
+                                                .map(|ts| (ts * 1_000_000.0).round() as u128)
+                                        });
+                                    if let (Some(min_us), Some(rt_us)) = (cutoff_since_us, realtime_us)
+                                        && rt_us < min_us
+                                    {
+                                        continue;
+                                    }
+                                    if let Some(ts) = preset_date {
+                                        if !in_operation && ts >= start_wall - 1.0 {
+                                            in_operation = true;
+                                        }
+                                        last_ts = Some(last_ts.map_or(ts, |prev| prev.max(ts)));
+                                    }
+                                    let cursor = val
+                                        .get("__CURSOR")
+                                        .and_then(serde_json::Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_owned);
+                                    made_progress = true;
+                                    if !health_cleared {
+                                        health_cleared = true;
+                                        self.set_health(None);
+                                    }
+                                    let ev = LogEvent::Line {
+                                        line: formatted,
+                                        preset_date,
+                                        log_path: None,
+                                        in_operation,
+                                        checkpoint: None,
+                                        journal_cursor: cursor.clone(),
+                                    };
+                                    tokio::select! {
+                                        biased;
+                                        res = shutdown.changed() => {
+                                            if res.is_err() || *shutdown.borrow() {
+                                                stop_requested = true;
+                                                break;
                                             }
-                                            if let Some(ts) = preset_date {
-                                                if !in_operation && ts >= start_wall - 1.0 {
-                                                    in_operation = true;
-                                                }
-                                                last_ts = Some(last_ts.map_or(ts, |prev| prev.max(ts)));
+                                        }
+                                        send_res = tx.send(ev) => {
+                                            if send_res.is_err() {
+                                                stop_requested = true;
+                                                break;
                                             }
-                                            let cursor = val
-                                                .get("__CURSOR")
-                                                .and_then(serde_json::Value::as_str)
-                                                .filter(|s| !s.is_empty())
-                                                .map(str::to_owned);
-                                            made_progress = true;
-                                            if !health_cleared {
-                                                health_cleared = true;
-                                                self.set_health(None);
-                                            }
-                                            let ev = LogEvent::Line {
-                                                line: formatted,
-                                                preset_date,
-                                                log_path: None,
-                                                in_operation,
-                                                checkpoint: None,
-                                                journal_cursor: cursor.clone(),
-                                            };
-                                            tokio::select! {
-                                                biased;
-                                                res = shutdown.changed() => {
-                                                    if res.is_err() || *shutdown.borrow() {
-                                                        stop_requested = true;
-                                                        break;
-                                                    }
-                                                }
-                                                send_res = tx.send(ev) => {
-                                                    if send_res.is_err() {
-                                                        stop_requested = true;
-                                                        break;
-                                                    }
-                                                    if let Some(c) = cursor {
-                                                        next_cursor = Some(c);
-                                                    }
-                                                }
+                                            if let Some(c) = cursor {
+                                                next_cursor = Some(c);
                                             }
                                         }
                                     }
-                                    Err(err) => {
-                                        log_msg(
-                                            LogLevel::Debug,
-                                            "fail2ban.filter",
-                                            &format!("Skipping malformed journalctl JSON line: {err}"),
-                                        );
-                                    }
                                 }
+                                if eof { break; }
                             }
                             Err(err) => {
                                 log_msg(
@@ -745,7 +784,11 @@ fn build_journalctl_args_inner(
     tail: bool,
     follow: bool,
 ) -> Vec<String> {
-    let mut args = vec!["--output=json".to_owned()];
+    let mut args = vec![
+        "--output=json".to_owned(),
+        "--all".to_owned(),
+        JOURNAL_FIELDS.to_owned(),
+    ];
     if follow {
         args.push("--follow".to_owned());
     }
@@ -967,6 +1010,27 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn fragmented_long_journal_record_and_oversize_recovery() {
+        let message = "x".repeat(8193);
+        let line = serde_json::json!({"MESSAGE": message}).to_string();
+        let mut record = JournalRecord::default();
+        for chunk in line.as_bytes().chunks(173) {
+            assert_eq!(record.consume(chunk), (chunk.len(), None));
+        }
+        let (used, value) = record.consume(b"\nnext");
+        assert_eq!(used, 1);
+        assert_eq!(value.unwrap()["MESSAGE"], message);
+        let chunk = [b'x'; 8192];
+        for _ in 0..=MAX_JSON_RECORD / chunk.len() {
+            assert_eq!(record.consume(&chunk), (chunk.len(), None));
+        }
+        assert!(record.bytes.len() <= MAX_JSON_RECORD);
+        assert_eq!(record.consume(b"\n"), (1, None));
+        record.consume(br#"{"MESSAGE":"next"}"#);
+        assert_eq!(record.consume(b"").1.unwrap()["MESSAGE"], "next");
+    }
+
+    #[test]
     fn build_journalctl_args_formats_matches_flags_path_and_since() {
         let cfg = JournalConfig {
             matches: vec![
@@ -985,6 +1049,8 @@ mod tests {
             tail_args,
             vec![
                 "--output=json",
+                "--all",
+                JOURNAL_FIELDS,
                 "--follow",
                 "--no-pager",
                 "--lines=0",

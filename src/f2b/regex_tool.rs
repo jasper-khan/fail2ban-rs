@@ -16,7 +16,7 @@ use crate::date::strptime::set_alternate_year;
 use crate::error::{Error, Result};
 use crate::filter::backend::JournalConfig;
 use crate::filter::backend::systemd::{
-    build_journalctl_args, format_journal_entry, parse_systemd_journal_options,
+    JournalRecord, build_journalctl_args, format_journal_entry, parse_systemd_journal_options,
 };
 use crate::filter::ipdns::UseDns;
 use crate::filter::regex::FailRegex;
@@ -1349,27 +1349,44 @@ fn read_journal_entries(
 ) -> Result<Vec<(String, Option<f64>)>> {
     let mut args = build_journalctl_args(cfg, None, false);
     args.retain(|a| a != "--follow");
-    let out = Command::new("journalctl")
+    let mut child = Command::new("journalctl")
         .args(&args)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| Error::io("executing journalctl", e))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut entries = Vec::new();
+    let read = (|| -> std::io::Result<()> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing journalctl stdout"))?;
+        let mut reader = BufReader::new(stdout);
+        let mut record = JournalRecord::default();
+        loop {
+            let chunk = reader.fill_buf()?;
+            let eof = chunk.is_empty();
+            let (used, value) = record.consume(chunk);
+            reader.consume(used);
+            if let Some(entry) = value.and_then(|v| format_journal_entry(&v, encoding)) {
+                entries.push(entry);
+            }
+            if eof {
+                return Ok(());
+            }
+        }
+    })();
+    if read.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|e| Error::io("waiting for journalctl", e))?;
+    read.map_err(|e| Error::io("reading journalctl", e))?;
+    if !status.success() {
         return Err(Error::io(
-            format!("journalctl exited with {}: {}", out.status, stderr.trim()),
+            format!("journalctl exited with {status}"),
             io::Error::other("journalctl failed"),
         ));
-    }
-    let mut entries = Vec::new();
-    for raw_line in out.stdout.split(|&b| b == b'\n') {
-        if raw_line.is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(raw_line)
-            && let Some(entry) = format_journal_entry(&val, encoding)
-        {
-            entries.push(entry);
-        }
     }
     Ok(entries)
 }

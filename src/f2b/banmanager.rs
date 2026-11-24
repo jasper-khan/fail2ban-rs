@@ -32,10 +32,18 @@ struct BanEntry {
     insertion: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingActions {
+    pub(crate) ban: Vec<String>,
+    pub(crate) reban: Vec<String>,
+    pub(crate) previously_banned: bool,
+}
+
 /// Tracks active bans per `TicketId`, preserving insertion order for expiration.
 #[derive(Debug)]
 pub struct BanManager {
     ban_list: HashMap<TicketId, BanEntry>,
+    pending_actions: HashMap<TicketId, PendingActions>,
     next_seq: u64,
     ban_time: i64,
     total_bans: u64,
@@ -52,6 +60,7 @@ impl BanManager {
     pub fn new() -> Self {
         Self {
             ban_list: HashMap::new(),
+            pending_actions: HashMap::new(),
             next_seq: 0,
             ban_time: DEFAULT_BAN_TIME,
             total_bans: 0,
@@ -69,7 +78,9 @@ impl BanManager {
     }
 
     pub fn size(&self) -> usize {
-        self.ban_list.len()
+        self.ban_list
+            .len()
+            .saturating_sub(self.pending_actions.len())
     }
 
     pub fn total_bans(&self) -> u64 {
@@ -81,7 +92,60 @@ impl BanManager {
     }
 
     pub fn in_ban_list(&self, id: &TicketId) -> bool {
-        self.ban_list.contains_key(id)
+        self.ban_list.contains_key(id) && !self.pending_actions.contains_key(id)
+    }
+
+    pub(crate) fn pending_ban(&self, id: &TicketId) -> Option<(&Ticket, &PendingActions)> {
+        Some((self.get_ticket_by_id(id)?, self.pending_actions.get(id)?))
+    }
+
+    pub(crate) fn pending_tickets(&self) -> impl Iterator<Item = &Ticket> {
+        self.pending_actions
+            .keys()
+            .filter_map(|id| self.get_ticket_by_id(id))
+    }
+
+    /// Partial bans remain available for expiry and explicit unban.
+    pub(crate) fn begin_actions(&mut self, id: &TicketId) {
+        if !self.ban_list.contains_key(id) {
+            return;
+        }
+        self.pending_actions
+            .insert(id.clone(), PendingActions::default());
+        self.total_bans = self.total_bans.saturating_sub(1);
+    }
+
+    pub(crate) fn failed_reban(&mut self, id: &TicketId, action: String) {
+        if !self.ban_list.contains_key(id) {
+            return;
+        }
+        let pending = self
+            .pending_actions
+            .entry(id.clone())
+            .or_insert_with(|| PendingActions {
+                previously_banned: true,
+                ..Default::default()
+            });
+        if !pending.reban.contains(&action) {
+            pending.reban.push(action);
+        }
+    }
+
+    /// Return true only on the first successful application of this ticket.
+    pub(crate) fn finish_actions(&mut self, id: &TicketId, failed: PendingActions) -> bool {
+        if !self.ban_list.contains_key(id) {
+            self.pending_actions.remove(id);
+            return false;
+        }
+        if !failed.ban.is_empty() || !failed.reban.is_empty() {
+            self.pending_actions.insert(id.clone(), failed);
+            return false;
+        }
+        self.pending_actions.remove(id);
+        if !failed.previously_banned {
+            self.total_bans = self.total_bans.saturating_add(1);
+        }
+        !failed.previously_banned
     }
 
     pub fn get_ticket_by_id(&self, id: &TicketId) -> Option<&Ticket> {
@@ -144,6 +208,7 @@ impl BanManager {
         let mut items: Vec<(&TicketId, f64, u64)> = self
             .ban_list
             .iter()
+            .filter(|(id, _)| !self.pending_actions.contains_key(*id))
             .map(|(id, entry)| {
                 (
                     id,
@@ -165,7 +230,11 @@ impl BanManager {
     /// When `with_time` is `false`, `end_of_ban` is `None`. When `with_time` is `true`,
     /// `end_of_ban` is `Some(timestamp)` for finite bans and `None` for permanent `-1` bans.
     pub fn get_ban_list_extended(&self, with_time: bool) -> Vec<(TicketId, f64, Option<f64>)> {
-        let mut entries: Vec<&BanEntry> = self.ban_list.values().collect();
+        let mut entries: Vec<&BanEntry> = self
+            .ban_list
+            .values()
+            .filter(|entry| !self.pending_actions.contains_key(&entry.ticket.fid))
+            .collect();
         entries.sort_unstable_by(|a, b| {
             comparison_end(&a.ticket, self.ban_time)
                 .total_cmp(&comparison_end(&b.ticket, self.ban_time))
@@ -208,7 +277,7 @@ impl BanManager {
         due.sort_unstable_by_key(|(seq, _)| *seq);
         let removed: Vec<Ticket> = due
             .into_iter()
-            .filter_map(|(_, id)| self.ban_list.remove(&id).map(|e| e.ticket))
+            .filter_map(|(_, id)| self.remove_by_id_deferred(&id))
             .collect();
         self.recompute_next_unban();
         removed
@@ -216,6 +285,7 @@ impl BanManager {
 
     /// Remove and return all active ban tickets in insertion order.
     pub fn flush_ban_list(&mut self) -> Vec<Ticket> {
+        self.pending_actions.clear();
         let mut entries: Vec<BanEntry> = self.ban_list.drain().map(|(_, e)| e).collect();
         entries.sort_unstable_by_key(|e| e.insertion);
         self.next_unban_time = PERMANENT_END;
@@ -232,6 +302,7 @@ impl BanManager {
     /// Remove and return the active ban ticket for `id` without recomputing `next_unban_time`.
     /// Callers using this in a batch must call [`Self::recompute_next_unban`] before returning.
     pub fn remove_by_id_deferred(&mut self, id: &TicketId) -> Option<Ticket> {
+        self.pending_actions.remove(id);
         self.ban_list.remove(id).map(|e| e.ticket)
     }
 

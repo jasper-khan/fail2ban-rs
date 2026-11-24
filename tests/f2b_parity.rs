@@ -1283,6 +1283,32 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
         "old jail must not be stopped before staged replacement is validated:\n{log_after_switch}"
     );
 
+    // A failure writing jail membership during restart must leave the old worker and bans live.
+    let control = rusqlite::Connection::open(&db_path).unwrap();
+    control.execute_batch("CREATE TRIGGER unavailable BEFORE INSERT ON jails BEGIN SELECT RAISE(FAIL, 'offline'); END;").unwrap();
+    let candidate = PickleValue::List(vec![
+        PickleValue::List(vec![s("add"), s("svc"), s("polling")]),
+        PickleValue::List(vec![s("start"), s("svc")]),
+    ]);
+    assert!(
+        tr.dispatch(&PickleValue::List(vec![
+            s("reload"),
+            s("svc"),
+            PickleValue::List(vec![s("--restart")]),
+            candidate
+        ]))
+        .await
+        .is_err()
+    );
+    control.execute_batch("DROP TRIGGER unavailable").unwrap();
+    assert_eq!(
+        tr.dispatch(&PickleValue::List(vec![s("get"), s("svc"), s("banip")]))
+            .await
+            .unwrap(),
+        PickleValue::List(vec![s("192.0.2.50")])
+    );
+    assert!(!fs::read_to_string(&order_log).unwrap().contains("fw1:stop"));
+
     // 1c. Plain reload renaming fw1 -> fw_alias matches upstream Actions.add/reload:
     //     fw_alias is never started or replayed, fw1 is unbanned/stopped, and both absent from
     //     _reload_actions are removed while the ticket stays; `--restart` provides stop-and-restore.
@@ -3943,17 +3969,6 @@ async fn round6_unban_cidr_and_stop_reload_test() {
         ]))
         .await
         .unwrap();
-        // Recursive tag inside actioncheck forces consistency_check_on_flush to return Err.
-        tr.dispatch(&PickleValue::List(vec![
-            s("set"),
-            s("rstj"),
-            s("action"),
-            s("brokenfw"),
-            s("actioncheck"),
-            s("<actioncheck>"),
-        ]))
-        .await
-        .unwrap();
         tr.dispatch(&PickleValue::List(vec![
             s("set"),
             s("rstj"),
@@ -3993,6 +4008,18 @@ async fn round6_unban_cidr_and_stop_reload_test() {
             s("rstj"),
             s("banip"),
             s("192.0.2.77"),
+        ]))
+        .await
+        .unwrap();
+
+        // Recursive tag inside actioncheck forces consistency_check_on_flush to return Err.
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("rstj"),
+            s("action"),
+            s("brokenfw"),
+            s("actioncheck"),
+            s("<actioncheck>"),
         ]))
         .await
         .unwrap();
@@ -4153,7 +4180,9 @@ async fn production_audit_b1_to_b6_and_n1_to_n4_regression_test() {
                     "  # Simulate journalctl --follow pinned to old inode (hangs silently after rotation).\n",
                     "  sleep 30\n",
                     "else\n",
-                    "  printf '{{\"__REALTIME_TIMESTAMP\":\"{2}\",\"__CURSOR\":\"c2\",\"_HOSTNAME\":\"h\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"fail 192.0.2.2\"}}\\n'\n",
+                    "  printf '{{\"__REALTIME_TIMESTAMP\":\"{2}\",\"__CURSOR\":\"c2\",\"_HOSTNAME\":\"h\",\"SYSLOG_IDENTIFIER\":\"sshd\",'\n",
+                    "  sleep 0.2\n",
+                    "  printf '\"MESSAGE\":\"fail 192.0.2.2\"}}\\n'\n",
                     "  sleep 30\n",
                     "fi\n",
                 ),
