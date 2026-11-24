@@ -29,18 +29,6 @@ if [[ ! -f "$reference_archive" ]]; then
 fi
 printf '%s  %s\n' "$reference_sha" "$reference_archive" | "${checksum[@]}" -c -
 path="fail2ban-$reference"
-python3 - "$reference_archive" "$output/python.zip" "$path" <<'PY'
-import sys
-import tarfile
-import zipfile
-
-archive, target, root = sys.argv[1:]
-with tarfile.open(archive) as source, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as package:
-    for member in source:
-        name = member.name.removeprefix(root + "/")
-        if member.isfile() and name.startswith("fail2ban/") and name.endswith(".py") and not name.startswith("fail2ban/tests/"):
-            package.writestr(name, source.extractfile(member).read())
-PY
 
 for target in "${targets[@]}"; do
     case "$target" in
@@ -64,7 +52,6 @@ for target in "${targets[@]}"; do
     install -m 0755 "${CARGO_TARGET_DIR:-target}/$target/release/apache-fakegooglebot" \
         "$package/config/filter.d/ignorecommands/apache-fakegooglebot"
     cp dist/fail2ban.service dist/fail2ban.socket scripts/install.sh LICENSE README.md "$package/"
-    install -m 0644 "$output/python.zip" "$package/python.zip"
     install -D -m 0644 docs/MIGRATION_AND_ROLLBACK.md "$package/docs/MIGRATION_AND_ROLLBACK.md"
 
     (

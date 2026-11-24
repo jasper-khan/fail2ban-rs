@@ -7,17 +7,13 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
-};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
-use crate::protocol::PickleValue;
 use crate::ticket::{Ticket, TicketId};
 
 /// Default purge age in seconds (24 hours), matching upstream Fail2Ban 1.1.1.
@@ -88,44 +84,11 @@ const UPSERT_BIP: &str = "INSERT INTO bips(ip, jail, timeofban, bantime, bancoun
 const INSERT_BAN: &str =
     "INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES(?1, ?2, ?3, ?4, ?5, ?6)";
 
-/// Result of executing one bridged SQLite statement for a `:memory:` Python action database.
-pub(crate) struct BridgeSqlResult {
-    pub(crate) rows: Vec<Vec<PickleValue>>,
-    pub(crate) json_cols: Vec<bool>,
-    pub(crate) rowcount: i64,
-}
-
-/// Lock-free view of mutable database settings (`purge_age`, `max_matches`) so
-/// Python action lifecycle commands never block on an active `:memory:` transaction.
-#[derive(Debug)]
-pub(crate) struct DbMetadata {
-    purge_age: AtomicI64,
-    max_matches: AtomicUsize,
-}
-
-impl DbMetadata {
-    fn new(purge_age: i64, max_matches: usize) -> Self {
-        Self {
-            purge_age: AtomicI64::new(purge_age),
-            max_matches: AtomicUsize::new(max_matches),
-        }
-    }
-
-    pub(crate) fn purge_age(&self) -> i64 {
-        self.purge_age.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn max_matches(&self) -> usize {
-        self.max_matches.load(Ordering::Relaxed)
-    }
-}
-
 /// Thread-safe handle to Fail2Ban 1.1.1's v4 SQLite persistent database.
 pub struct Fail2BanDb {
     filename: String,
     purge_age: i64,
     max_matches: usize,
-    meta: Arc<DbMetadata>,
     conn: Mutex<Connection>,
 }
 
@@ -207,7 +170,6 @@ impl Fail2BanDb {
             filename: trimmed.to_owned(),
             purge_age,
             max_matches,
-            meta: Arc::new(DbMetadata::new(purge_age, max_matches)),
             conn: Mutex::new(conn),
         })
     }
@@ -222,7 +184,6 @@ impl Fail2BanDb {
 
     pub fn set_purge_age(&mut self, secs: i64) {
         self.purge_age = secs;
-        self.meta.purge_age.store(secs, Ordering::Relaxed);
     }
 
     pub fn max_matches(&self) -> usize {
@@ -231,11 +192,6 @@ impl Fail2BanDb {
 
     pub fn set_max_matches(&mut self, n: usize) {
         self.max_matches = n;
-        self.meta.max_matches.store(n, Ordering::Relaxed);
-    }
-
-    pub(crate) fn metadata(&self) -> Arc<DbMetadata> {
-        Arc::clone(&self.meta)
     }
 
     /// Register or re-enable a jail in the `jails` table.
@@ -711,89 +667,6 @@ impl Fail2BanDb {
         .map_err(|e| sql_error("cleaning disabled jails", &e))?;
         tx.commit().map_err(|e| sql_error("committing purge", &e))?;
         Ok(del_bans + del_bips)
-    }
-
-    /// Run a Python `:memory:` bridge transaction under the SQLite connection lock.
-    /// Commits iff `f` returns `true`; otherwise drops the transaction to roll back.
-    pub(crate) fn with_bridge_transaction<F>(&self, f: F) -> std::result::Result<(), String>
-    where
-        F: FnOnce(&Transaction<'_>) -> bool,
-    {
-        let mut conn = self.lock_conn().map_err(|e| e.to_string())?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
-        if f(&tx) {
-            tx.commit().map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn execute_bridge_sql(
-        &self,
-        sql: &str,
-        params: &[PickleValue],
-    ) -> std::result::Result<BridgeSqlResult, String> {
-        let conn = self.lock_conn().map_err(|e| e.to_string())?;
-        Self::execute_bridge_sql_on(&conn, sql, params)
-    }
-
-    pub(crate) fn execute_bridge_sql_on(
-        conn: &Connection,
-        sql: &str,
-        params: &[PickleValue],
-    ) -> std::result::Result<BridgeSqlResult, String> {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let bound: Vec<SqlValue> = params
-            .iter()
-            .map(|v| match v {
-                PickleValue::None => SqlValue::Null,
-                PickleValue::Bool(b) => SqlValue::Integer(i64::from(*b)),
-                PickleValue::Int(i) => SqlValue::Integer(*i),
-                PickleValue::Float(f) => SqlValue::Real(*f),
-                PickleValue::Str(s) => SqlValue::Text(s.clone()),
-                PickleValue::Bytes(b) => SqlValue::Blob(b.clone()),
-                other => SqlValue::Text(other.to_string_lossy()),
-            })
-            .collect();
-        let col_count = stmt.column_count();
-        if col_count == 0 {
-            let changed = stmt
-                .execute(params_from_iter(bound))
-                .map_err(|e| e.to_string())?;
-            return Ok(BridgeSqlResult {
-                rows: Vec::new(),
-                json_cols: Vec::new(),
-                rowcount: changed as i64,
-            });
-        }
-        // Fail2Ban v4 schema uses column name `data` for every JSON column (`bans.data`, `bips.data`).
-        let json_cols: Vec<bool> = (0..col_count)
-            .map(|i| stmt.column_name(i) == Ok("data"))
-            .collect();
-        let mut rows_out = Vec::new();
-        let mut rows = stmt
-            .query(params_from_iter(bound))
-            .map_err(|e| e.to_string())?;
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let mut vals = Vec::with_capacity(col_count);
-            for idx in 0..col_count {
-                let cell = match row.get_ref(idx).map_err(|e| e.to_string())? {
-                    ValueRef::Null => PickleValue::None,
-                    ValueRef::Integer(i) => PickleValue::Int(i),
-                    ValueRef::Real(f) => PickleValue::Float(f),
-                    ValueRef::Text(b) => PickleValue::Str(String::from_utf8_lossy(b).into_owned()),
-                    ValueRef::Blob(b) => PickleValue::Bytes(b.to_vec()),
-                };
-                vals.push(cell);
-            }
-            rows_out.push(vals);
-        }
-        Ok(BridgeSqlResult {
-            rows: rows_out,
-            json_cols,
-            rowcount: -1,
-        })
     }
 
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {

@@ -748,7 +748,6 @@ impl Transmitter {
             "bantime" => {
                 let time = str2seconds_i64(&scalar(args, 0)?)?;
                 state.ban_manager.set_ban_time(time);
-                state.sync_python_ban_times();
                 key
             }
             "banip" => return Ok(integer(state.ban_ip(&strings(args)?).await?)),
@@ -796,7 +795,6 @@ impl Transmitter {
                 state
                     .ban_extra
                     .set_opt_value(&key["bantime.".len()..], arg(args, 0)?)?;
-                state.sync_python_ban_times();
                 key
             }
             _ => {
@@ -898,7 +896,6 @@ async fn change_action(
 ) -> Result<Value> {
     let key = string(args, 0)?;
     let cls = match action {
-        ActionKind::Python(py) => return py.set_or_call(key, args.get(1)).await,
         ActionKind::Command(a) if a.methods().iter().any(|m| m == key) => Some("CommandAction"),
         ActionKind::Smtp(a) if a.methods().iter().any(|m| m == key) => Some("SMTPAction"),
         ActionKind::Command(_) | ActionKind::Smtp(_) => None,

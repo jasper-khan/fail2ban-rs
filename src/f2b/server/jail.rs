@@ -403,8 +403,6 @@ impl JailState {
         init_json: Option<&str>,
     ) -> Result<()> {
         let init_str = init_json.unwrap_or("{}");
-        let ban_time = self.ban_manager.ban_time();
-        let max_ban_time = self.ban_extra.max_ban_time(ban_time);
         if let Some(pos) = self.actions.iter().position(|(n, _)| n == act_name) {
             if !self.reloading {
                 return Err(Error::invalid_command(format!(
@@ -426,46 +424,18 @@ impl JailState {
                 }
                 return Ok(());
             }
-            let replacement = build_action(
-                &self.name,
-                act_name,
-                python_path,
-                init_str,
-                ban_time,
-                max_ban_time,
-                self.db.clone(),
-            )
-            .await?;
+            let replacement = build_action(&self.name, act_name, python_path, init_str)?;
             let old = std::mem::replace(&mut self.actions[pos].1, replacement);
             self.replaced_actions.push((act_name.to_owned(), old));
             return Ok(());
         }
 
-        let action = build_action(
-            &self.name,
-            act_name,
-            python_path,
-            init_str,
-            ban_time,
-            max_ban_time,
-            self.db.clone(),
-        )
-        .await?;
+        let action = build_action(&self.name, act_name, python_path, init_str)?;
         self.actions.push((act_name.to_owned(), action));
         if self.reloading {
             self.reload_added_actions.push(act_name.to_owned());
         }
         Ok(())
-    }
-
-    pub fn sync_python_ban_times(&mut self) {
-        let ban_time = self.ban_manager.ban_time();
-        let max_ban_time = self.ban_extra.max_ban_time(ban_time);
-        for (_, act) in &mut self.actions {
-            if let ActionKind::Python(py) = act {
-                py.set_ban_times(ban_time, max_ban_time);
-            }
-        }
     }
 
     /// Remove an action by name (`delaction`).
@@ -504,7 +474,6 @@ impl JailState {
                 ActionKind::Smtp(smtp) => {
                     smtp_actions.insert(name.clone(), smtp.clone());
                 }
-                ActionKind::Python(_) => {}
             }
         }
         self.reload_snapshot = Some(ReloadSnapshot {
@@ -563,7 +532,6 @@ impl JailState {
             self.fail_manager.set_max_matches(snap.fail_max_matches);
             self.ban_manager.set_ban_time(snap.ban_time);
             self.ban_extra = snap.ban_extra;
-            self.sync_python_ban_times();
             self.file_checkpoints = snap.file_checkpoints;
             self.dirty_file_checkpoints = snap.dirty_file_checkpoints;
         } else {
@@ -630,7 +598,6 @@ impl JailState {
                     for (pos, entry) in orig_indices.into_iter().zip(delacts) {
                         self.actions.insert(pos, entry);
                     }
-                    self.reapply_flushed_actions(&pass.flushed, true).await;
                     self.reload_abort();
                     return Err(err);
                 }
@@ -1264,14 +1231,12 @@ impl JailState {
         }
         if !on_stop {
             if let Some(err) = pass.first_error {
-                self.reapply_flushed_actions(&pass.flushed, true).await;
                 return Err(err);
             }
             // Match upstream Actions.__flushBan: clear jail database history after flush/check
             // and before draining in-memory tickets or running per-ticket unbans so retries recover.
-            if clear_db && let Err(err) = self.db_del_ban(None) {
-                self.reapply_flushed_actions(&pass.flushed, false).await;
-                return Err(err);
+            if clear_db {
+                self.db_del_ban(None)?;
             }
         } else if clear_db {
             self.db_del_ban(None)?;
@@ -1305,39 +1270,7 @@ impl JailState {
             }
             unbanned += 1;
         }
-        if let Some(err) = pass.first_error {
-            return Err(err);
-        }
         Ok(unbanned)
-    }
-
-    async fn reapply_flushed_actions(&mut self, flushed: &BTreeSet<String>, query_db: bool) {
-        if flushed.is_empty() {
-            return;
-        }
-        let active_tickets: Vec<Ticket> = self
-            .ban_manager
-            .get_ban_list(false)
-            .into_iter()
-            .filter_map(|id| self.ban_manager.get_ticket_by_id(&id).cloned())
-            .collect();
-        for ticket in &active_tickets {
-            let ctx = self.build_action_context_with_db(ticket, false, query_db);
-            for (act_name, act) in &mut self.actions {
-                if !flushed.contains(act_name) || (ticket.restored && act.norestored()) {
-                    continue;
-                }
-                if let Err(err) = act.reban(&ctx).await {
-                    f2b_log!(
-                        LogLevel::Error,
-                        "fail2ban.actions",
-                        "Failed to restore ban in jail '{}' action '{act_name}' for {} after flush failure: {err}",
-                        self.name,
-                        ticket.fid
-                    );
-                }
-            }
-        }
     }
 
     async fn unban_ticket_actions(&mut self, ticket: &Ticket, log_notice: bool) {
@@ -1365,20 +1298,8 @@ impl JailState {
     }
 
     fn build_action_context(&self, ticket: &Ticket, include_current: bool) -> ActionContext {
-        self.build_action_context_with_db(ticket, include_current, true)
-    }
-
-    fn build_action_context_with_db(
-        &self,
-        ticket: &Ticket,
-        include_current: bool,
-        query_db: bool,
-    ) -> ActionContext {
-        let (db_all_cnt, db_all_matches, db_jail_cnt, db_jail_matches) = if query_db {
-            self.db_get_bans_merged(&ticket.fid)
-        } else {
-            (0, Vec::new(), 0, Vec::new())
-        };
+        let (db_all_cnt, db_all_matches, db_jail_cnt, db_jail_matches) =
+            self.db_get_bans_merged(&ticket.fid);
 
         let (ip_failures, ip_matches) = if include_current {
             let mut m = db_all_matches;
@@ -1681,14 +1602,11 @@ impl JailState {
 
 struct FlushPassResult {
     skip_unban: BTreeSet<String>,
-    flushed: BTreeSet<String>,
     first_error: Option<Error>,
 }
 
 /// Run `flush()` across `actions` following upstream `Actions.__flushBan` (`actions.py:652-676`),
-/// invoking `consistencyCheck` on flush errors when available. Tracks actions whose live rules
-/// were cleared so callers can restore them if a later step aborts, and supports continuing
-/// across unaffected actions during jail shutdown.
+/// invoking `consistencyCheck` on flush errors when available.
 async fn flush_actions_or_check(
     jail_name: &str,
     actions: &mut [(String, ActionKind)],
@@ -1696,7 +1614,6 @@ async fn flush_actions_or_check(
     continue_on_error: bool,
 ) -> FlushPassResult {
     let mut skip_unban = BTreeSet::new();
-    let mut flushed = BTreeSet::new();
     let mut first_error = None;
     for (act_name, act) in actions {
         if !act.supports_flush() {
@@ -1710,7 +1627,6 @@ async fn flush_actions_or_check(
         match act.flush().await {
             Ok(true) => {
                 skip_unban.insert(act_name.clone());
-                flushed.insert(act_name.clone());
             }
             Ok(false) => {}
             Err(err) => {
@@ -1725,7 +1641,6 @@ async fn flush_actions_or_check(
                     "No flush occurred, do consistency check"
                 );
                 if act.has_consistency_check() {
-                    let before_epoch = act.ban_epoch();
                     if let Err(chk_err) = act.consistency_check_on_flush(on_stop).await {
                         f2b_log!(
                             LogLevel::Error,
@@ -1742,42 +1657,24 @@ async fn flush_actions_or_check(
                         continue;
                     }
                     skip_unban.insert(act_name.clone());
-                    if act.ban_epoch() > before_epoch {
-                        flushed.insert(act_name.clone());
-                    }
                 }
             }
         }
     }
     FlushPassResult {
         skip_unban,
-        flushed,
         first_error,
     }
 }
 
-async fn build_action(
+fn build_action(
     jail_name: &str,
     act_name: &str,
     python_path: Option<&str>,
     init_json: &str,
-    ban_time: i64,
-    max_ban_time: i64,
-    db: Option<Arc<std::sync::Mutex<Fail2BanDb>>>,
 ) -> Result<ActionKind> {
     match python_path {
-        Some(path) => {
-            ActionKind::from_python_spec(
-                jail_name,
-                act_name,
-                path,
-                init_json,
-                ban_time,
-                max_ban_time,
-                db,
-            )
-            .await
-        }
+        Some(path) => ActionKind::from_python_spec(jail_name, act_name, path, init_json),
         None => Ok(ActionKind::command(
             jail_name.to_owned(),
             act_name.to_owned(),
@@ -1916,11 +1813,15 @@ impl Jail {
         let mut st = self.state.lock().await;
         st.flush_file_checkpoints_to_db();
         st.flush_journal_pos_to_db(current_unix_seconds());
-        let mut flush_err = None;
         if (st.alive || !st.ban_manager.get_ban_list(false).is_empty() || !st.actions.is_empty())
             && let Err(err) = st.flush_bans(false, true).await
         {
-            flush_err = Some(err);
+            f2b_log!(
+                LogLevel::Error,
+                "fail2ban.actions",
+                "Failed to flush bans while stopping jail '{}': {err}",
+                st.name
+            );
         }
         let jail_name = st.name.clone();
         for (act_name, act) in st.actions.iter_mut().rev() {
@@ -1939,10 +1840,7 @@ impl Jail {
             "Jail '{}' stopped",
             jail_name
         );
-        match flush_err {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Restart only the log backend task when monitored paths/encoding/matches change at runtime.

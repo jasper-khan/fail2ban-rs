@@ -83,22 +83,12 @@ pub fn encode_pickle_v2(val: &PickleValue) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     out.push(0x80); // PROTO
     out.push(0x02); // version 2
-    write_val(&mut out, val, 2);
+    write_val(&mut out, val);
     out.push(b'.'); // STOP
     out
 }
 
-/// Encode `val` into Python pickle protocol 4 bytes (uses compact `BINBYTES` for binary values).
-pub fn encode_pickle_v4(val: &PickleValue) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
-    out.push(0x80); // PROTO
-    out.push(0x04); // version 4
-    write_val(&mut out, val, 4);
-    out.push(b'.'); // STOP
-    out
-}
-
-fn write_val(out: &mut Vec<u8>, val: &PickleValue, proto: u8) {
+fn write_val(out: &mut Vec<u8>, val: &PickleValue) {
     match val {
         PickleValue::None => out.push(b'N'),
         PickleValue::Bool(true) => out.push(0x88),
@@ -131,32 +121,26 @@ fn write_val(out: &mut Vec<u8>, val: &PickleValue, proto: u8) {
             out.extend_from_slice(bytes);
         }
         PickleValue::Bytes(bytes) => {
-            if proto >= 3 {
-                out.push(b'B'); // BINBYTES
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes);
-            } else {
-                // Protocol 2 encodes raw bytes via builtins.bytes([..]) so Python 3 decodes as bytes.
-                out.extend_from_slice(b"cbuiltins\nbytes\n");
-                out.push(b']');
-                if !bytes.is_empty() {
-                    out.push(b'(');
-                    for &b in bytes {
-                        out.push(b'K');
-                        out.push(b);
-                    }
-                    out.push(b'e');
+            // Protocol 2 encodes raw bytes via builtins.bytes([..]) so Python 3 decodes as bytes.
+            out.extend_from_slice(b"cbuiltins\nbytes\n");
+            out.push(b']');
+            if !bytes.is_empty() {
+                out.push(b'(');
+                for &b in bytes {
+                    out.push(b'K');
+                    out.push(b);
                 }
-                out.push(0x85); // TUPLE1
-                out.push(b'R'); // REDUCE
+                out.push(b'e');
             }
+            out.push(0x85); // TUPLE1
+            out.push(b'R'); // REDUCE
         }
         PickleValue::List(items) => {
             out.push(b']');
             if !items.is_empty() {
                 out.push(b'(');
                 for item in items {
-                    write_val(out, item, proto);
+                    write_val(out, item);
                 }
                 out.push(b'e');
             }
@@ -164,24 +148,24 @@ fn write_val(out: &mut Vec<u8>, val: &PickleValue, proto: u8) {
         PickleValue::Tuple(items) => match items.as_slice() {
             [] => out.push(b')'),
             [a] => {
-                write_val(out, a, proto);
+                write_val(out, a);
                 out.push(0x85); // TUPLE1
             }
             [a, b] => {
-                write_val(out, a, proto);
-                write_val(out, b, proto);
+                write_val(out, a);
+                write_val(out, b);
                 out.push(0x86); // TUPLE2
             }
             [a, b, c] => {
-                write_val(out, a, proto);
-                write_val(out, b, proto);
-                write_val(out, c, proto);
+                write_val(out, a);
+                write_val(out, b);
+                write_val(out, c);
                 out.push(0x87); // TUPLE3
             }
             many => {
                 out.push(b'(');
                 for item in many {
-                    write_val(out, item, proto);
+                    write_val(out, item);
                 }
                 out.push(b't'); // TUPLE
             }
@@ -191,8 +175,8 @@ fn write_val(out: &mut Vec<u8>, val: &PickleValue, proto: u8) {
             if !entries.is_empty() {
                 out.push(b'(');
                 for (k, v) in entries {
-                    write_val(out, k, proto);
-                    write_val(out, v, proto);
+                    write_val(out, k);
+                    write_val(out, v);
                 }
                 out.push(b'u'); // SETITEMS
             }
@@ -215,7 +199,7 @@ fn write_val(out: &mut Vec<u8>, val: &PickleValue, proto: u8) {
             out.push(b'\n');
             out.extend_from_slice(cls.as_bytes());
             out.push(b'\n');
-            write_val(out, &PickleValue::Str(message.clone()), proto);
+            write_val(out, &PickleValue::Str(message.clone()));
             out.push(0x85); // TUPLE1
             out.push(b'R'); // REDUCE
         }

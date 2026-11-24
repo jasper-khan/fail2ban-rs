@@ -11,7 +11,7 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 use crate::error::{Error, Result};
-pub use pickle::{PickleValue, decode_pickle, encode_pickle_v2, encode_pickle_v4};
+pub use pickle::{PickleValue, decode_pickle, encode_pickle_v2};
 
 pub const END_COMMAND: &[u8] = b"<F2B_END_COMMAND>";
 pub const CLOSE_COMMAND: &[u8] = b"<F2B_CLOSE_COMMAND>";

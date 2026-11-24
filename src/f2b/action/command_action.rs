@@ -554,6 +554,11 @@ impl CommandAction {
             }
         }
 
+        if matches!(mode, OpMode::Flush | OpMode::Reload) {
+            // Deduplicate identical flush/reload commands across families only within a single call.
+            self.executed_ops.retain(|(t, _), _| t != tag);
+        }
+
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1012,6 +1017,51 @@ mod tests {
         assert_eq!(
             read_log(&log),
             vec!["start", "check", "stop", "start", "check"]
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_dual_stack_flush_and_reload_execute_again_on_subsequent_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("trace.log");
+        let l_s = log.display().to_string();
+
+        let mut act = CommandAction::new("sshd".to_owned(), "fw".to_owned());
+        act.set_property("actionstart", &format!("echo start >> '{l_s}'"))
+            .unwrap();
+        act.set_property("actionban", &format!("echo ban:<ip> >> '{l_s}'"))
+            .unwrap();
+        act.set_property("actionflush", &format!("echo flush >> '{l_s}'"))
+            .unwrap();
+        act.set_property("actionreload", &format!("echo reload >> '{l_s}'"))
+            .unwrap();
+
+        act.start(true).await.unwrap();
+        act.ban(&ctx_for("192.0.2.1", "sshd", false)).await.unwrap();
+        act.ban(&ctx_for("2001:db8::1", "sshd", false))
+            .await
+            .unwrap();
+        // First flush covers both families and deduplicates identical flush command to once.
+        act.flush().await.unwrap();
+        // Re-banning IPv4 only and flushing again must NOT be skipped by stale IPv6 dedup.
+        act.ban(&ctx_for("192.0.2.2", "sshd", false)).await.unwrap();
+        act.flush().await.unwrap();
+        // Two reloads each deduplicate across families within the call, running twice total.
+        act.reload().await.unwrap();
+        act.reload().await.unwrap();
+
+        assert_eq!(
+            read_log(&log),
+            vec![
+                "start",
+                "ban:192.0.2.1",
+                "ban:2001:db8::1",
+                "flush",
+                "ban:192.0.2.2",
+                "flush",
+                "reload",
+                "reload",
+            ]
         );
     }
 }

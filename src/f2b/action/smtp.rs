@@ -48,7 +48,7 @@ pub struct SmtpAction {
 }
 
 impl SmtpAction {
-    // Recognize the verbatim bytes shipped in 1.1.1 so a customized file named smtp.py still runs as a Python action.
+    // Recognize the verbatim bytes shipped in 1.1.1 so customized files named smtp.py are rejected rather than silently altered.
     pub(crate) fn is_stock_module(path: &str) -> bool {
         const STOCK_SIZE: u64 = 6725;
         const STOCK_FNV1A: u64 = 0x6cd4_8e15_f154_e630;

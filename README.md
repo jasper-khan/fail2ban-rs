@@ -17,7 +17,7 @@ tests use Python 3 to run the original tools from `FAIL2BAN_111_SOURCE`.
 
 ## Build and install a release
 
-With Zig, `cargo-zigbuild`, and Python 3 installed, build the Linux amd64 and arm64 archives.
+With Zig and `cargo-zigbuild` installed, build the Linux amd64 and arm64 archives.
 
 ```bash
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
@@ -47,10 +47,10 @@ For an existing Fail2Ban installation, see the [migration and rollback guide](do
 
 ## SMTP and Python actions
 
-The built-in stock `smtp.py` action runs natively in Rust. `ssl=true` upgrades the
-connection with `STARTTLS` and accepts self-signed server certificates, matching
-Fail2Ban 1.1.1. Customized `smtp.py` and third-party `.py` actions run via system
-Python 3 using the bundled 1.1.1 action runtime library (`python.zip`) when configured.
+The built-in stock `smtp.py` action runs natively in Rust (no Python runtime required).
+`ssl=true` upgrades the connection with `STARTTLS` and accepts self-signed server
+certificates, matching Fail2Ban 1.1.1. Custom or third-party `.py` actions are not
+supported and return an explicit error when configured.
 
 ## License
 

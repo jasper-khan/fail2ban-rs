@@ -1,9 +1,8 @@
-//! Fail2Ban 1.1.1 shell, SMTP, and Python actions.
+//! Fail2Ban 1.1.1 shell and built-in SMTP actions.
 
 pub mod cmd;
 pub mod command_action;
 pub mod policy;
-pub mod python;
 pub mod smtp;
 pub mod tags;
 
@@ -12,20 +11,15 @@ pub use policy::{ActionPolicy, Family};
 pub use smtp::SmtpAction;
 pub use tags::{StaticTemplate, escape_tag, replace_dynamic_tags};
 
-use std::sync::{Arc, Mutex};
-
-use crate::db::Fail2BanDb;
 use crate::error::{Error, Result};
 use crate::protocol::PickleValue;
 use crate::ticket::ActionContext;
-use python::PythonAction;
 
-/// Unified runtime action wrapper (`CommandAction`, built-in `SmtpAction`, or custom `PythonAction`).
+/// Unified runtime action wrapper (`CommandAction` or built-in `SmtpAction`).
 #[derive(Debug)]
 pub enum ActionKind {
     Command(CommandAction),
     Smtp(SmtpAction),
-    Python(PythonAction),
 }
 
 impl ActionKind {
@@ -39,42 +33,28 @@ impl ActionKind {
         Self::Smtp(action)
     }
 
-    /// Instantiate a Python action module spec (`addaction <name> <path> <init_json>`).
+    /// Instantiate a `.py` action module spec (`addaction <name> <path> <init_json>`).
     ///
-    /// Stock Fail2Ban 1.1.1 `smtp.py` runs natively in Rust; customized `smtp.py`
-    /// and any third-party `.py` action run through the Python 3 action bridge.
-    pub async fn from_python_spec(
+    /// Only the stock Fail2Ban 1.1.1 `smtp.py` action is supported (implemented natively in Rust).
+    pub fn from_python_spec(
         jail_name: &str,
         act_name: &str,
         path: &str,
         init_json: &str,
-        ban_time: i64,
-        max_ban_time: i64,
-        db: Option<Arc<Mutex<Fail2BanDb>>>,
     ) -> Result<ActionKind> {
         if SmtpAction::is_stock_module(path) {
             let smtp = SmtpAction::from_json(jail_name.to_owned(), act_name.to_owned(), init_json)?;
             return Ok(Self::Smtp(smtp));
         }
-        Ok(Self::Python(
-            PythonAction::load(
-                jail_name,
-                act_name,
-                path,
-                init_json,
-                ban_time,
-                max_ban_time,
-                db,
-            )
-            .await?,
-        ))
+        Err(Error::action(format!(
+            "Custom Python actions are not supported in fail2ban-rs (only stock smtp.py is supported): {path}"
+        )))
     }
 
     pub fn name(&self) -> &str {
         match self {
             Self::Command(a) => a.name(),
             Self::Smtp(a) => a.name(),
-            Self::Python(a) => a.name(),
         }
     }
 
@@ -82,7 +62,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.jail_name(),
             Self::Smtp(a) => a.jail_name(),
-            Self::Python(a) => a.jail_name(),
         }
     }
 
@@ -90,7 +69,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.norestored(),
             Self::Smtp(a) => a.norestored(),
-            Self::Python(a) => a.norestored,
         }
     }
 
@@ -98,14 +76,13 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.prolongable(),
             Self::Smtp(a) => a.prolongable(),
-            Self::Python(a) => a.prolongable,
         }
     }
 
     pub fn ban_epoch(&self) -> u64 {
         match self {
             Self::Command(a) => a.ban_epoch(),
-            Self::Smtp(_) | Self::Python(_) => 0,
+            Self::Smtp(_) => 0,
         }
     }
 
@@ -123,9 +100,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.execute_raw_cmd(real_cmd, timeout_override).await,
             Self::Smtp(_) => Err(Error::action("executeCmd is not supported on smtp.py")),
-            Self::Python(_) => Err(Error::action(
-                "executeCmd is not supported directly on Python actions",
-            )),
         }
     }
 
@@ -133,34 +107,21 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.supports_flush(),
             Self::Smtp(_) => false,
-            Self::Python(a) => a.flushable,
         }
     }
 
     pub fn has_reload(&self) -> bool {
-        match self {
-            Self::Command(_) => true,
-            Self::Smtp(_) => false,
-            Self::Python(a) => a.reloadable,
-        }
+        matches!(self, Self::Command(_))
     }
 
     pub fn has_clear_all_params(&self) -> bool {
-        match self {
-            Self::Command(_) => true,
-            Self::Smtp(_) => false,
-            Self::Python(a) => a.has_clear_all_params,
-        }
+        matches!(self, Self::Command(_))
     }
 
     pub async fn clear_all_params(&mut self) -> Result<()> {
         match self {
             Self::Command(a) => a.clear_all_params(),
             Self::Smtp(a) => a.clear_all_params(),
-            Self::Python(a) if a.has_clear_all_params => {
-                a.method("clearAllParams", None).await?;
-            }
-            Self::Python(_) => {}
         }
         Ok(())
     }
@@ -169,10 +130,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.set_property(key, value),
             Self::Smtp(a) => a.set_property(key, value),
-            Self::Python(a) => a
-                .set_or_call(key, Some(&PickleValue::Str(value.to_owned())))
-                .await
-                .map(|_| ()),
         }
     }
 
@@ -180,7 +137,6 @@ impl ActionKind {
         Ok(match self {
             Self::Command(a) => a.get_property(key),
             Self::Smtp(a) => a.get_property(key),
-            Self::Python(a) => return a.query("get", Some(key)).await.map(Some),
         }
         .map(PickleValue::Str))
     }
@@ -189,7 +145,6 @@ impl ActionKind {
         Ok(PickleValue::str_list(match self {
             Self::Command(a) => a.property_names(),
             Self::Smtp(a) => a.property_names(),
-            Self::Python(a) => return a.query("properties", None).await,
         }))
     }
 
@@ -197,7 +152,6 @@ impl ActionKind {
         Ok(PickleValue::str_list(match self {
             Self::Command(a) => a.methods(),
             Self::Smtp(a) => a.methods(),
-            Self::Python(a) => return a.query("methods", None).await,
         }))
     }
 
@@ -205,7 +159,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.start(allow_ipv6).await,
             Self::Smtp(a) => a.start().await,
-            Self::Python(a) => a.method("start", None).await.map(|_| ()),
         }
     }
 
@@ -213,7 +166,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.stop().await,
             Self::Smtp(a) => a.stop().await,
-            Self::Python(a) => a.method("stop", None).await.map(|_| ()),
         }
     }
 
@@ -221,7 +173,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.ban(ctx).await,
             Self::Smtp(a) => a.ban(ctx).await,
-            Self::Python(a) => a.event("ban", ctx).await,
         }
     }
 
@@ -229,7 +180,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.reban(ctx).await,
             Self::Smtp(a) => a.reban(ctx).await,
-            Self::Python(a) => a.event("reban", ctx).await,
         }
     }
 
@@ -237,7 +187,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.prolong(ctx).await,
             Self::Smtp(_) => Ok(()),
-            Self::Python(a) => a.event("prolong", ctx).await,
         }
     }
 
@@ -245,7 +194,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.unban(ctx).await,
             Self::Smtp(a) => a.unban(ctx).await,
-            Self::Python(a) => a.event("unban", ctx).await,
         }
     }
 
@@ -253,32 +201,24 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.flush().await.map(|()| true),
             Self::Smtp(_) => Ok(false),
-            Self::Python(a) => a.flush().await,
         }
     }
 
-    pub async fn reload(&mut self, options: Option<&str>) -> Result<()> {
+    pub async fn reload(&mut self, _options: Option<&str>) -> Result<()> {
         match self {
             Self::Command(a) => a.reload().await,
             Self::Smtp(_) => Ok(()),
-            Self::Python(a) if a.reloadable => a.method("reload", options).await.map(|_| ()),
-            Self::Python(_) => Ok(()),
         }
     }
 
     pub fn has_consistency_check(&self) -> bool {
-        match self {
-            Self::Command(_) => true,
-            Self::Smtp(_) => false,
-            Self::Python(a) => a.checkable,
-        }
+        matches!(self, Self::Command(_))
     }
 
     pub async fn consistency_check(&mut self) -> Result<bool> {
         match self {
             Self::Command(a) => a.consistency_check().await,
             Self::Smtp(_) => Ok(true),
-            Self::Python(a) => a.consistency_check().await,
         }
     }
 
@@ -286,7 +226,6 @@ impl ActionKind {
         match self {
             Self::Command(a) => a.consistency_check_on_flush(on_stop).await,
             Self::Smtp(_) => Ok(true),
-            Self::Python(a) => a.consistency_check_on_flush(on_stop).await,
         }
     }
 }
@@ -297,7 +236,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn loads_stock_smtp_natively_and_custom_smtp_filename_in_python() {
+    async fn loads_stock_smtp_natively_and_rejects_custom_python_actions() {
         let Some(reference) = std::env::var_os("FAIL2BAN_111_SOURCE") else {
             return;
         };
@@ -308,11 +247,7 @@ mod tests {
             "smtp",
             stock.to_str().unwrap(),
             r#"{"dest":"ops@example.com","matches":"matches"}"#,
-            600,
-            600,
-            None,
         )
-        .await
         .unwrap();
         assert!(matches!(smtp, ActionKind::Smtp(_)));
         assert_eq!(smtp.name(), "smtp");
@@ -330,59 +265,16 @@ mod tests {
             &other_smtp,
         )
         .unwrap();
-        let action = ActionKind::from_python_spec(
+        let err = ActionKind::from_python_spec(
             "sshd",
             "example",
             other_smtp.to_str().unwrap(),
             r#"{"opt1":"world"}"#,
-            600,
-            600,
-            None,
         )
-        .await
-        .unwrap();
-        let ActionKind::Python(mut action) = action else {
-            panic!("expected Python action");
-        };
-        assert_eq!(
-            action
-                .set_or_call(
-                    "testmethod",
-                    Some(&PickleValue::Str(r#"{"text":"there"}"#.to_owned())),
-                )
-                .await
-                .unwrap(),
-            PickleValue::Str("Hello there world".to_owned())
-        );
-
-        // Invalid Python action modules must fail with clear upstream errors.
-        let no_action = reference.join("fail2ban/tests/files/action.d/action_noAction.py");
+        .unwrap_err();
         assert!(
-            ActionKind::from_python_spec(
-                "sshd",
-                "bad1",
-                no_action.to_str().unwrap(),
-                "{}",
-                600,
-                600,
-                None
-            )
-            .await
-            .is_err()
-        );
-        let no_method = reference.join("fail2ban/tests/files/action.d/action_nomethod.py");
-        assert!(
-            ActionKind::from_python_spec(
-                "sshd",
-                "bad2",
-                no_method.to_str().unwrap(),
-                "{}",
-                600,
-                600,
-                None
-            )
-            .await
-            .is_err()
+            err.to_string().contains("not supported"),
+            "unexpected error for custom python action: {err}"
         );
     }
 }
