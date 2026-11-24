@@ -48,15 +48,29 @@ pub struct SmtpAction {
 }
 
 impl SmtpAction {
-    // Recognize the verbatim bytes shipped in 1.1.1 so customized files named smtp.py are rejected rather than silently altered.
+    // Recognize the stock 1.1.1 smtp.py (normalizing CRLF -> LF) so customized files named smtp.py are rejected.
     pub(crate) fn is_stock_module(path: &str) -> bool {
-        const STOCK_SIZE: u64 = 6725;
+        const STOCK_SIZE: usize = 6725;
         const STOCK_FNV1A: u64 = 0x6cd4_8e15_f154_e630;
-        std::fs::metadata(path).is_ok_and(|info| info.is_file() && info.len() == STOCK_SIZE)
+        const MAX_READ_BYTES: u64 = 16_384;
+        std::fs::metadata(path).is_ok_and(|info| info.is_file() && info.len() <= MAX_READ_BYTES)
             && std::fs::read(path).is_ok_and(|bytes| {
-                bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-                    (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-                }) == STOCK_FNV1A
+                let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                let mut len = 0usize;
+                let mut idx = 0usize;
+                while idx < bytes.len() {
+                    let b = if bytes[idx] == b'\r' && bytes.get(idx + 1) == Some(&b'\n') {
+                        idx += 2;
+                        b'\n'
+                    } else {
+                        let c = bytes[idx];
+                        idx += 1;
+                        c
+                    };
+                    hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+                    len += 1;
+                }
+                len == STOCK_SIZE && hash == STOCK_FNV1A
             })
     }
 
@@ -484,6 +498,13 @@ async fn smtp_tls(
     host: &str,
     timeout: Duration,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    if !is_loopback_host(host) {
+        f2b_log!(
+            LogLevel::Warning,
+            "fail2ban.smtp",
+            "SMTP STARTTLS to '{host}' skips TLS certificate verification (matching Fail2Ban 1.1.1 smtp.py)"
+        );
+    }
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|e| Error::action(format!("invalid SMTP TLS server name: {e}")))?;
     let provider = rustls::crypto::ring::default_provider();
@@ -670,6 +691,18 @@ async fn expect_code<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+const MAX_SMTP_REPLY_BYTES: usize = 65_536;
+
+fn is_loopback_host(host: &str) -> bool {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    trimmed
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 async fn read_smtp_reply<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     io_timeout: Duration,
@@ -708,6 +741,12 @@ async fn read_smtp_reply<R: tokio::io::AsyncRead + Unpin>(
         reply_code = Some(code);
         let sep = trimmed.as_bytes().get(3).copied();
         let body_part = trimmed.get(4..).unwrap_or("");
+        let extra = body_part.len() + usize::from(!full_text.is_empty());
+        if full_text.len().saturating_add(extra) > MAX_SMTP_REPLY_BYTES {
+            return Err(Error::action(format!(
+                "SMTP multiline reply exceeds {MAX_SMTP_REPLY_BYTES} bytes"
+            )));
+        }
         if !full_text.is_empty() {
             full_text.push('\n');
         }

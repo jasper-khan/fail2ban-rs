@@ -606,18 +606,35 @@ impl CommandAction {
             }
 
             let static_cmd = self.get_operation(tag, family)?;
-            let real_cmd = match ctx {
-                Some(c) => tags::replace_dynamic_tags(
+            let shell_cmd = match ctx {
+                Some(c) if static_cmd.contains("<ip-host>") => {
+                    let resolved_host = match c.ticket.target_ip().ip() {
+                        Some(ip) => tokio::task::spawn_blocking(move || {
+                            crate::filter::ipdns::ip_to_name(&ip)
+                        })
+                        .await
+                        .ok()
+                        .flatten(),
+                        None => None,
+                    };
+                    tags::build_shell_command(&static_cmd, c, family.as_str(), None, &|_| {
+                        resolved_host.clone()
+                    })
+                }
+                Some(c) => tags::build_shell_command(
                     &static_cmd,
                     c,
                     family.as_str(),
                     None,
                     &tags::default_reverse_dns,
                 ),
-                None => static_cmd,
+                None => tags::ShellCommand {
+                    script: static_cmd,
+                    args: Vec::new(),
+                },
             };
 
-            let (ok, code) = self.execute_cmd(&real_cmd).await?;
+            let (ok, code) = self.execute_cmd(&shell_cmd).await?;
             repcnt += 1;
             if ok {
                 return Ok(());
@@ -724,24 +741,24 @@ impl CommandAction {
             ip_jail_matches: Vec::new(),
             jail_stats: Default::default(),
         };
-        let real_cmd = tags::replace_dynamic_tags(
+        let shell_cmd = tags::build_shell_command(
             static_cmd,
             &ctx,
             family.as_str(),
             None,
             &tags::default_reverse_dns,
         );
-        let (ok, _) = self.execute_cmd(&real_cmd).await?;
+        let (ok, _) = self.execute_cmd(&shell_cmd).await?;
         Ok(ok)
     }
 
-    async fn execute_cmd(&self, real_cmd: &str) -> Result<(bool, i32)> {
-        if real_cmd.trim().is_empty() {
+    async fn execute_cmd(&self, shell_cmd: &tags::ShellCommand) -> Result<(bool, i32)> {
+        if shell_cmd.script.trim().is_empty() {
             f2b_log!(LogLevel::Debug, "fail2ban.action", "Nothing to do");
             return Ok((true, 0));
         }
         let _guard = cmd_lock().lock().await;
-        cmd::run_shell_cmd(real_cmd, self.timeout, &[0]).await
+        cmd::run_shell_cmd_args(&shell_cmd.script, &shell_cmd.args, self.timeout, &[0]).await
     }
 }
 

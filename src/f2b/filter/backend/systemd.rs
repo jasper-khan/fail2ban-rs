@@ -2,6 +2,7 @@
 //! `fail2ban/server/filtersystemd.py`, backed by `journalctl --output=json --follow`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,6 +32,8 @@ pub const SD_JOURNAL_CURRENT_USER: u32 = 8;
 const HEALTHY_WINDOW: Duration = Duration::from_secs(2);
 /// Timeout for one-shot `journalctl --lines=0` configuration validation probes.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Interval for checking whether active journal files rotated or flushed to `/var/log/journal`.
+const DEFAULT_ROTATE_POLL: Duration = Duration::from_secs(2);
 
 /// Parsed systemd journal backend options shared by daemon jails and `fail2ban-regex`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +327,23 @@ pub async fn validate_journal_config(cfg: &JournalConfig, journalctl_bin: &str) 
     )))
 }
 
+fn should_watch_active_files(cfg: &JournalConfig) -> bool {
+    !cfg.rotated && cfg.files.is_empty() && cfg.namespace.as_deref().is_none_or(str::is_empty)
+}
+
+fn active_files_snapshot(cfg: &JournalConfig) -> Vec<(PathBuf, u64, u64)> {
+    glob_journal_files(
+        cfg.flags.or(Some(SD_JOURNAL_LOCAL_ONLY)),
+        cfg.path.as_deref(),
+    )
+    .into_iter()
+    .filter_map(|path| {
+        let meta = std::fs::metadata(&path).ok()?;
+        Some((path, meta.dev(), meta.ino()))
+    })
+    .collect()
+}
+
 /// Systemd journal log reader spawning `journalctl --output=json --follow`.
 #[derive(Debug, Clone)]
 pub struct FilterSystemd {
@@ -334,6 +354,7 @@ pub struct FilterSystemd {
     after_cursor: Option<String>,
     journalctl_bin: String,
     health: Option<Arc<Mutex<Option<String>>>>,
+    rotate_poll_interval: Duration,
 }
 
 impl FilterSystemd {
@@ -347,7 +368,14 @@ impl FilterSystemd {
             after_cursor: None,
             journalctl_bin: "journalctl".to_owned(),
             health: None,
+            rotate_poll_interval: DEFAULT_ROTATE_POLL,
         }
+    }
+
+    /// Override the active-journal rotation poll interval (useful for tests).
+    pub fn with_rotate_poll_interval(mut self, interval: Duration) -> Self {
+        self.rotate_poll_interval = interval.max(Duration::from_millis(10));
+        self
     }
 
     /// Resume reading journal entries starting from Unix epoch `since_epoch` seconds.
@@ -414,6 +442,12 @@ impl FilterSystemd {
             // the initial end of matching records (including an empty match), matching upstream
             // FilterSystemd.run entering inOperationMode immediately on empty/drained initial reads.
             let follow = in_operation;
+            let watch_active = follow && should_watch_active_files(&self.config);
+            let initial_snapshot = if watch_active {
+                active_files_snapshot(&self.config)
+            } else {
+                Vec::new()
+            };
             let args = build_journalctl_args_inner(
                 &self.config,
                 self.since_epoch,
@@ -463,10 +497,16 @@ impl FilterSystemd {
             let mut reader = BufReader::new(stdout);
             let mut line_buf = String::new();
             let mut stop_requested = false;
+            let mut rotated_reopen = false;
             let mut made_progress = false;
             let mut health_cleared = false;
             let healthy_timer = tokio::time::sleep(HEALTHY_WINDOW);
             tokio::pin!(healthy_timer);
+            let mut rotate_tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + self.rotate_poll_interval,
+                self.rotate_poll_interval,
+            );
+            rotate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 line_buf.clear();
@@ -480,6 +520,12 @@ impl FilterSystemd {
                     () = &mut healthy_timer, if !health_cleared => {
                         health_cleared = true;
                         self.set_health(None);
+                    }
+                    _ = rotate_tick.tick(), if watch_active => {
+                        if active_files_snapshot(&self.config) != initial_snapshot {
+                            rotated_reopen = true;
+                            break;
+                        }
                     }
                     read_res = reader.read_line(&mut line_buf) => {
                         match read_res {
@@ -573,6 +619,34 @@ impl FilterSystemd {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 return Ok(());
+            }
+
+            if rotated_reopen {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                self.set_health(None);
+                if let Some(cursor) = next_cursor {
+                    self.after_cursor = Some(cursor);
+                } else if self.after_cursor.is_none() {
+                    if let Some(ts) = last_ts {
+                        let next_since = ts + 0.000_001;
+                        self.since_epoch = Some(
+                            self.since_epoch
+                                .map_or(next_since, |prev| prev.max(next_since)),
+                        );
+                    } else if self.tail {
+                        self.since_epoch = Some(start_wall);
+                        self.tail = false;
+                    }
+                }
+                log_msg(
+                    LogLevel::Info,
+                    "fail2ban.filter",
+                    "Active journal file set changed (rotation/flush); reopening journalctl",
+                );
+                in_operation = true;
+                backoff = Duration::from_millis(100);
+                continue;
             }
 
             let status = child.wait().await;

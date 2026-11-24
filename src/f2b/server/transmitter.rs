@@ -5,21 +5,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::jail::{Jail, JailState, current_unix_seconds};
+use super::jail::{Jail, JailState, attach_cymru_to_status, current_unix_seconds};
 use super::make_parent;
 use crate::VERSION;
-use crate::action::{ActionKind, Family, escape_tag, replace_dynamic_tags, tags};
+use crate::action::{ActionKind, Family, build_shell_command, escape_tag, tags};
 use crate::client::beautifier::py_repr;
 use crate::db::{DEFAULT_MAX_MATCHES, DEFAULT_PURGE_AGE, Fail2BanDb};
 use crate::duration::{parse_bool, str2seconds_i64};
 use crate::error::{Error, Result};
 use crate::f2b_log;
-use crate::filter::ipdns::{allow_ipv6, clear_dns_caches, set_allow_ipv6_str};
+use crate::filter::ipdns::{
+    AllowIpv6, allow_ipv6, clear_dns_caches, ip_to_name, lookup_cymru_info, set_allow_ipv6_str,
+};
 use crate::logging::{self, LogLevel};
 use crate::protocol::PickleValue::{
     self as Value, Bool, Dict, Float, Int, List, None as Null, Tuple,
 };
 use crate::ticket::{ActionContext, Ticket, TicketId};
+use tokio::sync::Notify;
 
 struct PendingReloadJail {
     untouched: bool,
@@ -43,81 +46,131 @@ pub struct Transmitter {
 
 impl Transmitter {
     pub async fn dispatch(&mut self, value: &Value) -> Result<Value> {
+        self.prepare_dispatch(value).await.execute_detached().await
+    }
+
+    /// Prepare a client command under the global `Transmitter` lock, detaching `sleep` and
+    /// jail-targeted operations so socket connections drop the global lock before awaiting.
+    pub(super) async fn prepare_dispatch(&mut self, value: &Value) -> DispatchPlan {
         if self.stopping {
-            return Err(Error::invalid_command("Server is stopping"));
+            return DispatchPlan::Done(Err(Error::invalid_command("Server is stopping")));
         }
-        self.command(list(value)?, false).await
+        let Ok(cmd) = list(value) else {
+            return DispatchPlan::Done(Err(invalid()));
+        };
+        self.prepare_command(cmd, false).await
+    }
+
+    pub(super) fn db_handle(&self) -> Option<Arc<Mutex<Fail2BanDb>>> {
+        self.db.clone()
     }
 
     pub(super) async fn stream(&mut self, commands: &[Value]) -> Result<Value> {
         for frame in commands {
-            Box::pin(self.command(list(frame)?, true)).await?;
+            let plan = Box::pin(self.prepare_command(list(frame)?, true)).await;
+            Box::pin(plan.execute_detached()).await?;
         }
         Ok(Null)
     }
 
-    async fn command(&mut self, command: &[Value], quiet: bool) -> Result<Value> {
-        let (head, args) = command.split_first().ok_or_else(invalid)?;
-        let name = head.as_str().ok_or_else(invalid)?;
+    async fn prepare_command(&mut self, command: &[Value], quiet: bool) -> DispatchPlan {
+        let Some((head, args)) = command.split_first() else {
+            return DispatchPlan::Done(Err(invalid()));
+        };
+        let Some(name) = head.as_str() else {
+            return DispatchPlan::Done(Err(invalid()));
+        };
         match name {
-            "ping" => Ok(text("pong")),
-            "version" => Ok(text(VERSION)),
-            "echo" => Ok(List(args.to_vec())),
-            "server-status" => Ok(text("Server ready")),
-            "server-stream" => self.stream(list(arg(args, 0)?)?).await,
-            "flushlogs" => Ok(text(logging::flush_logs()?)),
-            "status" => self.status(args).await,
-            "stats" | "statistic" | "statistics" => Ok(self.all_status("stats").await),
-            "add" => {
-                let name = string(args, 0)?;
-                let backend = args.get(1).and_then(Value::as_str).unwrap_or("auto");
-                self.add_jail(name, backend).await?;
-                Ok(text(name))
+            "ping" => DispatchPlan::Done(Ok(text("pong"))),
+            "version" => DispatchPlan::Done(Ok(text(VERSION))),
+            "echo" => DispatchPlan::Done(Ok(List(args.to_vec()))),
+            "server-status" => DispatchPlan::Done(Ok(text("Server ready"))),
+            "server-stream" => match arg(args, 0).and_then(list) {
+                Ok(frames) => DispatchPlan::Done(self.stream(frames).await),
+                Err(err) => DispatchPlan::Done(Err(err)),
+            },
+            "flushlogs" => DispatchPlan::Done(logging::flush_logs().map(text)),
+            "status" => self.plan_status(args),
+            "stats" | "statistic" | "statistics" => {
+                let jails = self
+                    .jails
+                    .iter()
+                    .map(|(n, j)| (n.clone(), j.clone()))
+                    .collect();
+                DispatchPlan::Stats(jails)
             }
-            "start" => {
-                let name = string(args, 0)?;
-                if self.pending_reload.is_some() && self.staged_jails.contains_key(name) {
-                    self.staged_to_start.insert(name.to_owned());
+            "add" => DispatchPlan::Done(
+                async {
+                    let name = string(args, 0)?;
+                    let backend = args.get(1).and_then(Value::as_str).unwrap_or("auto");
+                    self.add_jail(name, backend).await?;
+                    Ok(text(name))
+                }
+                .await,
+            ),
+            "start" => DispatchPlan::Done(
+                async {
+                    let name = string(args, 0)?;
+                    if self.pending_reload.is_some() && self.staged_jails.contains_key(name) {
+                        self.staged_to_start.insert(name.to_owned());
+                        if let Some(pending) = &mut self.pending_reload {
+                            pending.remove(name);
+                        }
+                        return Ok(Null);
+                    }
+                    self.jail(name)?.start().await?;
                     if let Some(pending) = &mut self.pending_reload {
                         pending.remove(name);
                     }
-                    return Ok(Null);
+                    Ok(Null)
                 }
-                self.jail(name)?.start().await?;
-                if let Some(pending) = &mut self.pending_reload {
-                    pending.remove(name);
-                }
-                Ok(Null)
-            }
-            "stop" => {
-                match args.first() {
-                    None => {
-                        let res = self.stop_all().await;
-                        self.stopping = true;
-                        res?;
+                .await,
+            ),
+            "stop" => DispatchPlan::Done(
+                async {
+                    match args.first() {
+                        None => {
+                            let res = self.stop_all().await;
+                            self.stopping = true;
+                            res?;
+                        }
+                        Some(value) if value.as_str() == Some("--all") => self.stop_all().await?,
+                        Some(value) => {
+                            self.remove_jail(value.as_str().ok_or_else(invalid)?)
+                                .await?
+                        }
                     }
-                    Some(value) if value.as_str() == Some("--all") => self.stop_all().await?,
-                    Some(value) => {
-                        self.remove_jail(value.as_str().ok_or_else(invalid)?)
-                            .await?
-                    }
+                    Ok(Null)
                 }
-                Ok(Null)
-            }
-            "reload" => self.reload(args).await,
-            "get" => self.get(args).await,
-            "multi-set" | "set" => self.set(args, name == "multi-set", quiet).await,
-            "unban" if !args.is_empty() => {
-                let ips = strings(args)?;
-                let ips = if ips == ["--all"] {
-                    None
-                } else {
-                    Some(ips.as_slice())
-                };
-                Ok(integer(self.unban(ips).await?))
-            }
-            "banned" => self.banned(&strings(args)?).await,
-            "config-error" => {
+                .await,
+            ),
+            "reload" => DispatchPlan::Done(self.reload(args).await),
+            "get" => self.plan_get(args),
+            "multi-set" | "set" => self.plan_set(args, name == "multi-set", quiet),
+            "unban" if !args.is_empty() => match strings(args) {
+                Ok(ips) => {
+                    let ips = if ips == ["--all"] { None } else { Some(ips) };
+                    let jails = self
+                        .jail_order
+                        .iter()
+                        .filter_map(|name| self.jails.get(name).cloned())
+                        .collect();
+                    DispatchPlan::Unban { ips, jails }
+                }
+                Err(err) => DispatchPlan::Done(Err(err)),
+            },
+            "banned" => match strings(args) {
+                Ok(ips) => {
+                    let jails = self
+                        .jail_order
+                        .iter()
+                        .filter_map(|name| self.jails.get(name).map(|j| (name.clone(), j.clone())))
+                        .collect();
+                    DispatchPlan::Banned { ips, jails }
+                }
+                Err(err) => DispatchPlan::Done(Err(err)),
+            },
+            "config-error" => DispatchPlan::Done((|| {
                 f2b_log!(
                     LogLevel::Error,
                     "fail2ban.transmitter",
@@ -125,14 +178,16 @@ impl Transmitter {
                     string(args, 0)?
                 );
                 Ok(Null)
-            }
-            "sleep" => {
-                let secs = arg(args, 0)?.as_f64().ok_or_else(invalid)?;
-                let duration = Duration::try_from_secs_f64(secs).map_err(|_| invalid())?;
-                tokio::time::sleep(duration).await;
-                Ok(Null)
-            }
-            _ => Err(invalid()),
+            })()),
+            "sleep" => match arg(args, 0)
+                .ok()
+                .and_then(Value::as_f64)
+                .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+            {
+                Some(duration) => DispatchPlan::Sleep(duration),
+                None => DispatchPlan::Done(Err(invalid())),
+            },
+            _ => DispatchPlan::Done(Err(invalid())),
         }
     }
 
@@ -237,7 +292,7 @@ impl Transmitter {
         if has("--unban") {
             for name in &names {
                 let jail = self.jail(name)?;
-                jail.state.lock().await.unban_ip(None, true).await?;
+                jail.unban_ip(None, true).await?;
             }
         }
         let replacing_all =
@@ -281,18 +336,19 @@ impl Transmitter {
 
         if result.is_ok() {
             for name in &staged_order {
-                if let Some(candidate) = staged_jails.get(name) {
-                    let st = candidate.state.lock().await;
-                    if let Err(err) = st.validate_backend().await {
-                        result = Err(err);
-                        break;
-                    }
+                if let Some(candidate) = staged_jails.get(name)
+                    && let Err(err) = candidate.validate_backend().await
+                {
+                    result = Err(err);
+                    break;
                 }
             }
         }
         if result.is_ok() {
             for (name, jail) in &self.jails {
-                if staged_jails.contains_key(name) {
+                if staged_jails.contains_key(name)
+                    || leftover.get(name).is_some_and(|e| e.untouched)
+                {
                     continue;
                 }
                 if jail.state.lock().await.is_reloading()
@@ -427,84 +483,54 @@ impl Transmitter {
         Ok(())
     }
 
-    pub(super) fn purge(&self) {
-        if let Err(err) = self.with_db(|db| db.purge(current_unix_seconds() as i64)) {
-            f2b_log!(LogLevel::Error, "fail2ban.database", "{err}");
-        }
+    fn status_header(&self) -> Vec<Value> {
+        vec![
+            field("Number of jail", integer(self.jails.len())),
+            field(
+                "Jail list",
+                text(self.jails.keys().cloned().collect::<Vec<_>>().join(", ")),
+            ),
+        ]
     }
 
-    async fn status(&self, args: &[Value]) -> Result<Value> {
-        let names = || {
-            [
-                field("Number of jail", integer(self.jails.len())),
-                field(
-                    "Jail list",
-                    text(self.jails.keys().cloned().collect::<Vec<_>>().join(", ")),
-                ),
-            ]
-        };
+    fn plan_status(&self, args: &[Value]) -> DispatchPlan {
         match args {
-            [] => Ok(List(Vec::from(names()))),
+            [] => DispatchPlan::Done(Ok(List(self.status_header()))),
             [target] | [target, _] => {
-                let target = target.as_str().ok_or_else(invalid)?;
-                let flavor = args.get(1).and_then(Value::as_str).unwrap_or("basic");
+                let Some(target) = target.as_str() else {
+                    return DispatchPlan::Done(Err(invalid()));
+                };
+                let flavor = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or("basic")
+                    .to_owned();
                 if target == "--all" {
-                    let all = self.all_status(flavor).await;
-                    if flavor == "stats" {
-                        return Ok(all);
+                    let jails = self
+                        .jails
+                        .iter()
+                        .map(|(n, j)| (n.clone(), j.clone()))
+                        .collect();
+                    DispatchPlan::Status {
+                        header: Some(self.status_header()),
+                        flavor,
+                        jails,
+                        single: false,
                     }
-                    let mut result = Vec::from(names());
-                    result.push(all);
-                    Ok(List(result))
                 } else {
-                    Ok(self.jail(target)?.state.lock().await.status(flavor))
-                }
-            }
-            _ => Err(invalid()),
-        }
-    }
-
-    async fn all_status(&self, flavor: &str) -> Value {
-        let mut statuses = Vec::new();
-        for (name, jail) in &self.jails {
-            statuses.push((text(name), jail.state.lock().await.status(flavor)));
-        }
-        Dict(statuses)
-    }
-
-    async fn unban(&self, ips: Option<&[String]>) -> Result<usize> {
-        let mut count = 0;
-        for name in &self.jail_order {
-            if let Some(jail) = self.jails.get(name) {
-                count += jail.state.lock().await.unban_ip(ips, true).await?;
-            }
-        }
-        Ok(count)
-    }
-
-    async fn banned(&self, ips: &[String]) -> Result<Value> {
-        let mut result = Vec::new();
-        if ips.is_empty() {
-            for name in &self.jail_order {
-                if let Some(jail) = self.jails.get(name) {
-                    let banned = jail.state.lock().await.get_banned(&[]);
-                    result.push(Dict(vec![(text(name), banned)]));
-                }
-            }
-        } else {
-            for ip in ips {
-                let mut names = Vec::new();
-                for name in &self.jail_order {
-                    if let Some(jail) = self.jails.get(name)
-                        && jail.state.lock().await.get_banned(std::slice::from_ref(ip)) == Int(1)
-                    {
-                        names.push(text(name));
+                    match self.jail(target) {
+                        Ok(jail) => DispatchPlan::Status {
+                            header: None,
+                            flavor,
+                            jails: vec![(target.to_owned(), jail.clone())],
+                            single: true,
+                        },
+                        Err(err) => DispatchPlan::Done(Err(err)),
                     }
                 }
-                result.push(List(names));
             }
+            _ => DispatchPlan::Done(Err(invalid())),
         }
-        Ok(List(result))
     }
 
     fn global(&self, key: &str) -> Result<Option<Value>> {
@@ -526,19 +552,30 @@ impl Transmitter {
         }))
     }
 
-    async fn get(&self, args: &[Value]) -> Result<Value> {
-        let name = string(args, 0)?;
-        if let Some(value) = self.global(name)? {
-            return Ok(value);
+    fn plan_get(&self, args: &[Value]) -> DispatchPlan {
+        let name = match string(args, 0) {
+            Ok(n) => n,
+            Err(err) => return DispatchPlan::Done(Err(err)),
+        };
+        match self.global(name) {
+            Ok(Some(value)) => return DispatchPlan::Done(Ok(value)),
+            Ok(None) => {}
+            Err(err) => return DispatchPlan::Done(Err(err)),
         }
-        let jail = self.jail(name)?;
-        let mut jail = jail.state.lock().await;
-        jail_property(
-            &mut jail,
-            string(args, 1)?,
-            args.get(2..).unwrap_or_default(),
-        )
-        .await
+        let jail = match self.jail(name) {
+            Ok(j) => j.clone(),
+            Err(err) => return DispatchPlan::Done(Err(err)),
+        };
+        let key = match string(args, 1) {
+            Ok(k) => k.to_owned(),
+            Err(err) => return DispatchPlan::Done(Err(err)),
+        };
+        let rest = args.get(2..).unwrap_or_default().to_vec();
+        DispatchPlan::JailGet {
+            jail,
+            key,
+            args: rest,
+        }
     }
 
     fn set_global(&mut self, key: &str, args: &[Value]) -> Result<Option<Value>> {
@@ -591,15 +628,221 @@ impl Transmitter {
         self.global(key)
     }
 
-    async fn set(&mut self, args: &[Value], multiple: bool, quiet: bool) -> Result<Value> {
-        let name = string(args, 0)?;
-        if let Some(value) = self.set_global(name, args.get(1..).unwrap_or_default())? {
-            return Ok(if quiet { Null } else { value });
+    fn plan_set(&mut self, args: &[Value], multiple: bool, quiet: bool) -> DispatchPlan {
+        let name = match string(args, 0) {
+            Ok(n) => n,
+            Err(err) => return DispatchPlan::Done(Err(err)),
+        };
+        match self.set_global(name, args.get(1..).unwrap_or_default()) {
+            Ok(Some(value)) => return DispatchPlan::Done(Ok(if quiet { Null } else { value })),
+            Ok(None) => {}
+            Err(err) => return DispatchPlan::Done(Err(err)),
         }
-        let jail = self.jail(name)?;
-        let key = string(args, 1)?;
-        let args = args.get(2..).ok_or_else(invalid)?;
-        if key == "idle" {
+        let jail = match self.jail(name) {
+            Ok(j) => j.clone(),
+            Err(err) => return DispatchPlan::Done(Err(err)),
+        };
+        let key = match string(args, 1) {
+            Ok(k) => k.to_owned(),
+            Err(err) => return DispatchPlan::Done(Err(err)),
+        };
+        let Some(rest) = args.get(2..) else {
+            return DispatchPlan::Done(Err(invalid()));
+        };
+        DispatchPlan::JailSet {
+            jail,
+            key,
+            args: rest.to_vec(),
+            multiple,
+            quiet,
+        }
+    }
+}
+
+pub(super) enum DispatchPlan {
+    Done(Result<Value>),
+    Sleep(Duration),
+    Status {
+        header: Option<Vec<Value>>,
+        flavor: String,
+        jails: Vec<(String, Jail)>,
+        single: bool,
+    },
+    Stats(Vec<(String, Jail)>),
+    Banned {
+        ips: Vec<String>,
+        jails: Vec<(String, Jail)>,
+    },
+    Unban {
+        ips: Option<Vec<String>>,
+        jails: Vec<Jail>,
+    },
+    JailGet {
+        jail: Jail,
+        key: String,
+        args: Vec<Value>,
+    },
+    JailSet {
+        jail: Jail,
+        key: String,
+        args: Vec<Value>,
+        multiple: bool,
+        quiet: bool,
+    },
+}
+
+impl DispatchPlan {
+    pub(super) async fn execute(self, stopped: &Notify) -> Result<Value> {
+        match self {
+            Self::Sleep(duration) => {
+                tokio::select! {
+                    biased;
+                    _ = stopped.notified() => Ok(Null),
+                    _ = tokio::time::sleep(duration) => Ok(Null),
+                }
+            }
+            other => other.execute_detached().await,
+        }
+    }
+
+    async fn execute_detached(self) -> Result<Value> {
+        match self {
+            Self::Done(res) => res,
+            Self::Sleep(duration) => {
+                tokio::time::sleep(duration).await;
+                Ok(Null)
+            }
+            Self::Status {
+                header,
+                flavor,
+                jails,
+                single,
+            } => {
+                if flavor == "cymru" {
+                    let plan = if single {
+                        let Some((_, jail)) = jails.into_iter().next() else {
+                            return Err(invalid());
+                        };
+                        let (base, banned) = jail.state.lock().await.status_snapshot_for_cymru();
+                        CymruStatusPlan::Single { base, banned }
+                    } else {
+                        let mut entries = Vec::with_capacity(jails.len());
+                        for (name, jail) in jails {
+                            let (base, banned) =
+                                jail.state.lock().await.status_snapshot_for_cymru();
+                            entries.push((name, base, banned));
+                        }
+                        CymruStatusPlan::All {
+                            header: header.unwrap_or_default(),
+                            entries,
+                        }
+                    };
+                    return tokio::task::spawn_blocking(move || plan.resolve())
+                        .await
+                        .map_err(|err| {
+                            Error::io("cymru DNS worker join failed", std::io::Error::other(err))
+                        });
+                }
+                if single {
+                    let Some((_, jail)) = jails.into_iter().next() else {
+                        return Err(invalid());
+                    };
+                    return Ok(jail.state.lock().await.status(&flavor));
+                }
+                let mut statuses = Vec::with_capacity(jails.len());
+                for (name, jail) in jails {
+                    statuses.push((text(&name), jail.state.lock().await.status(&flavor)));
+                }
+                let all = Dict(statuses);
+                if flavor == "stats" {
+                    return Ok(all);
+                }
+                let mut result = header.unwrap_or_default();
+                result.push(all);
+                Ok(List(result))
+            }
+            Self::Stats(jails) => {
+                let mut statuses = Vec::with_capacity(jails.len());
+                for (name, jail) in jails {
+                    statuses.push((text(&name), jail.state.lock().await.status("stats")));
+                }
+                Ok(Dict(statuses))
+            }
+            Self::Banned { ips, jails } => {
+                let mut result = Vec::new();
+                if ips.is_empty() {
+                    for (name, jail) in jails {
+                        let banned = jail.state.lock().await.get_banned(&[]);
+                        result.push(Dict(vec![(text(&name), banned)]));
+                    }
+                } else {
+                    for ip in &ips {
+                        let mut names = Vec::new();
+                        for (name, jail) in &jails {
+                            if jail.state.lock().await.get_banned(std::slice::from_ref(ip))
+                                == Int(1)
+                            {
+                                names.push(text(name));
+                            }
+                        }
+                        result.push(List(names));
+                    }
+                }
+                Ok(List(result))
+            }
+            Self::Unban { ips, jails } => {
+                let mut count = 0;
+                for jail in jails {
+                    count += jail.unban_ip(ips.as_deref(), true).await?;
+                }
+                Ok(integer(count))
+            }
+            Self::JailGet { jail, key, args } => execute_jail_get(&jail, &key, &args).await,
+            Self::JailSet {
+                jail,
+                key,
+                args,
+                multiple,
+                quiet,
+            } => execute_jail_set(&jail, &key, &args, multiple, quiet).await,
+        }
+    }
+}
+
+async fn execute_jail_get(jail: &Jail, key: &str, args: &[Value]) -> Result<Value> {
+    match key {
+        "actions" => Ok(Value::str_list(jail.actions.lock().await.names())),
+        "action" | "actionproperties" | "actionmethods" => {
+            let name = string(args, 0)?;
+            let mut acts = jail.actions.lock().await;
+            let action = acts.get_mut(name).ok_or_else(|| unknown_action(name))?;
+            match key {
+                "actionproperties" => action.property_names().await,
+                "actionmethods" => action.methods().await,
+                _ => {
+                    let property = string(args, 1)?;
+                    action.get_property(property).await?.ok_or_else(|| {
+                        Error::invalid_command(format!("Action has no attribute {property:?}"))
+                    })
+                }
+            }
+        }
+        _ => {
+            let st = jail.state.lock().await;
+            sync_jail_property(&st, key, args)
+        }
+    }
+}
+
+async fn execute_jail_set(
+    jail: &Jail,
+    key: &str,
+    args: &[Value],
+    multiple: bool,
+    quiet: bool,
+) -> Result<Value> {
+    match key {
+        "idle" => {
             let idle = match string(args, 0)? {
                 "on" => true,
                 "off" => false,
@@ -612,6 +855,86 @@ impl Transmitter {
             jail.set_idle(idle).await;
             return Ok(if quiet { Null } else { Bool(idle) });
         }
+        "addjournalmatch" => {
+            jail.add_journal_match(&strings(args)?).await?;
+            let (restart, response) = {
+                let st = jail.state.lock().await;
+                let restart = !st.is_reloading();
+                let resp = if quiet {
+                    Null
+                } else {
+                    sync_jail_property(&st, "journalmatch", &[])?
+                };
+                (restart, resp)
+            };
+            if restart {
+                jail.restart_backend_if_alive().await;
+            }
+            return Ok(response);
+        }
+        "deljournalmatch" => {
+            jail.del_journal_match(&strings(args)?).await?;
+            let (restart, response) = {
+                let st = jail.state.lock().await;
+                let restart = !st.is_reloading();
+                let resp = if quiet {
+                    Null
+                } else {
+                    sync_jail_property(&st, "journalmatch", &[])?
+                };
+                (restart, resp)
+            };
+            if restart {
+                jail.restart_backend_if_alive().await;
+            }
+            return Ok(response);
+        }
+        "banip" => return Ok(integer(jail.ban_ip(&strings(args)?).await?)),
+        "unbanip" => {
+            let ips = strings(args)?;
+            let report_absent = ips.first().is_some_and(|ip| ip == "--report-absent");
+            let ips = if report_absent { &ips[1..] } else { &ips };
+            return Ok(integer(jail.unban_ip(Some(ips), !report_absent).await?));
+        }
+        "attempt" => {
+            let ip = string(args, 0)?;
+            return Ok(Int(jail.add_attempt(ip, &strings(&args[1..])?).await?));
+        }
+        "addaction" => {
+            let action = string(args, 0)?;
+            let path = args.get(1).and_then(Value::as_str);
+            let init = if path.is_some() {
+                Some(string(args, 2)?)
+            } else {
+                None
+            };
+            jail.add_action(action, path, init).await?;
+            return Ok(if quiet { Null } else { text(action) });
+        }
+        "delaction" => {
+            jail.del_action(string(args, 0)?).await?;
+            return Ok(Null);
+        }
+        "action" => {
+            let action_name = string(args, 0)?;
+            let mut acts = jail.actions.lock().await;
+            let default_ban_time = jail.state.lock().await.ban_manager.ban_time();
+            let action = acts
+                .get_mut(action_name)
+                .ok_or_else(|| unknown_action(action_name))?;
+            if multiple {
+                for spec in list(arg(args, 1)?)? {
+                    change_action(action, list(spec)?, default_ban_time).await?;
+                }
+                return Ok(Bool(true));
+            }
+            let result = change_action(action, &args[1..], default_ban_time).await?;
+            return Ok(if quiet { Null } else { result });
+        }
+        _ => {}
+    }
+
+    let (restart, response) = {
         let mut state = jail.state.lock().await;
         let get_key = match key {
             "ignoreself" => {
@@ -670,14 +993,6 @@ impl Transmitter {
             "logencoding" => {
                 state.filter.set_log_encoding_str(string(args, 0)?)?;
                 key
-            }
-            "addjournalmatch" => {
-                state.add_journal_match(&strings(args)?).await?;
-                "journalmatch"
-            }
-            "deljournalmatch" => {
-                state.del_journal_match(&strings(args)?).await?;
-                "journalmatch"
             }
             "prefregex" => {
                 state.filter.set_prefregex(optional_string(arg(args, 0)?))?;
@@ -750,47 +1065,6 @@ impl Transmitter {
                 state.ban_manager.set_ban_time(time);
                 key
             }
-            "banip" => return Ok(integer(state.ban_ip(&strings(args)?).await?)),
-            "unbanip" => {
-                let ips = strings(args)?;
-                let report_absent = ips.first().is_some_and(|ip| ip == "--report-absent");
-                let ips = if report_absent { &ips[1..] } else { &ips };
-                return Ok(integer(state.unban_ip(Some(ips), !report_absent).await?));
-            }
-            "attempt" => {
-                let ip = string(args, 0)?;
-                return Ok(Int(state.add_attempt(ip, &strings(&args[1..])?).await?));
-            }
-            "addaction" => {
-                let action = string(args, 0)?;
-                let path = args.get(1).and_then(Value::as_str);
-                let init = if path.is_some() {
-                    Some(string(args, 2)?)
-                } else {
-                    None
-                };
-                state.add_action(action, path, init).await?;
-                return Ok(if quiet { Null } else { text(action) });
-            }
-            "delaction" => {
-                state.del_action(string(args, 0)?)?;
-                return Ok(Null);
-            }
-            "action" => {
-                let action_name = string(args, 0)?;
-                let default_ban_time = state.ban_manager.ban_time();
-                let action = state
-                    .get_action_mut(action_name)
-                    .ok_or_else(|| unknown_action(action_name))?;
-                if multiple {
-                    for spec in list(arg(args, 1)?)? {
-                        change_action(action, list(spec)?, default_ban_time).await?;
-                    }
-                    return Ok(Bool(true));
-                }
-                let result = change_action(action, &args[1..], default_ban_time).await?;
-                return Ok(if quiet { Null } else { result });
-            }
             key if key.starts_with("bantime.") => {
                 state
                     .ban_extra
@@ -808,17 +1082,17 @@ impl Transmitter {
         let response = if quiet {
             Null
         } else {
-            jail_property(&mut state, get_key, &[]).await?
+            sync_jail_property(&state, get_key, &[])?
         };
-        drop(state);
-        if restart {
-            jail.restart_backend_if_alive().await;
-        }
-        Ok(response)
+        (restart, response)
+    };
+    if restart {
+        jail.restart_backend_if_alive().await;
     }
+    Ok(response)
 }
 
-async fn jail_property(jail: &mut JailState, key: &str, args: &[Value]) -> Result<Value> {
+fn sync_jail_property(jail: &JailState, key: &str, args: &[Value]) -> Result<Value> {
     let filter = &jail.filter;
     Ok(match key {
         "logpath" => Value::str_list(jail.get_log_paths()),
@@ -860,23 +1134,6 @@ async fn jail_property(jail: &mut JailState, key: &str, args: &[Value]) -> Resul
             jail.get_ban_list(args.first().and_then(Value::as_str) == Some("--with-time")),
         ),
         "banned" => jail.get_banned(&strings(args)?),
-        "actions" => Value::str_list(jail.actions.iter().map(|(name, _)| name)),
-        "action" | "actionproperties" | "actionmethods" => {
-            let name = string(args, 0)?;
-            let action = jail
-                .get_action_mut(name)
-                .ok_or_else(|| unknown_action(name))?;
-            match key {
-                "actionproperties" => action.property_names().await?,
-                "actionmethods" => action.methods().await?,
-                _ => {
-                    let property = string(args, 1)?;
-                    action.get_property(property).await?.ok_or_else(|| {
-                        Error::invalid_command(format!("Action has no attribute {property:?}"))
-                    })?
-                }
-            }
-        }
         key if key.starts_with("bantime.") => jail
             .ban_extra
             .get_opt(&key["bantime.".len()..])
@@ -1105,13 +1362,24 @@ async fn call_action_method(
             };
             let ctx = action_context_from_json(action.jail_name(), info, default_ban_time);
             let fam = Family::from_ticket_id(ctx.ticket.target_ip()).as_str();
-            Ok(text(replace_dynamic_tags(
-                &real_cmd,
-                &ctx,
-                fam,
-                None,
-                &tags::default_reverse_dns,
-            )))
+            let built = if real_cmd.contains("<ip-host>")
+                && let Some(ip) = ctx.ticket.target_ip().ip()
+            {
+                let resolved_host = tokio::task::spawn_blocking(move || ip_to_name(&ip))
+                    .await
+                    .ok()
+                    .flatten();
+                build_shell_command(&real_cmd, &ctx, fam, None, &|_| resolved_host.clone())
+            } else {
+                build_shell_command(&real_cmd, &ctx, fam, None, &tags::default_reverse_dns)
+            };
+            if built.args.is_empty() {
+                Ok(text(built.script))
+            } else {
+                Ok(Value::str_list(
+                    std::iter::once(built.script).chain(built.args),
+                ))
+            }
         }
         "executeCmd" => {
             reject_unknown_kwargs(kwargs, cls, method, &["realCmd", "timeout"])?;
@@ -1218,6 +1486,60 @@ fn is_global_set_key(key: &str) -> bool {
     )
 }
 
+enum CymruStatusPlan {
+    Single {
+        base: Value,
+        banned: Vec<TicketId>,
+    },
+    All {
+        header: Vec<Value>,
+        entries: Vec<(String, Value, Vec<TicketId>)>,
+    },
+}
+
+impl CymruStatusPlan {
+    fn resolve(self) -> Value {
+        match self {
+            Self::Single { mut base, banned } => {
+                attach_cymru_to_status(&mut base, lookup_cymru_info(&banned));
+                base
+            }
+            Self::All {
+                mut header,
+                entries,
+            } => {
+                let mut dict = Vec::with_capacity(entries.len());
+                for (name, mut base, banned) in entries {
+                    attach_cymru_to_status(&mut base, lookup_cymru_info(&banned));
+                    dict.push((text(&name), base));
+                }
+                header.push(Dict(dict));
+                List(header)
+            }
+        }
+    }
+}
+
+fn validate_thread_opts(opts: &[(Value, Value)]) -> Result<()> {
+    for (key, value) in opts {
+        if key.as_str() != Some("stacksize") {
+            return Err(Error::Key(format!("unknown option {}", py_repr(key))));
+        }
+        let size = value.as_i64().ok_or_else(|| {
+            Error::Value(format!(
+                "invalid literal for int() with base 10: {}",
+                py_repr(value)
+            ))
+        })?;
+        let bytes = size.checked_mul(1024);
+        if size < 0 || (size != 0 && size < 32) || bytes.is_none() {
+            let shown = bytes.unwrap_or(size);
+            return Err(Error::Value(format!("size not valid: {shown} bytes")));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a protocol command stream (used by both `reload` preflight and `fail2ban-client -t`).
 pub fn validate_config_stream(commands: &[Value]) -> Result<()> {
     let mut filters: BTreeMap<String, crate::filter::Filter> = BTreeMap::new();
@@ -1240,6 +1562,31 @@ pub fn validate_config_stream(commands: &[Value]) -> Result<()> {
         }
         let jail = string(args, 0)?;
         if is_global_set_key(jail) {
+            let global_args = &args[1..];
+            match jail {
+                "loglevel" => {
+                    let _ = LogLevel::parse(&scalar(global_args, 0)?)?;
+                }
+                "allowipv6" => {
+                    let _ = AllowIpv6::parse(&scalar(global_args, 0)?)?;
+                }
+                "dbpurgeage" => {
+                    let _ = str2seconds_i64(&scalar(global_args, 0)?)?;
+                }
+                "dbmaxmatches" => {
+                    let _ = nonnegative(global_args, 0)?;
+                }
+                "syslogsocket" | "logtarget" | "dbfile" => {
+                    let _ = string(global_args, 0)?;
+                }
+                "thread" => {
+                    let Dict(opts) = arg(global_args, 0)? else {
+                        return Err(invalid());
+                    };
+                    validate_thread_opts(opts)?;
+                }
+                _ => {}
+            }
             continue;
         }
         let multiple = name == "multi-set";
@@ -1249,6 +1596,13 @@ pub fn validate_config_stream(commands: &[Value]) -> Result<()> {
             .entry(jail.to_owned())
             .or_insert_with(|| crate::filter::Filter::new(jail));
         match key {
+            "addaction" => {
+                let act_name = string(rest, 0)?;
+                if let Some(path) = rest.get(1).and_then(Value::as_str) {
+                    let init_json = string(rest, 2)?;
+                    let _ = ActionKind::from_python_spec(jail, act_name, path, init_json)?;
+                }
+            }
             "ignoreself" => {
                 let _ = parse_bool(&scalar(rest, 0)?)?;
             }

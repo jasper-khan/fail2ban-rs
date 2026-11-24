@@ -19,43 +19,51 @@ pub enum TicketId {
 }
 
 impl TicketId {
-    /// Parse a string into a canonical `TicketId` (IP -> Subnet -> Raw fallback).
+    /// Parse a string into a canonical `TicketId` (IP / `[IPv6]` / CIDR / dotted-mask -> Raw fallback).
     pub fn parse(raw: &str) -> Self {
         let s = raw.trim();
-        if let Ok(ip) = s.parse::<IpAddr>() {
-            return Self::Ip(canonical_ip(ip));
+        crate::filter::ipdns::parse_ticket_ip_or_net(s).unwrap_or_else(|| Self::Raw(s.to_owned()))
+    }
+
+    /// Construct from an IP and optional CIDR prefix length, rejecting out-of-range prefixes.
+    pub fn try_from_ip_cidr(ip: IpAddr, cidr: Option<u8>) -> Option<Self> {
+        match (ip, cidr) {
+            (IpAddr::V4(_), Some(p)) if p > 32 => return None,
+            (IpAddr::V6(_), Some(p)) if p > 128 => return None,
+            _ => {}
         }
-        if let Ok(net) = s.parse::<IpNet>() {
-            let truncated = net.trunc();
-            // Host-length prefixes collapse to plain Ip matching Fail2Ban IPAddr.
-            if (truncated.addr().is_ipv4() && truncated.prefix_len() == 32)
-                || (truncated.addr().is_ipv6() && truncated.prefix_len() == 128)
-            {
-                return Self::Ip(canonical_ip(truncated.addr()));
+        // Handle IPv4-mapped IPv6 with explicit IPv6 CIDR (match upstream IPAddr: only collapse
+        // to IPv4 when cidr is None, or remap >=96 cleanly).
+        if let (IpAddr::V6(v6), Some(p)) = (ip, cidr) {
+            if p == 128 {
+                return Some(Self::Ip(canonical_ip(IpAddr::V6(v6))));
             }
-            return Self::Net(truncated);
+            if let Some(v4) = v6.to_ipv4_mapped()
+                && p >= 96
+            {
+                let v4_prefix = p - 96;
+                return Self::try_from_ip_cidr(IpAddr::V4(v4), Some(v4_prefix));
+            }
+            let net = ipnet::Ipv6Net::new(v6, p).ok()?;
+            return Some(Self::Net(IpNet::V6(net.trunc())));
         }
-        Self::Raw(s.to_owned())
+        let ip = canonical_ip(ip);
+        match (ip, cidr) {
+            (IpAddr::V4(v4), Some(p)) if p < 32 => {
+                let net = ipnet::Ipv4Net::new(v4, p).ok()?;
+                Some(Self::Net(IpNet::V4(net.trunc())))
+            }
+            (IpAddr::V6(v6), Some(p)) if p < 128 => {
+                let net = ipnet::Ipv6Net::new(v6, p).ok()?;
+                Some(Self::Net(IpNet::V6(net.trunc())))
+            }
+            _ => Some(Self::Ip(ip)),
+        }
     }
 
     /// Construct from an IP and optional CIDR prefix length.
     pub fn from_ip_cidr(ip: IpAddr, cidr: Option<u8>) -> Self {
-        let ip = canonical_ip(ip);
-        match (ip, cidr) {
-            (IpAddr::V4(v4), Some(p)) if p < 32 => {
-                if let Ok(net) = ipnet::Ipv4Net::new(v4, p) {
-                    return Self::Net(IpNet::V4(net.trunc()));
-                }
-                Self::Ip(IpAddr::V4(v4))
-            }
-            (IpAddr::V6(v6), Some(p)) if p < 128 => {
-                if let Ok(net) = ipnet::Ipv6Net::new(v6, p) {
-                    return Self::Net(IpNet::V6(net.trunc()));
-                }
-                Self::Ip(IpAddr::V6(v6))
-            }
-            _ => Self::Ip(ip),
-        }
+        Self::try_from_ip_cidr(ip, cidr).unwrap_or_else(|| Self::Ip(canonical_ip(ip)))
     }
 
     pub fn ip(&self) -> Option<IpAddr> {
@@ -223,6 +231,11 @@ impl Ticket {
         for (k, v) in &self.data {
             obj.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
+        if let Some(ref ip) = self.ip
+            && ip != &self.fid
+        {
+            obj.insert("ip".to_owned(), serde_json::Value::String(ip.to_string()));
+        }
         if !self.matches.is_empty() && max_matches > 0 {
             let start = self.matches.len().saturating_sub(max_matches);
             let lines: Vec<serde_json::Value> = self.matches[start..]
@@ -238,7 +251,8 @@ impl Ticket {
         serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_else(|_| b"{}".to_vec())
     }
 
-    /// Populate `matches`, `attempts`, and custom `data` from Fail2Ban 1.1.1's SQLite JSON column.
+    /// Populate `matches`, `attempts`, custom `data`, and separate target `ip`
+    /// (when `<F-ID>` differs from `<HOST>`) from Fail2Ban 1.1.1's SQLite JSON column.
     pub fn apply_db_json(&mut self, raw: &[u8]) {
         let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(raw)
         else {
@@ -265,6 +279,26 @@ impl Ticket {
                     } else if !v.is_null() {
                         self.data.insert(k, v.to_string());
                     }
+                }
+            }
+        }
+        if self.ip.is_none() {
+            if let Some(ip_str) = self.data.get("ip")
+                && let Some(parsed) = crate::filter::ipdns::parse_ticket_ip_or_net(ip_str)
+                && parsed != self.fid
+            {
+                self.ip = Some(parsed);
+            } else if matches!(self.fid, TicketId::Raw(_)) {
+                let cidr = match self.data.get("cidr").map(String::as_str) {
+                    None | Some("") => Some(None),
+                    Some(raw_cidr) => raw_cidr.parse::<u8>().ok().map(Some),
+                };
+                if let Some(cidr_opt) = cidr
+                    && let Some(addr_str) = self.data.get("ip4").or_else(|| self.data.get("ip6"))
+                    && let Some(parsed) =
+                        crate::filter::ipdns::parse_ip_with_cidr(addr_str, cidr_opt)
+                {
+                    self.ip = Some(parsed);
                 }
             }
         }

@@ -211,65 +211,352 @@ fn query_fqdn(short: &str) -> String {
     short.to_owned()
 }
 
-/// Default reverse DNS lookup via `getnameinfo(..., NI_NAMEREQD)`.
-#[allow(unsafe_code)]
+/// Default reverse DNS lookup using the shared TTL-cached resolver.
 pub fn default_reverse_dns(ip: &IpAddr) -> Option<String> {
-    let mut host = [0u8; 1025];
-    let rc = match ip {
-        IpAddr::V4(v4) => {
-            // SAFETY: Zeroed `sockaddr_in` initializes all padding/length fields.
-            let mut sa: nix::libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            sa.sin_family = nix::libc::AF_INET as nix::libc::sa_family_t;
-            sa.sin_addr = nix::libc::in_addr {
-                s_addr: u32::from_ne_bytes(v4.octets()),
-            };
-            // SAFETY: `sa` is a valid `sockaddr_in` and `host` is writable for `host.len()` bytes.
-            unsafe {
-                nix::libc::getnameinfo(
-                    (&raw const sa).cast::<nix::libc::sockaddr>(),
-                    std::mem::size_of::<nix::libc::sockaddr_in>() as nix::libc::socklen_t,
-                    host.as_mut_ptr().cast::<nix::libc::c_char>(),
-                    host.len() as nix::libc::socklen_t,
-                    std::ptr::null_mut(),
-                    0,
-                    nix::libc::NI_NAMEREQD,
-                )
-            }
+    crate::filter::ipdns::ip_to_name(ip)
+}
+
+/// Shell script plus out-of-band positional arguments (`sh -c <script> <arg0> ...`),
+/// matching Fail2Ban 1.1.1 `Utils.buildShellCmd`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellCommand {
+    pub script: String,
+    pub args: Vec<String>,
+}
+
+/// Return `true` iff `value` contains any shell metacharacter from `CommandAction.ESCAPE_CRE`,
+/// ASCII whitespace (which causes word splitting outside quotes), or a NUL byte, requiring
+/// out-of-band positional argument binding.
+pub(crate) fn needs_shell_var(value: &str) -> bool {
+    value.chars().any(|ch| {
+        ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '\\' | '#'
+                    | '&'
+                    | ';'
+                    | '`'
+                    | '|'
+                    | '*'
+                    | '?'
+                    | '~'
+                    | '<'
+                    | '>'
+                    | '^'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '$'
+                    | '\''
+                    | '"'
+                    | '\x0b'
+                    | '\0'
+            )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteMode {
+    Unquoted,
+    Single,
+    Double,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteContainer {
+    Root,
+    Subshell { parens: usize },
+    Backtick,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuoteFrame {
+    container: QuoteContainer,
+    mode: QuoteMode,
+    escaped: bool,
+}
+
+/// Tracks POSIX `sh` quoting context across literal template fragments so substituted
+/// variables expand safely inside single quotes, double quotes, and unquoted positions.
+struct ShellQuoteState {
+    frames: Vec<QuoteFrame>,
+}
+
+impl ShellQuoteState {
+    fn new() -> Self {
+        Self {
+            frames: vec![QuoteFrame {
+                container: QuoteContainer::Root,
+                mode: QuoteMode::Unquoted,
+                escaped: false,
+            }],
         }
-        IpAddr::V6(v6) => {
-            // SAFETY: Zeroed `sockaddr_in6` initializes all padding/scope/length fields.
-            let mut sa6: nix::libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-            sa6.sin6_family = nix::libc::AF_INET6 as nix::libc::sa_family_t;
-            sa6.sin6_addr = nix::libc::in6_addr {
-                s6_addr: v6.octets(),
-            };
-            // SAFETY: `sa6` is a valid `sockaddr_in6` and `host` is writable for `host.len()` bytes.
-            unsafe {
-                nix::libc::getnameinfo(
-                    (&raw const sa6).cast::<nix::libc::sockaddr>(),
-                    std::mem::size_of::<nix::libc::sockaddr_in6>() as nix::libc::socklen_t,
-                    host.as_mut_ptr().cast::<nix::libc::c_char>(),
-                    host.len() as nix::libc::socklen_t,
-                    std::ptr::null_mut(),
-                    0,
-                    nix::libc::NI_NAMEREQD,
-                )
-            }
-        }
-    };
-    if rc != 0 {
-        return None;
     }
-    let end = host.iter().position(|&b| b == 0).unwrap_or(host.len());
-    let name = String::from_utf8_lossy(&host[..end]).trim().to_owned();
-    if name.is_empty() { None } else { Some(name) }
+
+    fn mode(&self) -> QuoteMode {
+        self.frames
+            .last()
+            .map_or(QuoteMode::Unquoted, |frame| frame.mode)
+    }
+
+    fn advance(&mut self, lit: &str) {
+        let mut chars = lit.chars().peekable();
+        while let Some(ch) = chars.next() {
+            let has_parent = self.frames.len() > 1;
+            let Some(frame) = self.frames.last_mut() else {
+                break;
+            };
+            match frame.mode {
+                QuoteMode::Single => {
+                    if ch == '\'' {
+                        frame.mode = QuoteMode::Unquoted;
+                    }
+                }
+                QuoteMode::Double => {
+                    if frame.escaped {
+                        frame.escaped = false;
+                    } else if ch == '\\' {
+                        frame.escaped = true;
+                    } else if ch == '"' {
+                        frame.mode = QuoteMode::Unquoted;
+                    } else if ch == '$' && chars.peek() == Some(&'(') {
+                        let _ = chars.next();
+                        self.frames.push(QuoteFrame {
+                            container: QuoteContainer::Subshell { parens: 0 },
+                            mode: QuoteMode::Unquoted,
+                            escaped: false,
+                        });
+                    } else if ch == '`' {
+                        self.frames.push(QuoteFrame {
+                            container: QuoteContainer::Backtick,
+                            mode: QuoteMode::Unquoted,
+                            escaped: false,
+                        });
+                    }
+                }
+                QuoteMode::Unquoted => {
+                    if frame.escaped {
+                        frame.escaped = false;
+                    } else if ch == '\\' {
+                        frame.escaped = true;
+                    } else if ch == '\'' {
+                        frame.mode = QuoteMode::Single;
+                    } else if ch == '"' {
+                        frame.mode = QuoteMode::Double;
+                    } else if ch == '$' && chars.peek() == Some(&'(') {
+                        let _ = chars.next();
+                        self.frames.push(QuoteFrame {
+                            container: QuoteContainer::Subshell { parens: 0 },
+                            mode: QuoteMode::Unquoted,
+                            escaped: false,
+                        });
+                    } else if ch == '(' {
+                        if let QuoteContainer::Subshell { parens } = &mut frame.container {
+                            *parens += 1;
+                        }
+                    } else if ch == ')' {
+                        match &mut frame.container {
+                            QuoteContainer::Subshell { parens } if *parens > 0 => {
+                                *parens -= 1;
+                            }
+                            QuoteContainer::Subshell { .. } if has_parent => {
+                                self.frames.pop();
+                            }
+                            _ => {}
+                        }
+                    } else if ch == '`' {
+                        if matches!(frame.container, QuoteContainer::Backtick) && has_parent {
+                            self.frames.pop();
+                        } else {
+                            self.frames.push(QuoteFrame {
+                                container: QuoteContainer::Backtick,
+                                mode: QuoteMode::Unquoted,
+                                escaped: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sanitize a Fail2Ban tag name into a valid POSIX shell variable name (`f2bV_<name>`).
+fn shell_var_name(tag: &str) -> String {
+    let mut name = String::with_capacity(5 + tag.len());
+    name.push_str("f2bV_");
+    for ch in tag.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    name
+}
+
+/// Bind dynamic tag values that contain shell metacharacters or whitespace into out-of-band
+/// positional arguments (`f2bV_<tag>=$0 ... \n<script>`), matching Fail2Ban 1.1.1
+/// `CommandAction.replaceDynamicTags` + `Utils.buildShellCmd` while preserving POSIX shell
+/// quoting semantics across single-quoted, double-quoted, and unquoted templates.
+pub(crate) fn build_shell_command_from_resolver<F>(template: &str, mut resolve: F) -> ShellCommand
+where
+    F: FnMut(&str) -> Option<(String, bool)>,
+{
+    if !template.contains('<') {
+        return ShellCommand {
+            script: template.to_owned(),
+            args: Vec::new(),
+        };
+    }
+
+    let mut body = String::with_capacity(template.len());
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut quote_state = ShellQuoteState::new();
+    let mut literal_start = 0usize;
+    let mut tag_start: Option<usize> = None;
+
+    for (index, ch) in template.char_indices() {
+        match ch {
+            '<' => tag_start = Some(index),
+            ' ' => tag_start = None,
+            '>' => {
+                let Some(open) = tag_start.take() else {
+                    continue;
+                };
+                let Some(name) = template
+                    .get(open + 1..index)
+                    .filter(|part| !part.is_empty())
+                else {
+                    continue;
+                };
+                if let Some((raw_value, protect)) = resolve(name) {
+                    if let Some(lit) = template.get(literal_start..open) {
+                        quote_state.advance(lit);
+                        body.push_str(lit);
+                    }
+                    if protect && needs_shell_var(&raw_value) {
+                        // Strip interior NULs so `execve` never fails with EINVAL on untrusted logs.
+                        let clean = if raw_value.contains('\0') {
+                            raw_value.replace('\0', "")
+                        } else {
+                            raw_value
+                        };
+                        let var_base = if let Some(suffix) = name.strip_prefix("F-") {
+                            let lower = suffix.to_ascii_lowercase();
+                            let mapped = match lower.as_str() {
+                                "id" => "fid",
+                                "port" => "fport",
+                                other => other,
+                            };
+                            shell_var_name(&format!("F_{mapped}"))
+                        } else {
+                            shell_var_name(name)
+                        };
+                        let var_name = if let Some((existing, _)) =
+                            vars.iter().find(|(k, v)| k == &var_base && v == &clean)
+                        {
+                            existing.clone()
+                        } else if !vars.iter().any(|(k, _)| k == &var_base) {
+                            vars.push((var_base.clone(), clean));
+                            var_base
+                        } else {
+                            let mut n = 2usize;
+                            loop {
+                                let candidate = format!("{var_base}_{n}");
+                                if !vars.iter().any(|(k, _)| k == &candidate) {
+                                    vars.push((candidate.clone(), clean));
+                                    break candidate;
+                                }
+                                n += 1;
+                            }
+                        };
+                        match quote_state.mode() {
+                            QuoteMode::Unquoted => {
+                                body.push_str("\"${");
+                                body.push_str(&var_name);
+                                body.push_str("}\"");
+                            }
+                            QuoteMode::Double => {
+                                body.push_str("${");
+                                body.push_str(&var_name);
+                                body.push('}');
+                            }
+                            QuoteMode::Single => {
+                                body.push_str("'\"${");
+                                body.push_str(&var_name);
+                                body.push_str("}\"'");
+                            }
+                        }
+                    } else {
+                        body.push_str(&raw_value);
+                    }
+                    literal_start = index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(tail) = template.get(literal_start..) {
+        body.push_str(tail);
+    }
+
+    if vars.is_empty() {
+        return ShellCommand {
+            script: body,
+            args: Vec::new(),
+        };
+    }
+
+    let mut header = String::new();
+    let mut args = Vec::with_capacity(vars.len());
+    for (idx, (var_name, value)) in vars.into_iter().enumerate() {
+        use std::fmt::Write;
+        if idx < 10 {
+            let _ = write!(header, "{var_name}=${idx} ");
+        } else {
+            let _ = write!(header, "{var_name}=${{{idx}}} ");
+        }
+        args.push(value);
+    }
+    header.push('\n');
+    header.push_str(&body);
+    ShellCommand {
+        script: header,
+        args,
+    }
+}
+
+/// Non-recursive single-pass dynamic tag substitution producing a safe [`ShellCommand`]
+/// (`CommandAction.replaceDynamicTags` + `Utils.buildShellCmd`).
+pub fn build_shell_command(
+    template: &str,
+    ctx: &ActionContext,
+    family: &str,
+    extra_hostname: Option<(&str, &str)>,
+    reverse_dns_fn: &dyn Fn(&IpAddr) -> Option<String>,
+) -> ShellCommand {
+    let mut cached_ip_host: Option<String> = None;
+    build_shell_command_from_resolver(template, |name| {
+        resolve_dynamic_tag_raw(
+            name,
+            ctx,
+            family,
+            extra_hostname,
+            reverse_dns_fn,
+            &mut cached_ip_host,
+        )
+    })
 }
 
 /// Non-recursive single-pass dynamic tag replacement (`CommandAction.replaceDynamicTags`).
 ///
-/// Substituted values (including untrusted `<matches>` and `<F-NAME>`) are never
-/// re-scanned for `<...>` tags. `extra_hostname`, if provided, overrides
-/// `(<fq-hostname>, <sh-hostname>)`.
+/// Kept as a string helper for callers that expect inline escaped text; shell execution
+/// paths must use [`build_shell_command`] to pass untrusted values out-of-band.
 pub fn replace_dynamic_tags(
     template: &str,
     ctx: &ActionContext,
@@ -300,7 +587,7 @@ pub fn replace_dynamic_tags(
                 else {
                     continue;
                 };
-                if let Some(replacement) = resolve_dynamic_tag(
+                if let Some((raw, protect)) = resolve_dynamic_tag_raw(
                     name,
                     ctx,
                     family,
@@ -311,7 +598,11 @@ pub fn replace_dynamic_tags(
                     if let Some(lit) = template.get(literal_start..open) {
                         out.push_str(lit);
                     }
-                    out.push_str(&replacement);
+                    if protect {
+                        out.push_str(&escape_tag(&raw));
+                    } else {
+                        out.push_str(&raw);
+                    }
                     literal_start = index + 1;
                 }
             }
@@ -333,21 +624,25 @@ pub(crate) fn replace_family_tag(template: &str, family: &str) -> String {
     template.replace("<family>", family)
 }
 
-fn resolve_dynamic_tag(
+/// Resolve a dynamic tag to `(raw_value, protect_in_shell)`.
+///
+/// Only structural tokens `<br>` and `<sp>` return `protect = false`; every data tag
+/// returns `protect = true` so untrusted values are always bound out-of-band in shell execution.
+fn resolve_dynamic_tag_raw(
     name: &str,
     ctx: &ActionContext,
     family: &str,
     extra_hostname: Option<(&str, &str)>,
     reverse_dns_fn: &dyn Fn(&IpAddr) -> Option<String>,
     cached_ip_host: &mut Option<String>,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     match name {
-        "ip" | "IP" => Some(ctx.ticket.target_ip().to_string()),
-        "fid" => Some(ctx.ticket.fid.to_string()),
-        "ip-rev" => Some(ctx.ticket.target_ip().ip_rev()),
+        "ip" | "IP" => Some((ctx.ticket.target_ip().to_string(), true)),
+        "fid" => Some((ctx.ticket.fid.to_string(), true)),
+        "ip-rev" => Some((ctx.ticket.target_ip().ip_rev(), true)),
         "ip-host" => {
             if let Some(cached) = cached_ip_host.as_ref() {
-                return Some(cached.clone());
+                return Some((cached.clone(), true));
             }
             let target = ctx.ticket.target_ip();
             let resolved = target
@@ -355,51 +650,60 @@ fn resolve_dynamic_tag(
                 .and_then(|ip| reverse_dns_fn(&ip))
                 .unwrap_or_else(|| target.to_string());
             *cached_ip_host = Some(resolved.clone());
-            Some(resolved)
+            Some((resolved, true))
         }
-        "family" => Some(family.to_owned()),
-        "name" => Some(ctx.jail_name.clone()),
-        "failures" => Some(ctx.ticket.attempts.to_string()),
-        "ipfailures" => Some(ctx.ip_failures.to_string()),
-        "ipjailfailures" => Some(ctx.ip_jail_failures.to_string()),
-        "matches" => Some(escape_tag(&ctx.ticket.matches.join("\n"))),
-        "ipmatches" => Some(escape_tag(&ctx.ip_matches.join("\n"))),
-        "ipjailmatches" => Some(escape_tag(&ctx.ip_jail_matches.join("\n"))),
-        "time" => Some(format_time(ctx.ticket.time)),
-        "bantime" => Some(
+        "family" => Some((family.to_owned(), true)),
+        "name" | "jail.name" => Some((ctx.jail_name.clone(), true)),
+        "jail.banned" => Some((ctx.jail_stats.banned.to_string(), true)),
+        "jail.banned_total" => Some((ctx.jail_stats.banned_total.to_string(), true)),
+        "jail.found" => Some((ctx.jail_stats.found.to_string(), true)),
+        "jail.found_total" => Some((ctx.jail_stats.found_total.to_string(), true)),
+        "raw-ticket" => Some((format!("{:?}", ctx.ticket), true)),
+        "failures" => Some((ctx.ticket.attempts.to_string(), true)),
+        "ipfailures" => Some((ctx.ip_failures.to_string(), true)),
+        "ipjailfailures" => Some((ctx.ip_jail_failures.to_string(), true)),
+        "matches" => Some((ctx.ticket.matches.join("\n"), true)),
+        "ipmatches" => Some((ctx.ip_matches.join("\n"), true)),
+        "ipjailmatches" => Some((ctx.ip_jail_matches.join("\n"), true)),
+        "time" => Some((format_time(ctx.ticket.time), true)),
+        "bantime" => Some((
             ctx.ticket
                 .effective_ban_time(ctx.default_ban_time)
                 .to_string(),
-        ),
-        "bancount" => Some(ctx.ticket.ban_count.to_string()),
-        "restored" => Some(if ctx.ticket.restored { "1" } else { "0" }.to_owned()),
-        "subnet" => Some(format_subnet(ctx.ticket.target_ip())),
-        "cidr" => Some(
+            true,
+        )),
+        "bancount" => Some((ctx.ticket.ban_count.to_string(), true)),
+        "restored" => Some((if ctx.ticket.restored { "1" } else { "0" }.to_owned(), true)),
+        "subnet" => Some((format_subnet(ctx.ticket.target_ip()), true)),
+        "cidr" => Some((
             ctx.ticket
                 .target_ip()
                 .prefix_len()
                 .map_or_else(String::new, |p| p.to_string()),
-        ),
-        "mask" => Some(ctx.ticket.target_ip().netmask()),
-        "fq-hostname" => Some(
+            true,
+        )),
+        "mask" => Some((ctx.ticket.target_ip().netmask(), true)),
+        "fq-hostname" => Some((
             extra_hostname
                 .map(|(fq, _)| fq)
                 .unwrap_or_else(|| system_hostnames().0.as_str())
                 .to_owned(),
-        ),
-        "sh-hostname" => Some(
+            true,
+        )),
+        "sh-hostname" => Some((
             extra_hostname
                 .map(|(_, sh)| sh)
                 .unwrap_or_else(|| system_hostnames().1.as_str())
                 .to_owned(),
-        ),
-        "br" => Some("\n".to_owned()),
-        "sp" => Some(" ".to_owned()),
+            true,
+        )),
+        "br" => Some(("\n".to_owned(), false)),
+        "sp" => Some((" ".to_owned(), false)),
         _ => {
             let suffix = name
                 .strip_prefix("F-")
                 .filter(|part| is_capture_name(part))?;
-            Some(lookup_capture_escaped(&ctx.ticket.data, suffix))
+            Some((lookup_capture_raw(&ctx.ticket.data, suffix), true))
         }
     }
 }
@@ -411,7 +715,7 @@ fn is_capture_name(name: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
 }
 
-fn lookup_capture_escaped(data: &BTreeMap<String, String>, suffix: &str) -> String {
+fn lookup_capture_raw(data: &BTreeMap<String, String>, suffix: &str) -> String {
     let lower = suffix.to_ascii_lowercase();
     let mapped = match lower.as_str() {
         "id" => "fid",
@@ -426,7 +730,7 @@ fn lookup_capture_escaped(data: &BTreeMap<String, String>, suffix: &str) -> Stri
                 .find(|(k, _)| k.eq_ignore_ascii_case(mapped) || k.eq_ignore_ascii_case(&lower))
                 .map(|(_, v)| v)
         });
-    value.map_or_else(String::new, |v| escape_tag(v))
+    value.cloned().unwrap_or_default()
 }
 
 fn format_time(t: f64) -> String {

@@ -9,7 +9,9 @@ pub mod tags;
 pub use command_action::CommandAction;
 pub use policy::{ActionPolicy, Family};
 pub use smtp::SmtpAction;
-pub use tags::{StaticTemplate, escape_tag, replace_dynamic_tags};
+pub use tags::{
+    ShellCommand, StaticTemplate, build_shell_command, escape_tag, replace_dynamic_tags,
+};
 
 use crate::error::{Error, Result};
 use crate::protocol::PickleValue;

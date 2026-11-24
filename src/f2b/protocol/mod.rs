@@ -15,7 +15,7 @@ pub use pickle::{PickleValue, decode_pickle, encode_pickle_v2};
 
 pub const END_COMMAND: &[u8] = b"<F2B_END_COMMAND>";
 pub const CLOSE_COMMAND: &[u8] = b"<F2B_CLOSE_COMMAND>";
-pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Build a success response tuple `(0, value)` matching Fail2Ban's `Transmitter`.

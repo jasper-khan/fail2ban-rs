@@ -20,7 +20,10 @@ use crate::error::{Error, Result};
 use crate::logging::{LogLevel, log_msg};
 use crate::ticket::{Ticket, TicketId};
 
-use self::ipdns::{IgnoreCache, IgnoreConfig, UseDns, parse_ip_with_cidr, text_to_ip};
+use self::ipdns::{
+    IgnoreCache, IgnoreConfig, IgnoreDecision, PendingIgnoreCommand, UseDns, dns_to_ip_cached,
+    parse_ip_with_cidr, parse_ticket_ip_or_net, text_to_ip,
+};
 use self::regex::FailRegex;
 
 const DEFAULT_MLFID_MAX_COUNT: usize = 100;
@@ -515,6 +518,30 @@ impl Default for Filter {
     }
 }
 
+/// A regex match whose `<HOST>` DNS hostname is not yet cached and must be resolved off-thread.
+#[derive(Debug, Clone)]
+pub struct PendingDnsMatch {
+    pub regex_idx: usize,
+    pub event_time: f64,
+    pub matches: Vec<String>,
+    pub fail_data: BTreeMap<String, String>,
+    pub dns_host: String,
+}
+
+/// Async external work deferred by [`Filter::process_line_defer_ignore_cmd`] so callers
+/// never block Tokio threads or hold jail locks across DNS or `ignorecommand` I/O.
+#[derive(Debug, Default)]
+pub struct DeferredLineWork {
+    pub pending_dns: Vec<PendingDnsMatch>,
+    pub pending_ignore: Vec<(MatchResult, PendingIgnoreCommand)>,
+}
+
+impl DeferredLineWork {
+    pub fn is_empty(&self) -> bool {
+        self.pending_dns.is_empty() && self.pending_ignore.is_empty()
+    }
+}
+
 impl Filter {
     /// Construct a new [`Filter`] for `jail_name` with Fail2Ban 1.1.1 defaults.
     pub fn new(jail_name: impl Into<String>) -> Self {
@@ -764,8 +791,47 @@ impl Filter {
         Ok(())
     }
 
+    /// Return deduplicated hostnames in `ignoreip`/`file:` whose forward DNS entries are
+    /// not yet cached, so async callers can resolve them via `spawn_blocking` outside locks.
+    pub fn uncached_ignore_hosts(&mut self) -> Vec<String> {
+        self.ignore.uncached_ignore_hosts()
+    }
+
     pub fn ignores_ip(&mut self, id: &TicketId, ticket: Option<&Ticket>) -> bool {
         self.ignore.is_ignored(id, ticket, &self.jail_name)
+    }
+
+    pub fn check_ignore_static(
+        &mut self,
+        id: &TicketId,
+        ticket: Option<&Ticket>,
+    ) -> IgnoreDecision {
+        self.ignore.check_ignore_static(id, ticket, &self.jail_name)
+    }
+
+    pub fn finish_ignore_command(&mut self, pending: PendingIgnoreCommand, ignored: bool) -> bool {
+        self.ignore
+            .finish_ignore_command(pending, &self.jail_name, ignored)
+    }
+
+    pub fn record_deferred_match_outcome(
+        &mut self,
+        regex_idx: usize,
+        pending: PendingIgnoreCommand,
+        ignored: bool,
+    ) -> bool {
+        let ignored = self
+            .ignore
+            .finish_ignore_command(pending, &self.jail_name, ignored);
+        if ignored {
+            self.stats.ignored += 1;
+        } else {
+            if let Some(slot) = self.stats.regex_hits.get_mut(regex_idx) {
+                *slot += 1;
+            }
+            self.stats.matched += 1;
+        }
+        ignored
     }
 
     pub fn prefregex(&self) -> Option<&str> {
@@ -940,6 +1006,55 @@ impl Filter {
         preset_date: Option<f64>,
         now: f64,
     ) -> LineProcessResult {
+        self.process_line_inner(line, preset_date, now, None)
+    }
+
+    /// Like [`Filter::process_line_at`], but defers uncached forward DNS lookups and external
+    /// `ignorecommand` executions so async daemon workers can drop jail locks before I/O.
+    pub fn process_line_defer_ignore_cmd(
+        &mut self,
+        line: &str,
+        preset_date: Option<f64>,
+        now: f64,
+    ) -> (LineProcessResult, DeferredLineWork) {
+        let mut deferred = DeferredLineWork::default();
+        let res = self.process_line_inner(line, preset_date, now, Some(&mut deferred));
+        (res, deferred)
+    }
+
+    /// Finalize a [`PendingDnsMatch`] after its hostname has been resolved into the DNS cache
+    /// via `spawn_blocking`, returning immediate matches and any deferred `ignorecommand` work.
+    pub fn finish_deferred_dns_match(
+        &mut self,
+        pending: PendingDnsMatch,
+    ) -> (Vec<MatchResult>, Vec<(MatchResult, PendingIgnoreCommand)>) {
+        let mut out = LineProcessResult::default();
+        let mut deferred = DeferredLineWork::default();
+        let produced = self.build_results_from_match(
+            pending.regex_idx,
+            pending.event_time,
+            pending.matches,
+            pending.fail_data,
+            &mut out,
+            Some(&mut deferred),
+            false,
+        );
+        if produced {
+            if let Some(slot) = self.stats.regex_hits.get_mut(pending.regex_idx) {
+                *slot += 1;
+            }
+            self.stats.matched += 1;
+        }
+        (out.results, deferred.pending_ignore)
+    }
+
+    fn process_line_inner(
+        &mut self,
+        line: &str,
+        preset_date: Option<f64>,
+        now: f64,
+        deferred: Option<&mut DeferredLineWork>,
+    ) -> LineProcessResult {
         let clean = line.trim_end_matches(['\r', '\n']);
         self.stats.total_lines += 1;
 
@@ -1029,7 +1144,7 @@ impl Filter {
         }
 
         out.date_time = Some(event_time);
-        self.run_find_failure(event_time, &mut out);
+        self.run_find_failure(event_time, &mut out, deferred);
         out
     }
 
@@ -1111,7 +1226,12 @@ impl Filter {
             .any(|rx| rx.search(&work_buf, &work_lines))
     }
 
-    fn run_find_failure(&mut self, event_time: f64, out: &mut LineProcessResult) {
+    fn run_find_failure(
+        &mut self,
+        event_time: f64,
+        out: &mut LineProcessResult,
+        mut deferred: Option<&mut DeferredLineWork>,
+    ) {
         let org_lines = self.line_buffer.clone();
         let orig_buf = FailRegex::tuple_lines_buf(&org_lines);
 
@@ -1197,8 +1317,15 @@ impl Filter {
                 continue;
             };
 
-            let produced =
-                self.build_results_from_match(idx, event_time, merged_lines, fail_data, out);
+            let produced = self.build_results_from_match(
+                idx,
+                event_time,
+                merged_lines,
+                fail_data,
+                out,
+                deferred.as_deref_mut(),
+                true,
+            );
 
             if produced {
                 if let Some(slot) = self.stats.regex_hits.get_mut(idx) {
@@ -1323,6 +1450,7 @@ impl Filter {
         Some(line_strs)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_results_from_match(
         &mut self,
         regex_idx: usize,
@@ -1330,7 +1458,31 @@ impl Filter {
         matches: Vec<String>,
         fail_data: BTreeMap<String, String>,
         out: &mut LineProcessResult,
+        mut deferred: Option<&mut DeferredLineWork>,
+        defer_uncached_dns: bool,
     ) -> bool {
+        if defer_uncached_dns
+            && !self.return_raw_host
+            && matches!(self.use_dns, UseDns::Yes | UseDns::Warn)
+            && !fail_data.contains_key("ip4")
+            && !fail_data.contains_key("ip6")
+            && let Some(dns_raw) = fail_data.get("dns")
+            && parse_ticket_ip_or_net(dns_raw).is_none()
+            && !dns_raw.trim().is_empty()
+            && dns_to_ip_cached(dns_raw.trim()).is_none()
+            && let Some(deferred_out) = deferred.as_deref_mut()
+        {
+            let dns_host = dns_raw.trim().to_owned();
+            deferred_out.pending_dns.push(PendingDnsMatch {
+                regex_idx,
+                event_time,
+                matches,
+                fail_data,
+                dns_host,
+            });
+            return false;
+        }
+
         let explicit_fid = fail_data.get("fid").map(|s| TicketId::parse(s));
         let resolved_ips = resolve_fail_ips(&fail_data, self.use_dns, self.return_raw_host);
 
@@ -1377,7 +1529,33 @@ impl Filter {
                 tmp.ip = ip.clone();
                 tmp.matches = matches.clone();
                 tmp.data = fail_data.clone();
-                if self.ignore.is_ignored(primary, Some(&tmp), &self.jail_name) {
+                if let Some(deferred_out) = deferred.as_deref_mut() {
+                    match self
+                        .ignore
+                        .check_ignore_static(primary, Some(&tmp), &self.jail_name)
+                    {
+                        IgnoreDecision::Decided(true) => {
+                            self.stats.ignored += 1;
+                            out.ignored_by_ip = true;
+                            continue;
+                        }
+                        IgnoreDecision::Decided(false) => {}
+                        IgnoreDecision::RunCommand(pending) => {
+                            deferred_out.pending_ignore.push((
+                                MatchResult {
+                                    regex_idx,
+                                    fid,
+                                    ip,
+                                    time: event_time,
+                                    matches: matches.clone(),
+                                    data: fail_data.clone(),
+                                },
+                                pending,
+                            ));
+                            continue;
+                        }
+                    }
+                } else if self.ignore.is_ignored(primary, Some(&tmp), &self.jail_name) {
                     self.stats.ignored += 1;
                     out.ignored_by_ip = true;
                     continue;
@@ -1436,18 +1614,27 @@ fn resolve_fail_ips(
     use_dns: UseDns,
     return_raw_host: bool,
 ) -> Vec<TicketId> {
-    let cidr = fail_data.get("cidr").and_then(|s| s.parse::<u8>().ok());
+    let cidr = match fail_data.get("cidr").map(String::as_str) {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<u8>() {
+            Ok(p) => Some(p),
+            Err(_) => return Vec::new(),
+        },
+    };
     if let Some(v4) = fail_data.get("ip4") {
         if return_raw_host {
             return vec![TicketId::Raw(v4.clone())];
         }
-        return vec![parse_ip_with_cidr(v4, cidr)];
+        return parse_ip_with_cidr(v4, cidr).into_iter().collect();
     }
     if let Some(v6) = fail_data.get("ip6") {
         if return_raw_host {
             return vec![TicketId::Raw(v6.clone())];
         }
-        return vec![parse_ip_with_cidr(v6, cidr)];
+        return parse_ip_with_cidr(v6, cidr)
+            .filter(|id| crate::filter::ipdns::allow_ipv6() || !id.is_ipv6())
+            .into_iter()
+            .collect();
     }
     if let Some(dns) = fail_data.get("dns") {
         if return_raw_host {

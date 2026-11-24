@@ -72,7 +72,26 @@ pub async fn run_shell_cmd(
     timeout: Duration,
     success_codes: &[i32],
 ) -> Result<(bool, i32)> {
-    let out = execute("sh", "sh", &["-c", command], timeout, true, true).await?;
+    run_shell_cmd_args(command, &[], timeout, success_codes).await
+}
+
+/// Execute `sh -c <command> <arg0> <arg1> ...` in its own process group under `timeout`.
+///
+/// In POSIX `sh -c`, the first positional argument after `<command>` is bound to `$0`,
+/// the second to `$1`, etc., matching Fail2Ban 1.1.1's `Utils.buildShellCmd`.
+pub async fn run_shell_cmd_args(
+    command: &str,
+    positional_args: &[String],
+    timeout: Duration,
+    success_codes: &[i32],
+) -> Result<(bool, i32)> {
+    let mut argv: Vec<&str> = Vec::with_capacity(2 + positional_args.len());
+    argv.push("-c");
+    argv.push(command);
+    for arg in positional_args {
+        argv.push(arg.as_str());
+    }
+    let out = execute("sh", "sh", &argv, timeout, true, true).await?;
     let code = out
         .status
         .code()

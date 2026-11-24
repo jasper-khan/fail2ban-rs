@@ -161,14 +161,23 @@ impl FilterPyinotify {
         }
 
         let mut buf = vec![0u8; READ_BUF_BYTES];
+        let pending_sleep = tokio::time::sleep(self.pending_retry);
+        tokio::pin!(pending_sleep);
+        let mut pending_armed = !self.pending.is_empty();
 
         loop {
             if *shutdown.borrow() {
                 break;
             }
 
-            let pending_wait = self.pending_retry;
-            let has_pending = !self.pending.is_empty();
+            if self.pending.is_empty() {
+                pending_armed = false;
+            } else if !pending_armed {
+                pending_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + self.pending_retry);
+                pending_armed = true;
+            }
 
             tokio::select! {
                 res = shutdown.changed() => {
@@ -176,10 +185,16 @@ impl FilterPyinotify {
                         break;
                     }
                 }
-                () = tokio::time::sleep(pending_wait), if has_pending => {
+                () = &mut pending_sleep, if pending_armed => {
                     let retry_events = self.retry_pending(async_fd.get_ref());
                     if !send_events(&tx, &mut shutdown, retry_events).await {
                         break;
+                    }
+                    pending_armed = !self.pending.is_empty();
+                    if pending_armed {
+                        pending_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + self.pending_retry);
                     }
                 }
                 ready_res = async_fd.readable() => {

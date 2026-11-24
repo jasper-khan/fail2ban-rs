@@ -39,7 +39,8 @@ for target in "${targets[@]}"; do
     cargo zigbuild --release --locked --bins --target "$target"
 
     name="fail2ban-rs-$version-linux-$arch"
-    package="$output/$name"
+    stage=$(mktemp -d)
+    package="$stage/$name"
     mkdir -p "$package/bin"
     for binary in fail2ban-server fail2ban-client fail2ban-regex; do
         install -m 0755 "${CARGO_TARGET_DIR:-target}/$target/release/$binary" "$package/bin/$binary"
@@ -54,10 +55,11 @@ for target in "${targets[@]}"; do
     cp dist/fail2ban.service dist/fail2ban.socket scripts/install.sh LICENSE README.md "$package/"
     install -D -m 0644 docs/MIGRATION_AND_ROLLBACK.md "$package/docs/MIGRATION_AND_ROLLBACK.md"
 
+    tar -czf "$output/$name.tar.gz" -C "$stage" "$name"
     (
         cd "$output"
-        tar -czf "$name.tar.gz" "$name"
         "${checksum[@]}" "$name.tar.gz" > "$name.tar.gz.sha256"
     )
+    find "$stage" -depth -delete
     echo "Created $output/$name.tar.gz"
 done

@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone};
+use chrono::{
+    DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta,
+    TimeZone,
+};
 
 use crate::error::{Error, Result};
 
@@ -549,15 +552,16 @@ pub fn re_group_dict_strptime(
     msec: bool,
     default_tz: Option<i32>,
 ) -> Result<f64> {
-    re_group_dict_strptime_at(found, msec, default_tz, Local::now().naive_local())
+    re_group_dict_strptime_at(found, msec, default_tz, Local::now().fixed_offset())
 }
 
-/// Deterministic variant of [`re_group_dict_strptime`] parameterized by reference `now`.
+/// Deterministic variant of [`re_group_dict_strptime`] parameterized by reference `now`
+/// (carrying both local wall clock and UTC offset).
 pub(crate) fn re_group_dict_strptime_at(
     found: &BTreeMap<String, String>,
     msec: bool,
     default_tz: Option<i32>,
-    now: NaiveDateTime,
+    now: DateTime<FixedOffset>,
 ) -> Result<f64> {
     let mut year: Option<i32> = None;
     let mut month: Option<u32> = None;
@@ -716,12 +720,25 @@ pub(crate) fn re_group_dict_strptime_at(
         }
     }
 
+    if tzoffset.is_none() {
+        tzoffset = default_tz;
+    }
+
+    // Align missing year/month/day and rollover comparisons to the log's own timezone
+    // (or local wall time when no timezone is specified), avoiding +-24h drift when host
+    // timezone differs from log timezone.
+    let now_utc = now.naive_utc();
+    let ref_now = match tzoffset {
+        Some(off) => now_utc + TimeDelta::seconds(i64::from(off) * 60),
+        None => now.naive_local(),
+    };
+
     let mut assume_year = false;
     let year_val = match year {
         Some(y) => y,
         None => {
             assume_year = true;
-            now.year()
+            ref_now.year()
         }
     };
     let mut final_year = year_val;
@@ -746,34 +763,40 @@ pub(crate) fn re_group_dict_strptime_at(
     let mut assume_today = false;
     if month.is_none() && day.is_none() {
         assume_today = true;
-        month = Some(now.month());
-        day = Some(now.day());
+        month = Some(ref_now.month());
+        day = Some(ref_now.day());
     }
 
     let final_month = month.ok_or_else(|| Error::date("missing month in date"))?;
     let final_day = day.ok_or_else(|| Error::date("missing day in date"))?;
 
-    let naive_date =
-        NaiveDate::from_ymd_opt(final_year, final_month, final_day).ok_or_else(|| {
-            Error::date(format!(
+    let naive_date = match NaiveDate::from_ymd_opt(final_year, final_month, final_day) {
+        Some(d) => d,
+        None if assume_year && final_month == 2 && final_day == 29 => {
+            final_year -= 1;
+            NaiveDate::from_ymd_opt(final_year, 2, 29).ok_or_else(|| {
+                Error::date(format!(
+                    "invalid date {}-{}-{}",
+                    final_year + 1,
+                    final_month,
+                    final_day
+                ))
+            })?
+        }
+        None => {
+            return Err(Error::date(format!(
                 "invalid date {final_year}-{final_month}-{final_day}"
-            ))
-        })?;
+            )));
+        }
+    };
     let naive_time = NaiveTime::from_hms_micro_opt(hour, minute, second, fraction)
         .ok_or_else(|| Error::date(format!("invalid time {hour}:{minute}:{second}.{fraction}")))?;
-    let mut dt = NaiveDateTime::new(naive_date, naive_time);
+    let mut dt_wall = NaiveDateTime::new(naive_date, naive_time);
 
-    if tzoffset.is_none() {
-        tzoffset = default_tz;
+    if assume_today && dt_wall > ref_now {
+        dt_wall -= TimeDelta::days(1);
     }
-    if let Some(off) = tzoffset {
-        dt -= TimeDelta::seconds(i64::from(off) * 60);
-    }
-
-    if assume_today && dt > now {
-        dt -= TimeDelta::days(1);
-    }
-    if assume_year && dt > now + TimeDelta::days(1) {
+    if assume_year && dt_wall > ref_now + TimeDelta::days(1) {
         let prev_date = NaiveDate::from_ymd_opt(final_year - 1, final_month, final_day)
             .ok_or_else(|| {
                 Error::date(format!(
@@ -783,18 +806,21 @@ pub(crate) fn re_group_dict_strptime_at(
                     final_day
                 ))
             })?;
-        dt = NaiveDateTime::new(prev_date, dt.time());
+        dt_wall = NaiveDateTime::new(prev_date, naive_time);
     }
 
-    let mut secs = if tzoffset.is_some() {
-        dt.and_utc().timestamp() as f64
+    let mut secs = if let Some(off) = tzoffset {
+        let dt_utc = dt_wall - TimeDelta::seconds(i64::from(off) * 60);
+        dt_utc.and_utc().timestamp() as f64
     } else {
         Local
-            .from_local_datetime(&dt)
+            .from_local_datetime(&dt_wall)
             .earliest()
-            .or_else(|| Local.from_local_datetime(&dt).latest())
-            .map_or_else(|| dt.and_utc().timestamp(), |local_dt| local_dt.timestamp())
-            as f64
+            .or_else(|| Local.from_local_datetime(&dt_wall).latest())
+            .map_or_else(
+                || dt_wall.and_utc().timestamp(),
+                |local_dt| local_dt.timestamp(),
+            ) as f64
     };
     if msec {
         secs += f64::from(fraction) / 1_000_000.0;
@@ -924,9 +950,14 @@ mod tests {
 
     #[test]
     fn handles_midnight_and_year_rollover_plus_default_tz() {
-        let now = NaiveDate::from_ymd_opt(2026, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 5, 0)
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let now = utc
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 5, 0)
+                    .unwrap(),
+            )
             .unwrap();
 
         // Time-only pattern after current clock rolls back to Dec 31, 2025.
@@ -977,5 +1008,81 @@ mod tests {
             .and_utc()
             .timestamp() as f64;
         assert_eq!(ts3, expected3);
+
+        // Cross-timezone rollover (B3): UTC-5 host at 10:00 local (15:00 UTC) reading UTC log 14:59:55.
+        let now_minus5 = FixedOffset::west_opt(5 * 3600)
+            .unwrap()
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 5, 14)
+                    .unwrap()
+                    .and_hms_opt(10, 0, 0)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut f_utc_time = BTreeMap::new();
+        f_utc_time.insert("H".into(), "14".into());
+        f_utc_time.insert("M".into(), "59".into());
+        f_utc_time.insert("S".into(), "55".into());
+        let ts_minus5 = re_group_dict_strptime_at(&f_utc_time, false, Some(0), now_minus5).unwrap();
+        assert_eq!(
+            ts_minus5,
+            NaiveDate::from_ymd_opt(2026, 5, 14)
+                .unwrap()
+                .and_hms_opt(14, 59, 55)
+                .unwrap()
+                .and_utc()
+                .timestamp() as f64
+        );
+
+        // Cross-timezone rollover (B3): UTC+8 host at 01:00 local on May 15 (17:00 UTC May 14) reading UTC 16:59:55.
+        let now_plus8 = FixedOffset::east_opt(8 * 3600)
+            .unwrap()
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 5, 15)
+                    .unwrap()
+                    .and_hms_opt(1, 0, 0)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut f_utc_time2 = BTreeMap::new();
+        f_utc_time2.insert("H".into(), "16".into());
+        f_utc_time2.insert("M".into(), "59".into());
+        f_utc_time2.insert("S".into(), "55".into());
+        let ts_plus8 = re_group_dict_strptime_at(&f_utc_time2, false, Some(0), now_plus8).unwrap();
+        assert_eq!(
+            ts_plus8,
+            NaiveDate::from_ymd_opt(2026, 5, 14)
+                .unwrap()
+                .and_hms_opt(16, 59, 55)
+                .unwrap()
+                .and_utc()
+                .timestamp() as f64
+        );
+
+        // Leap-day year rollover (B3): non-leap year 2025 parsing Feb 29 rolls back to 2024-02-29.
+        let now_2025 = utc
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2025, 1, 2)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut f_leap = BTreeMap::new();
+        f_leap.insert("b".into(), "Feb".into());
+        f_leap.insert("d".into(), "29".into());
+        f_leap.insert("H".into(), "23".into());
+        f_leap.insert("M".into(), "59".into());
+        f_leap.insert("S".into(), "59".into());
+        let ts_leap = re_group_dict_strptime_at(&f_leap, false, Some(0), now_2025).unwrap();
+        assert_eq!(
+            ts_leap,
+            NaiveDate::from_ymd_opt(2024, 2, 29)
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap()
+                .and_utc()
+                .timestamp() as f64
+        );
     }
 }

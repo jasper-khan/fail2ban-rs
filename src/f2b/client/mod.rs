@@ -493,6 +493,11 @@ impl Fail2banClient {
             }
         };
 
+        if let Err(e) = crate::server::validate_config_stream(&stream) {
+            log_msg(LogLevel::Error, "fail2ban", &e.to_string());
+            return false;
+        }
+
         let sock = self.socket_path();
         if !self.opts.force && std::fs::symlink_metadata(&sock).is_ok() {
             log_msg(
@@ -516,13 +521,20 @@ impl Fail2banClient {
             if !self.opts.background {
                 let _ = child.kill();
                 let _ = child.wait();
+            } else if self.ping_silent(Duration::from_millis(100)) {
+                let _ = self.send_single(&["stop".to_owned()], true, Some(Duration::from_secs(5)));
+                let _ = self.wait_on_server(false, None);
             }
             return false;
         }
 
         if !self.send_config_stream(stream) {
+            let _ = self.send_single(&["stop".to_owned()], true, Some(Duration::from_secs(5)));
+            let stopped = self.wait_on_server(false, None).is_ok();
             if !self.opts.background {
-                let _ = child.kill();
+                if !stopped {
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
             }
             return false;

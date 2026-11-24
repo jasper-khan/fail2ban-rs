@@ -294,7 +294,18 @@ async fn serve(
                     f2b_log!(LogLevel::Error, "fail2ban.server", "{err}");
                 }
             }
-            _ = purge.tick() => server.lock().await.purge(),
+            _ = purge.tick() => {
+                if let Some(db) = server.lock().await.db_handle() {
+                    let now = jail::current_unix_seconds() as i64;
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(guard) = db.lock()
+                            && let Err(err) = guard.purge(now)
+                        {
+                            f2b_log!(LogLevel::Error, "fail2ban.database", "{err}");
+                        }
+                    });
+                }
+            }
             _ = connections.join_next(), if !connections.is_empty() => {}
             incoming = listener.accept() => match incoming {
                 Ok((stream, _)) => {
@@ -313,39 +324,41 @@ async fn serve(
 async fn connection(mut stream: UnixStream, server: Arc<Mutex<Transmitter>>, stopped: Arc<Notify>) {
     let mut pending = Vec::new();
     while let Ok(Some(data)) = read_frame(&mut stream, &mut pending, DEFAULT_TIMEOUT).await {
-        let (reply, shutting_down) = {
-            let mut server = server.lock().await;
-            let response = match decode_pickle(&data) {
-                Ok(value) => server.dispatch(&value).await,
-                Err(error) => Err(error),
-            };
-            let reply = match response {
-                Ok(value) => ok_response(value),
-                Err(Error::UnknownJail(name)) => err_response_kind("UnknownJailException", name),
-                Err(Error::DuplicateJail(name)) => {
-                    err_response_kind("DuplicateJailException", name)
-                }
-                Err(Error::Value(message)) => err_response_kind("ValueError", message),
-                Err(Error::Key(message)) => err_response_kind("KeyError", message),
-                Err(Error::Type(message)) => err_response_kind("TypeError", message),
-                Err(Error::LogPath { path, source }) => {
-                    let kind = match source.kind() {
-                        io::ErrorKind::NotFound => "FileNotFoundError",
-                        io::ErrorKind::PermissionDenied => "PermissionError",
-                        io::ErrorKind::IsADirectory => "IsADirectoryError",
-                        _ => "OSError",
-                    };
-                    let errno = source.raw_os_error().unwrap_or(0);
-                    let detail = source.to_string();
-                    let detail = detail
-                        .strip_suffix(&format!(" (os error {errno})"))
-                        .unwrap_or(&detail);
-                    let path = py_repr(&PickleValue::Str(path.to_string_lossy().into_owned()));
-                    err_response_kind(kind, format!("[Errno {errno}] {detail}: {path}"))
-                }
-                Err(err) => err_response_kind("Exception", err.to_string()),
-            };
-            (reply, server.stopping)
+        let (response, shutting_down) = match decode_pickle(&data) {
+            Ok(value) => {
+                let plan = {
+                    let mut server = server.lock().await;
+                    server.prepare_dispatch(&value).await
+                };
+                let response = plan.execute(&stopped).await;
+                let shutting_down = server.lock().await.stopping;
+                (response, shutting_down)
+            }
+            Err(error) => (Err(error), false),
+        };
+        let reply = match response {
+            Ok(value) => ok_response(value),
+            Err(Error::UnknownJail(name)) => err_response_kind("UnknownJailException", name),
+            Err(Error::DuplicateJail(name)) => err_response_kind("DuplicateJailException", name),
+            Err(Error::Value(message)) => err_response_kind("ValueError", message),
+            Err(Error::Key(message)) => err_response_kind("KeyError", message),
+            Err(Error::Type(message)) => err_response_kind("TypeError", message),
+            Err(Error::LogPath { path, source }) => {
+                let kind = match source.kind() {
+                    io::ErrorKind::NotFound => "FileNotFoundError",
+                    io::ErrorKind::PermissionDenied => "PermissionError",
+                    io::ErrorKind::IsADirectory => "IsADirectoryError",
+                    _ => "OSError",
+                };
+                let errno = source.raw_os_error().unwrap_or(0);
+                let detail = source.to_string();
+                let detail = detail
+                    .strip_suffix(&format!(" (os error {errno})"))
+                    .unwrap_or(&detail);
+                let path = py_repr(&PickleValue::Str(path.to_string_lossy().into_owned()));
+                err_response_kind(kind, format!("[Errno {errno}] {detail}: {path}"))
+            }
+            Err(err) => err_response_kind("Exception", err.to_string()),
         };
         let write = timeout(DEFAULT_TIMEOUT, stream.write_all(&encode_frame(&reply))).await;
         if shutting_down {

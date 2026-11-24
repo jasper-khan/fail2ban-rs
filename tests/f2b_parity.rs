@@ -1647,26 +1647,30 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
     fs::set_permissions(&status_jctl, fs::Permissions::from_mode(0o755)).unwrap();
 
     let j_sys = Jail::new("syshealth", "systemd", None).unwrap();
-    {
-        let mut st = j_sys.state.lock().await;
-        st.set_journalctl_bin(status_jctl.to_str().unwrap());
-        st.add_journal_match(&["_SYSTEMD_UNIT=sshd.service".to_owned()])
+    j_sys
+        .state
+        .lock()
+        .await
+        .set_journalctl_bin(status_jctl.to_str().unwrap());
+    j_sys
+        .add_journal_match(&["_SYSTEMD_UNIT=sshd.service".to_owned()])
+        .await
+        .unwrap();
+    assert!(
+        j_sys
+            .add_journal_match(&["INVALID_NO_EQ".to_owned()])
             .await
-            .unwrap();
-        assert!(
-            st.add_journal_match(&["INVALID_NO_EQ".to_owned()])
-                .await
-                .is_err(),
-            "syntactically invalid journalmatch must be rejected"
-        );
-        assert!(
-            st.add_journal_match(&["_REJECT=1".to_owned()])
-                .await
-                .is_err(),
-            "journalctl-rejected match must fail before replacing live reader"
-        );
-        assert_eq!(st.journal_matches.len(), 1);
-    }
+            .is_err(),
+        "syntactically invalid journalmatch must be rejected"
+    );
+    assert!(
+        j_sys
+            .add_journal_match(&["_REJECT=1".to_owned()])
+            .await
+            .is_err(),
+        "journalctl-rejected match must fail before replacing live reader"
+    );
+    assert_eq!(j_sys.state.lock().await.journal_matches.len(), 1);
     fs::write(&kill_flag, "1").unwrap();
     j_sys.start().await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1765,23 +1769,29 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
         st.fail_manager.set_max_retry(1);
         st.ban_manager.set_ban_time(1);
         st.add_log_path(batch_log.clone(), false).unwrap();
-        st.add_action("probe", None, None).await.unwrap();
-        st.get_action_mut("probe")
-            .unwrap()
-            .set_property(
-                "actionban",
-                &format!(
-                    "python3 -c \"import sqlite3; c=sqlite3.connect('{}'); r=c.execute('SELECT lastfilepos FROM logs').fetchall(); print(r)\" > '{}'",
-                    batch_db_path.display(),
-                    pos_seen_during_ban.display()
-                ),
-            )
-            .await
-            .unwrap();
-        // Process benign lines directly without LogEvent::Checkpoint: SQLite `logs` must stay untouched per line.
-        let now = current_unix_seconds();
-        for i in 0..5u64 {
-            st.handle_log_event(
+    }
+    batch_jail.add_action("probe", None, None).await.unwrap();
+    batch_jail
+        .actions
+        .lock()
+        .await
+        .get_mut("probe")
+        .unwrap()
+        .set_property(
+            "actionban",
+            &format!(
+                "python3 -c \"import sqlite3; c=sqlite3.connect('{}'); r=c.execute('SELECT lastfilepos FROM logs').fetchall(); print(r)\" > '{}'",
+                batch_db_path.display(),
+                pos_seen_during_ban.display()
+            ),
+        )
+        .await
+        .unwrap();
+    // Process benign lines directly without LogEvent::Checkpoint: SQLite `logs` must stay untouched per line.
+    let now = current_unix_seconds();
+    for i in 0..5u64 {
+        batch_jail
+            .handle_log_event(
                 LogEvent::Line {
                     line: format!("benign line {i}"),
                     preset_date: None,
@@ -1793,18 +1803,19 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
                 now,
             )
             .await;
-        }
-        assert!(
-            batch_db
-                .lock()
-                .unwrap()
-                .get_logs("batch")
-                .unwrap()
-                .is_empty(),
-            "benign LogEvent::Line must not synchronously commit SQLite per line"
-        );
-        // Trigger a ban line: during actionban, SQLite must NOT already have the post-line offset.
-        st.handle_log_event(
+    }
+    assert!(
+        batch_db
+            .lock()
+            .unwrap()
+            .get_logs("batch")
+            .unwrap()
+            .is_empty(),
+        "benign LogEvent::Line must not synchronously commit SQLite per line"
+    );
+    // Trigger a ban line: during actionban, SQLite must NOT already have the post-line offset.
+    batch_jail
+        .handle_log_event(
             LogEvent::Line {
                 line: "banme 192.0.2.77".to_owned(),
                 preset_date: None,
@@ -1816,19 +1827,18 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
             now,
         )
         .await;
-        let seen_mid_ban = fs::read_to_string(&pos_seen_during_ban).unwrap();
-        assert!(
-            !seen_mid_ban.contains("999"),
-            "SQLite offset must not advance before ban action & DB write finish: {seen_mid_ban}"
-        );
-        // Periodic tick / Checkpoint flushes batched offset after ban persistence.
-        st.periodic_tick(now).await;
-        let saved_logs = batch_db.lock().unwrap().get_logs("batch").unwrap();
-        assert!(
-            saved_logs.iter().any(|(_, _, pos)| *pos == 999),
-            "batched offset must persist on tick/checkpoint: {saved_logs:?}"
-        );
-    }
+    let seen_mid_ban = fs::read_to_string(&pos_seen_during_ban).unwrap();
+    assert!(
+        !seen_mid_ban.contains("999"),
+        "SQLite offset must not advance before ban action & DB write finish: {seen_mid_ban}"
+    );
+    // Periodic tick / Checkpoint flushes batched offset after ban persistence.
+    batch_jail.periodic_tick(now).await;
+    let saved_logs = batch_db.lock().unwrap().get_logs("batch").unwrap();
+    assert!(
+        saved_logs.iter().any(|(_, _, pos)| *pos == 999),
+        "batched offset must persist on tick/checkpoint: {saved_logs:?}"
+    );
 
     // Now test sustained traffic does not starve ban expiry for 192.0.2.78 (bantime=1s).
     let flood_jail = Jail::new("flood", "polling", None).unwrap();
@@ -1844,13 +1854,7 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
         st.add_log_path(flood_log.clone(), false).unwrap();
     }
     flood_jail.start().await.unwrap();
-    flood_jail
-        .state
-        .lock()
-        .await
-        .ban_ip(&["192.0.2.78".to_owned()])
-        .await
-        .unwrap();
+    flood_jail.ban_ip(&["192.0.2.78".to_owned()]).await.unwrap();
     let flood_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flood_stop_bg = Arc::clone(&flood_stop);
     let flood_log_bg = flood_log.clone();
@@ -3939,14 +3943,14 @@ async fn round6_unban_cidr_and_stop_reload_test() {
         ]))
         .await
         .unwrap();
-        // Invalid tag inside actioncheck forces consistency_check_on_flush to return Err.
+        // Recursive tag inside actioncheck forces consistency_check_on_flush to return Err.
         tr.dispatch(&PickleValue::List(vec![
             s("set"),
             s("rstj"),
             s("action"),
             s("brokenfw"),
             s("actioncheck"),
-            s("<missing_tag>"),
+            s("<actioncheck>"),
         ]))
         .await
         .unwrap();
@@ -4020,5 +4024,1357 @@ async fn round6_unban_cidr_and_stop_reload_test() {
             "failing action cleanup on stop must still unban sibling per-IP action"
         );
         let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+}
+
+#[tokio::test]
+async fn production_audit_b1_to_b6_and_n1_to_n4_regression_test() {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use fail2ban_rs::action::CommandAction;
+    use fail2ban_rs::filter::LogEncoding;
+    use fail2ban_rs::filter::backend::inotify::FilterPyinotify;
+    use fail2ban_rs::filter::backend::systemd::FilterSystemd;
+    use fail2ban_rs::filter::backend::{FileLogConfig, JournalConfig, LogEvent};
+    use fail2ban_rs::filter::ipdns::IgnoreConfig;
+    use fail2ban_rs::protocol::{PickleValue, decode_pickle, encode_pickle_v2};
+    use fail2ban_rs::server::jail::current_unix_seconds;
+    use fail2ban_rs::server::{Transmitter, validate_config_stream};
+    use fail2ban_rs::ticket::{ActionContext, ActionJailStats, Ticket, TicketId};
+
+    let s = |v: &str| PickleValue::Str(v.to_owned());
+    let dir = tempfile::tempdir().unwrap();
+
+    // B1 + N4(tags): positional-arg passing blocks command injection in <fid>/<ip>/<ip-host>/<matches>/<F-*>,
+    // preserves unmangled payloads inside double quotes (AbuseIPDB/Blocklist.de), blocks single-quote escape
+    // in ignorecommand, and expands <jail.*> / <raw-ticket>.
+    {
+        let pwn_marker = dir.path().join("b1_pwned");
+        let out_file = dir.path().join("b1_out.txt");
+        let mut act = CommandAction::new("nginx-map".to_owned(), "fw".to_owned());
+        act.set_property(
+            "actionban",
+            &format!(
+                "printf '%s\\n---\\n%s\\n---\\n%s|%s|%s|%s|%s\\n' \"<fid>\" \"<matches>\" \"<jail.name>\" \"<jail.banned>\" \"<jail.banned_total>\" \"<jail.found>\" \"<jail.found_total>\" > '{}'",
+                out_file.display()
+            ),
+        )
+        .unwrap();
+        let payload_fid = format!(
+            "sess_$(touch '{}')_`touch '{}'`",
+            pwn_marker.display(),
+            pwn_marker.display()
+        );
+        let mut ticket = Ticket::new(TicketId::Raw(payload_fid.clone()), 1_700_000_000.0);
+        ticket.matches = vec![
+            "[warn] user 'bob'".to_owned(),
+            format!("cmd $(touch '{}')", pwn_marker.display()),
+        ];
+        let ctx = ActionContext {
+            jail_name: "nginx-map".to_owned(),
+            ticket,
+            default_ban_time: 600,
+            ip_failures: 1,
+            ip_jail_failures: 1,
+            ip_matches: Vec::new(),
+            ip_jail_matches: Vec::new(),
+            jail_stats: ActionJailStats {
+                banned: 3,
+                banned_total: 9,
+                found: 4,
+                found_total: 12,
+            },
+        };
+        act.ban(&ctx).await.unwrap();
+        assert!(
+            !pwn_marker.exists(),
+            "B1: untrusted <fid>/<matches> must never execute shell command substitutions"
+        );
+        let rendered = fs::read_to_string(&out_file).unwrap();
+        assert_eq!(
+            rendered,
+            format!(
+                "{payload_fid}\n---\n[warn] user 'bob'\ncmd $(touch '{}')\n---\nnginx-map|3|9|4|12\n",
+                pwn_marker.display()
+            ),
+            "B1/N4: double-quoted payload must stay unmangled without stray backslashes"
+        );
+
+        // Single-quoted ignorecommand must never allow single-quote escape.
+        let mut ig = IgnoreConfig::new();
+        ig.ignore_self = false;
+        ig.ignore_command = Some(format!(
+            "printf '%s' '<F-USER>' >/dev/null; test ! -e '{}'; exit 1",
+            pwn_marker.display()
+        ));
+        let mut ig_ticket = Ticket::new(TicketId::parse("192.0.2.50"), 1_700_000_000.0);
+        ig_ticket.data.insert(
+            "user".to_owned(),
+            format!("a'; touch '{}'; echo 'b", pwn_marker.display()),
+        );
+        assert!(!ig.is_ignored(&ig_ticket.fid, Some(&ig_ticket), "sshd"));
+        assert!(
+            !pwn_marker.exists(),
+            "B1: single-quoted ignorecommand must never allow single-quote injection"
+        );
+    }
+
+    // B2: default backend = systemd detects active journal rotation (new inode) and reopens journalctl.
+    {
+        let jdir = dir.path().join("b2_journal");
+        fs::create_dir_all(&jdir).unwrap();
+        let active_j = jdir.join("system.journal");
+        fs::write(&active_j, "gen1").unwrap();
+
+        let mock_jctl = dir.path().join("b2_mock_journalctl");
+        let spawn_count = dir.path().join("b2_spawn_count");
+        let now_us = (current_unix_seconds() as u64) * 1_000_000;
+        fs::write(
+            &mock_jctl,
+            format!(
+                concat!(
+                    "#!/usr/bin/env bash\n",
+                    "set -euo pipefail\n",
+                    "follow=0\n",
+                    "for a in \"$@\"; do [[ \"$a\" == --follow ]] && follow=1; done\n",
+                    "if [[ \"$follow\" -eq 0 ]]; then\n",
+                    "  printf '{{\"__REALTIME_TIMESTAMP\":\"{0}\",\"__CURSOR\":\"c1\",\"_HOSTNAME\":\"h\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"fail 192.0.2.1\"}}\\n'\n",
+                    "  exit 0\n",
+                    "fi\n",
+                    "c=0\n",
+                    "if [[ -f '{1}' ]]; then c=$(cat '{1}'); fi\n",
+                    "c=$((c + 1))\n",
+                    "printf '%s' \"$c\" > '{1}'\n",
+                    "if [[ \"$c\" -eq 1 ]]; then\n",
+                    "  # Simulate journalctl --follow pinned to old inode (hangs silently after rotation).\n",
+                    "  sleep 30\n",
+                    "else\n",
+                    "  printf '{{\"__REALTIME_TIMESTAMP\":\"{2}\",\"__CURSOR\":\"c2\",\"_HOSTNAME\":\"h\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"fail 192.0.2.2\"}}\\n'\n",
+                    "  sleep 30\n",
+                    "fi\n",
+                ),
+                now_us,
+                spawn_count.display(),
+                now_us + 1_000_000,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&mock_jctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = JournalConfig {
+            path: Some(jdir.clone()),
+            rotated: false,
+            ..JournalConfig::default()
+        };
+        let reader = FilterSystemd::new(cfg, LogEncoding::Utf8, false)
+            .with_journalctl_bin(mock_jctl.to_str().unwrap())
+            .with_rotate_poll_interval(Duration::from_millis(50));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (shut_tx, shut_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _ = reader.run(tx, shut_rx).await;
+        });
+
+        let ev1 = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let LogEvent::Line { line: l1, .. } = ev1 else {
+            panic!("expected first journal line");
+        };
+        assert!(l1.contains("192.0.2.1"), "unexpected first line: {l1}");
+
+        // Wait briefly for follow child #1 to start, then rotate system.journal to a brand-new inode.
+        let wait_dl = Instant::now() + Duration::from_secs(3);
+        while !spawn_count.exists() && Instant::now() < wait_dl {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        fs::rename(&active_j, jdir.join("system@rotated.journal")).unwrap();
+        fs::write(&active_j, "gen2").unwrap();
+
+        let ev2 = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let LogEvent::Line { line: l2, .. } = ev2 else {
+            panic!("expected post-rotation journal line");
+        };
+        assert!(
+            l2.contains("192.0.2.2"),
+            "B2: post-rotation line missed: {l2}"
+        );
+        let _ = shut_tx.send(true);
+        let _ = handle.await;
+    }
+
+    // B3: multi-action jail repairs Action A, then Action B repairs during a new ban and must reban prior tickets.
+    {
+        let healthy_a = dir.path().join("b3_ok_a");
+        let healthy_b = dir.path().join("b3_ok_b");
+        let log_b = dir.path().join("b3_act_b.log");
+        let mut tr = Transmitter::default();
+        tr.dispatch(&PickleValue::List(vec![s("add"), s("b3j"), s("polling")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b3j"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        for (name, flag, log_opt) in [
+            ("act_a", &healthy_a, None),
+            ("act_b", &healthy_b, Some(&log_b)),
+        ] {
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("b3j"),
+                s("addaction"),
+                s(name),
+            ]))
+            .await
+            .unwrap();
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("b3j"),
+                s("action"),
+                s(name),
+                s("actionstart"),
+                s(&format!("touch '{}'", flag.display())),
+            ]))
+            .await
+            .unwrap();
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("b3j"),
+                s("action"),
+                s(name),
+                s("actioncheck"),
+                s(&format!("test -f '{}'", flag.display())),
+            ]))
+            .await
+            .unwrap();
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("b3j"),
+                s("action"),
+                s(name),
+                s("actionrepair"),
+                s(&format!("touch '{}'", flag.display())),
+            ]))
+            .await
+            .unwrap();
+            let ban_cmd = match log_opt {
+                Some(p) => format!(
+                    "test -f '{}' && printf 'ban:%s\\n' '<ip>' >> '{}'",
+                    flag.display(),
+                    p.display()
+                ),
+                None => format!("test -f '{}'", flag.display()),
+            };
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s("b3j"),
+                s("action"),
+                s(name),
+                s("actionban"),
+                s(&ban_cmd),
+            ]))
+            .await
+            .unwrap();
+            if let Some(p) = log_opt {
+                tr.dispatch(&PickleValue::List(vec![
+                    s("set"),
+                    s("b3j"),
+                    s("action"),
+                    s(name),
+                    s("actionreban"),
+                    s(&format!("printf 'reban:%s\\n' '<ip>' >> '{}'", p.display())),
+                ]))
+                .await
+                .unwrap();
+            }
+        }
+        tr.dispatch(&PickleValue::List(vec![s("start"), s("b3j")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b3j"),
+            s("banip"),
+            s("192.0.2.10"),
+        ]))
+        .await
+        .unwrap();
+
+        // Action A loses its chain and repairs on ban #2 (A.ban_epoch becomes 1).
+        fs::remove_file(&healthy_a).unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b3j"),
+            s("banip"),
+            s("192.0.2.11"),
+        ]))
+        .await
+        .unwrap();
+        assert!(healthy_a.exists());
+
+        // Now Action B loses its chain and repairs on ban #3 (B.ban_epoch becomes 1):
+        // B must reban 192.0.2.10 and 192.0.2.11 instead of skipping due to A's epoch=1.
+        fs::remove_file(&healthy_b).unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b3j"),
+            s("banip"),
+            s("192.0.2.12"),
+        ]))
+        .await
+        .unwrap();
+        let b_events = fs::read_to_string(&log_b).unwrap();
+        assert!(
+            b_events.contains("reban:192.0.2.10") && b_events.contains("reban:192.0.2.11"),
+            "B3: Action B must reban prior tickets after repairing even after Action A already repaired:\n{b_events}"
+        );
+        let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+
+    // B4: slow ignorecommand running in worker loop must NOT hold jail lock or block status/ping.
+    {
+        let log_path = dir.path().join("b4.log");
+        let started_flag = dir.path().join("b4_ig_started");
+        fs::write(&log_path, "").unwrap();
+        let mut tr = Transmitter::default();
+        tr.dispatch(&PickleValue::List(vec![s("add"), s("b4j"), s("polling")]))
+            .await
+            .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b4j"),
+            s("ignoreself"),
+            s("false"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b4j"),
+            s("maxretry"),
+            s("1"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b4j"),
+            s("datepattern"),
+            s("EPOCH"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b4j"),
+            s("addfailregex"),
+            s("^\\s*hit <HOST>$"),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b4j"),
+            s("ignorecommand"),
+            s(&format!(
+                "touch '{}'; sleep 2; exit 1",
+                started_flag.display()
+            )),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![
+            s("set"),
+            s("b4j"),
+            s("addlogpath"),
+            s(log_path.to_str().unwrap()),
+        ]))
+        .await
+        .unwrap();
+        tr.dispatch(&PickleValue::List(vec![s("start"), s("b4j")]))
+            .await
+            .unwrap();
+
+        let ts = current_unix_seconds() as i64;
+        fs::write(&log_path, format!("{ts} hit 192.0.2.88\n")).unwrap();
+        let wait_dl = Instant::now() + Duration::from_secs(5);
+        while !started_flag.exists() && Instant::now() < wait_dl {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(started_flag.exists(), "B4: ignorecommand did not start");
+
+        // While ignorecommand is sleeping 2s, status on the SAME jail must return promptly.
+        let t0 = Instant::now();
+        let st = tr
+            .dispatch(&PickleValue::List(vec![s("status"), s("b4j")]))
+            .await;
+        let elapsed = t0.elapsed();
+        assert!(st.is_ok());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "B4: status blocked on running ignorecommand for {elapsed:?}"
+        );
+        let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+
+    // B5: reload that removes `apache` while `sshd` fails reload_commit must NOT strip `apache` into a zombie.
+    {
+        let log_ap = dir.path().join("b5_apache.log");
+        let log_ssh = dir.path().join("b5_sshd.log");
+        fs::write(&log_ap, "").unwrap();
+        fs::write(&log_ssh, "").unwrap();
+
+        let mut tr = Transmitter::default();
+        for (jn, lp) in [("apache", &log_ap), ("sshd", &log_ssh)] {
+            tr.dispatch(&PickleValue::List(vec![s("add"), s(jn), s("polling")]))
+                .await
+                .unwrap();
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s(jn),
+                s("ignoreself"),
+                s("false"),
+            ]))
+            .await
+            .unwrap();
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s(jn),
+                s("addlogpath"),
+                s(lp.to_str().unwrap()),
+            ]))
+            .await
+            .unwrap();
+            tr.dispatch(&PickleValue::List(vec![
+                s("set"),
+                s(jn),
+                s("addaction"),
+                s("fw"),
+            ]))
+            .await
+            .unwrap();
+            tr.dispatch(&PickleValue::List(vec![s("start"), s(jn)]))
+                .await
+                .unwrap();
+        }
+        // Fail sshd reload while omitting apache from the reload stream.
+        let failing_reload = PickleValue::List(vec![
+            PickleValue::List(vec![s("add"), s("sshd"), s("polling")]),
+            PickleValue::List(vec![s("set"), s("sshd"), s("addaction"), s("fw")]),
+            PickleValue::List(vec![
+                s("set"),
+                s("sshd"),
+                s("action"),
+                s("fw"),
+                s("actionreload"),
+                s("false"),
+            ]),
+            PickleValue::List(vec![s("start"), s("sshd")]),
+        ]);
+        let res = tr
+            .dispatch(&PickleValue::List(vec![
+                s("reload"),
+                s("--all"),
+                PickleValue::List(vec![]),
+                failing_reload,
+            ]))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(
+            tr.dispatch(&PickleValue::List(vec![
+                s("get"),
+                s("apache"),
+                s("actions")
+            ]))
+            .await
+            .unwrap(),
+            PickleValue::List(vec![s("fw")]),
+            "B5: failed reload must NOT strip actions from untouched jail pending removal"
+        );
+        assert_eq!(
+            tr.dispatch(&PickleValue::List(vec![
+                s("get"),
+                s("apache"),
+                s("logpath")
+            ]))
+            .await
+            .unwrap(),
+            PickleValue::List(vec![s(log_ap.to_str().unwrap())]),
+            "B5: failed reload must preserve logpath of untouched jail"
+        );
+        let _ = tr.dispatch(&PickleValue::List(vec![s("stop")])).await;
+    }
+
+    // B6 + CRLF smtp.py: validate_config_stream catches custom .py, bad globals, and accepts CRLF stock smtp.py.
+    {
+        assert!(
+            validate_config_stream(&[PickleValue::List(vec![
+                s("set"),
+                s("sshd"),
+                s("addaction"),
+                s("bad"),
+                s("/tmp/custom.py"),
+                s("{}"),
+            ])])
+            .is_err(),
+            "B6: validate_config_stream must reject custom .py addaction"
+        );
+        assert!(
+            validate_config_stream(&[PickleValue::List(vec![
+                s("set"),
+                s("loglevel"),
+                s("NOT_A_LEVEL"),
+            ])])
+            .is_err(),
+            "B6: validate_config_stream must reject invalid loglevel"
+        );
+        assert!(
+            validate_config_stream(&[PickleValue::List(vec![
+                s("set"),
+                s("allowipv6"),
+                s("bogus"),
+            ])])
+            .is_err(),
+            "B6: validate_config_stream must reject invalid allowipv6"
+        );
+        if let Some(upstream) = upstream_source() {
+            let stock_bytes = fs::read(upstream.join("config/action.d/smtp.py")).unwrap();
+            let crlf_bytes: Vec<u8> = stock_bytes
+                .into_iter()
+                .flat_map(|b| {
+                    if b == b'\n' {
+                        vec![b'\r', b'\n']
+                    } else {
+                        vec![b]
+                    }
+                })
+                .collect();
+            let crlf_smtp = dir.path().join("smtp.py");
+            fs::write(&crlf_smtp, crlf_bytes).unwrap();
+            validate_config_stream(&[PickleValue::List(vec![
+                s("set"),
+                s("sshd"),
+                s("addaction"),
+                s("smtp"),
+                s(crlf_smtp.to_str().unwrap()),
+                s(r#"{"host":"localhost:25"}"#),
+            ])])
+            .expect("B6: stock smtp.py converted to CRLF must pass preflight validation");
+        }
+    }
+
+    // N1: FilterPyinotify pending retry timer must NOT starve under continuous events on another active file.
+    {
+        let active_log = dir.path().join("n1_active.log");
+        let missing_dir = dir.path().join("n1_late_dir");
+        let late_log = missing_dir.join("late.log");
+        fs::write(&active_log, "").unwrap();
+
+        let watcher = FilterPyinotify::with_pending_retry(
+            vec![
+                FileLogConfig {
+                    path: active_log.clone(),
+                    tail: false,
+                    resume_fingerprint: None,
+                    resume_offset: 0,
+                    auto_seek: None,
+                },
+                FileLogConfig {
+                    path: late_log.clone(),
+                    tail: false,
+                    resume_fingerprint: None,
+                    resume_offset: 0,
+                    auto_seek: None,
+                },
+            ],
+            LogEncoding::Utf8,
+            Duration::from_millis(120),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (shut_tx, shut_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _ = watcher.run(tx, shut_rx).await;
+        });
+
+        let active_writer_path = active_log.clone();
+        let writer = tokio::spawn(async move {
+            for i in 0..25 {
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                let mut f = OpenOptions::new()
+                    .append(true)
+                    .open(&active_writer_path)
+                    .unwrap();
+                writeln!(f, "noise {i}").unwrap();
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        fs::create_dir_all(&missing_dir).unwrap();
+        fs::write(&late_log, "late-target-hit\n").unwrap();
+
+        let mut saw_late = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(Some(LogEvent::Line { line, .. })) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+                && line.contains("late-target-hit")
+            {
+                saw_late = true;
+                break;
+            }
+        }
+        assert!(
+            saw_late,
+            "N1: pending directory retry must fire even while another watched log emits every 35ms"
+        );
+        let _ = shut_tx.send(true);
+        let _ = writer.await;
+        let _ = handle.await;
+    }
+
+    // N3 + N4: pickle 2500-item batching + TypeError + IPAddr CIDR + TicketId dotted mask + del_ignore_ip + install.sh marker guard.
+    {
+        let big = PickleValue::List((0..2500).map(PickleValue::Int).collect());
+        let decoded = decode_pickle(&encode_pickle_v2(&big)).unwrap();
+        assert_eq!(decoded, big);
+
+        let te = PickleValue::Exception {
+            kind: "TypeError".to_owned(),
+            message: "bad arg".to_owned(),
+        };
+        assert_eq!(decode_pickle(&encode_pickle_v2(&te)).unwrap(), te);
+
+        assert_eq!(
+            TicketId::parse("192.0.2.0/255.255.255.0"),
+            TicketId::parse("192.0.2.0/24")
+        );
+        assert_eq!(
+            TicketId::parse("[2001:db8::1]"),
+            TicketId::parse("2001:db8::1")
+        );
+
+        let mut ig = IgnoreConfig::new();
+        ig.add_ignore_ip("192.0.2.5/24");
+        assert!(ig.del_ignore_ip(Some("192.0.2.0/24")));
+        assert!(ig.ignore_ips.is_empty());
+
+        // install.sh --uninstall on a host without fail2ban-rs marker must NOT delete pre-existing /usr/local files.
+        let uninst_root = dir.path().join("n4_uninstalled_host");
+        fs::create_dir_all(uninst_root.join("usr/local/bin")).unwrap();
+        fs::write(
+            uninst_root.join("usr/local/bin/fail2ban-server"),
+            "UPSTREAM-PY\n",
+        )
+        .unwrap();
+        let install_sh = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+        let out = Command::new("bash")
+            .arg(&install_sh)
+            .arg("--uninstall")
+            .env("DESTDIR", &uninst_root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            fs::read_to_string(uninst_root.join("usr/local/bin/fail2ban-server")).unwrap(),
+            "UPSTREAM-PY\n",
+            "install.sh --uninstall must not touch /usr/local binaries when fail2ban-rs was never installed"
+        );
+    }
+}
+
+/// Independent audit regression test covering B1–B6 and NB1–NB4 from docs/INDEPENDENT_AUDIT_REPORT.md.
+#[tokio::test]
+async fn independent_audit_b1_to_b6_and_nb1_to_nb4_regression_test() {
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use fail2ban_rs::action::{ActionKind, CommandAction, SmtpAction};
+    use fail2ban_rs::db::Fail2BanDb;
+    use fail2ban_rs::filter::Filter;
+    use fail2ban_rs::filter::ipdns::UseDns;
+    use fail2ban_rs::protocol::{PickleValue, decode_pickle, encode_frame, read_frame};
+    use fail2ban_rs::server::jail::{Jail, current_unix_seconds};
+    use fail2ban_rs::ticket::{ActionContext, Ticket, TicketId};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, UnixStream};
+
+    let dir = TempDir::new().unwrap();
+
+    // B1: POSIX shell quoting context (single-quoted, double-quoted, nested backtick, unquoted
+    // whitespace/glob protection) executed via real `sh -c`.
+    {
+        let out_sq = dir.path().join("b1_sq.txt");
+        let out_uq_ws = dir.path().join("b1_uq_ws.txt");
+        let out_uq_glob = dir.path().join("b1_uq_glob.txt");
+        let out_bt = dir.path().join("b1_bt.txt");
+
+        let mut act = CommandAction::new("sshd".to_owned(), "b1_quote".to_owned());
+        act.set_property(
+            "actionban",
+            &format!(
+                "printf '%s' '<matches>' > '{}'; \
+                 sh -c 'printf \"%d|%s\" $# \"$1\"' _ <F-USER> > '{}'; \
+                 (cd / && sh -c 'printf \"%d|%s\" $# \"$1\"' _ <F-GLOB> > '{}'); \
+                 printf %b \"host:`printf '%s' \"<F-USER>\" | tr a-z A-Z` match:<matches>\" > '{}'",
+                out_sq.display(),
+                out_uq_ws.display(),
+                out_uq_glob.display(),
+                out_bt.display(),
+            ),
+        )
+        .unwrap();
+
+        let mut ticket = Ticket::new(TicketId::parse("192.0.2.66"), 1_700_000_000.0);
+        ticket.matches = vec!["sshd[1234]: failed 'quote' $HOME".to_owned()];
+        ticket
+            .data
+            .insert("user".to_owned(), "alice -v --flush".to_owned());
+        ticket.data.insert("glob".to_owned(), "*".to_owned());
+        let ctx = ActionContext {
+            jail_name: "sshd".to_owned(),
+            ticket,
+            default_ban_time: 600,
+            ip_failures: 1,
+            ip_jail_failures: 1,
+            ip_matches: vec![],
+            ip_jail_matches: vec![],
+            jail_stats: Default::default(),
+        };
+        act.ban(&ctx).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&out_sq).unwrap(),
+            "sshd[1234]: failed 'quote' $HOME",
+            "B1: single-quoted <matches> must expand to actual value, not literal ${{f2bV_matches}}"
+        );
+        assert_eq!(
+            fs::read_to_string(&out_uq_ws).unwrap(),
+            "1|alice -v --flush",
+            "B1: unquoted <F-USER> with spaces/options must remain a single argv"
+        );
+        assert_eq!(
+            fs::read_to_string(&out_uq_glob).unwrap(),
+            "1|*",
+            "B1: unquoted <F-GLOB> with '*' must NOT glob-expand against cwd '/'"
+        );
+        assert_eq!(
+            fs::read_to_string(&out_bt).unwrap(),
+            "host:ALICE -V --FLUSH match:sshd[1234]: failed 'quote' $HOME",
+            "B1: nested double-quoted tag inside backticks inside double quotes must expand cleanly"
+        );
+    }
+
+    // B2: pseudo-IPs and out-of-range CIDRs matched by loose regexes must be dropped, never degraded to Raw.
+    {
+        let mut flt = Filter::new("b2_invalid");
+        flt.set_check_find_time(false);
+        flt.set_ignore_self(false);
+        flt.set_use_dns(UseDns::No).unwrap();
+        flt.add_fail_regex(r"bad <HOST>$").unwrap();
+        flt.add_fail_regex(r"sub <IP4>/<CIDR>$").unwrap();
+
+        for bogus in [
+            "May 14 08:30:15 h app: bad 999.999.999.999",
+            "May 14 08:30:16 h app: bad :::",
+            "May 14 08:30:17 h app: bad 12:34:56",
+            "May 14 08:30:18 h app: sub 192.0.2.1/99",
+            "May 14 08:30:19 h app: sub 192.0.2.1/999",
+        ] {
+            assert!(
+                flt.process_line(bogus, None).is_empty(),
+                "B2: invalid IP/CIDR line must be dropped: {bogus}"
+            );
+        }
+        let valid = flt.process_line("May 14 08:30:20 h app: sub 192.0.2.5/24", None);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].ip, Some(TicketId::parse("192.0.2.0/24")));
+    }
+
+    // B4: <F-ID> separate from <HOST> persists and restores `ticket.ip` through SQLite,
+    // honoring `ignoreip` and passing real `<ip>` to actionban on restart.
+    {
+        let db = Arc::new(std::sync::Mutex::new(
+            Fail2BanDb::open(":memory:", 86_400, 10).unwrap(),
+        ));
+        let now = current_unix_seconds();
+        {
+            let guard = db.lock().unwrap();
+            guard.add_jail("b4j").unwrap();
+            let mut t1 = Ticket::new(TicketId::Raw("sess-ignored".to_owned()), now);
+            t1.ip = Some(TicketId::parse("198.51.100.10"));
+            t1.ban_time = Some(600);
+            guard.add_ban("b4j", &t1, 600).unwrap();
+
+            let mut t2 = Ticket::new(TicketId::Raw("sess-active".to_owned()), now);
+            t2.ip = Some(TicketId::parse("203.0.113.99"));
+            t2.ban_time = Some(600);
+            guard.add_ban("b4j", &t2, 600).unwrap();
+        }
+
+        let ban_log = dir.path().join("b4_restore.log");
+        let jail = Jail::new("b4j", "polling", Some(Arc::clone(&db))).unwrap();
+        {
+            let mut st = jail.state.lock().await;
+            st.filter.set_ignore_self(false);
+            st.filter.add_ignore_ip("198.51.100.10");
+        }
+        jail.add_action("fw", None, None).await.unwrap();
+        jail.actions
+            .lock()
+            .await
+            .get_mut("fw")
+            .unwrap()
+            .set_property(
+                "actionban",
+                &format!(
+                    "printf 'ip=%s fid=%s\\n' '<ip>' '<fid>' >> '{}'",
+                    ban_log.display()
+                ),
+            )
+            .await
+            .unwrap();
+        jail.start().await.unwrap();
+
+        let logged = fs::read_to_string(&ban_log).unwrap();
+        assert!(
+            logged.contains("ip=203.0.113.99 fid=sess-active"),
+            "B4: restored ticket must pass real IP to <ip>: {logged:?}"
+        );
+        assert!(
+            !logged.contains("sess-ignored"),
+            "B4: restored ticket with ignored target IP must respect ignoreip: {logged:?}"
+        );
+        jail.stop().await.unwrap();
+    }
+
+    // B5: slow SMTP actionban in one jail + concurrent `sleep` RPC must NOT block `ping`,
+    // `status <slow>`, `status <fast>`, or `set <fast> banip` on the control socket.
+    {
+        let sock = dir.path().join("b5.sock");
+        let pid = dir.path().join("b5.pid");
+        let fast_log = dir.path().join("b5_fast.log");
+
+        // Mock slow SMTP server: notifies once connected, holds connection for 2s before replying.
+        let smtp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smtp_port = smtp_listener.local_addr().unwrap().port();
+        let smtp_connected = Arc::new(tokio::sync::Notify::new());
+        let smtp_connected_srv = Arc::clone(&smtp_connected);
+        let smtp_srv = tokio::spawn(async move {
+            // Connection 0: `start` email, Connection 1: `ban` email (2s delay), Connection 2: `stop` email.
+            for idx in 0..3u8 {
+                let Ok((mut s, _)) = smtp_listener.accept().await else {
+                    break;
+                };
+                if idx == 1 {
+                    smtp_connected_srv.notify_one();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                let _ = s.write_all(b"220 slow.local ESMTP\r\n").await;
+                let (r, mut w) = s.into_split();
+                let mut br = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if br.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let upper = line.trim().to_ascii_uppercase();
+                    if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+                        let _ = w.write_all(b"250-slow.local\r\n250 OK\r\n").await;
+                    } else if upper.starts_with("MAIL ") || upper.starts_with("RCPT ") {
+                        let _ = w.write_all(b"250 OK\r\n").await;
+                    } else if upper == "DATA" {
+                        let _ = w.write_all(b"354 Go ahead\r\n").await;
+                        loop {
+                            line.clear();
+                            if br.read_line(&mut line).await.unwrap_or(0) == 0
+                                || line.trim_end_matches(['\r', '\n']) == "."
+                            {
+                                break;
+                            }
+                        }
+                        let _ = w.write_all(b"250 Queued\r\n").await;
+                    } else if upper == "QUIT" {
+                        let _ = w.write_all(b"221 Bye\r\n").await;
+                        break;
+                    } else {
+                        let _ = w.write_all(b"250 OK\r\n").await;
+                    }
+                }
+            }
+        });
+
+        struct ChildKillGuard(std::process::Child);
+        impl Drop for ChildKillGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let server_bin = env!("CARGO_BIN_EXE_fail2ban-server");
+        let mut srv_child = ChildKillGuard(
+            Command::new(server_bin)
+                .args([
+                    "--async",
+                    "-f",
+                    "-x",
+                    "-s",
+                    sock.to_str().unwrap(),
+                    "-p",
+                    pid.to_str().unwrap(),
+                    "--logtarget",
+                    "STDERR",
+                ])
+                .spawn()
+                .unwrap(),
+        );
+
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < wait_deadline {
+            if sock.exists() && UnixStream::connect(&sock).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        async fn rpc(sock: &Path, cmd: PickleValue) -> PickleValue {
+            let mut stream = UnixStream::connect(sock).await.unwrap();
+            stream.write_all(&encode_frame(&cmd)).await.unwrap();
+            let mut buf = Vec::new();
+            let raw = read_frame(&mut stream, &mut buf, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .unwrap();
+            decode_pickle(&raw).unwrap()
+        }
+        let assert_ok = |resp: &PickleValue, label: &str| {
+            assert!(
+                matches!(resp, PickleValue::Tuple(p) if p.first() == Some(&PickleValue::Int(0))),
+                "B5 setup RPC {label} failed: {resp:?}"
+            );
+        };
+
+        let smtp_py = upstream_source()
+            .expect("FAIL2BAN_111_SOURCE must be set")
+            .join("config/action.d/smtp.py");
+        let smtp_init = format!(
+            r#"{{"host":"127.0.0.1:{smtp_port}","fromaddr":"f2b@test.local","toaddr":"ops@test.local"}}"#
+        );
+        let s = |v: &str| PickleValue::Str(v.to_owned());
+        assert_ok(
+            &rpc(
+                &sock,
+                PickleValue::List(vec![s("add"), s("slow"), s("polling")]),
+            )
+            .await,
+            "add slow",
+        );
+        assert_ok(
+            &rpc(
+                &sock,
+                PickleValue::List(vec![
+                    s("set"),
+                    s("slow"),
+                    s("addaction"),
+                    s("act_slow"),
+                    s(smtp_py.to_str().unwrap()),
+                    s(&smtp_init),
+                ]),
+            )
+            .await,
+            "addaction act_slow",
+        );
+        assert_ok(
+            &rpc(&sock, PickleValue::List(vec![s("start"), s("slow")])).await,
+            "start slow",
+        );
+
+        assert_ok(
+            &rpc(
+                &sock,
+                PickleValue::List(vec![s("add"), s("fast"), s("polling")]),
+            )
+            .await,
+            "add fast",
+        );
+        assert_ok(
+            &rpc(
+                &sock,
+                PickleValue::List(vec![s("set"), s("fast"), s("addaction"), s("act_fast")]),
+            )
+            .await,
+            "addaction act_fast",
+        );
+        assert_ok(
+            &rpc(
+                &sock,
+                PickleValue::List(vec![
+                    s("set"),
+                    s("fast"),
+                    s("action"),
+                    s("act_fast"),
+                    s("actionban"),
+                    s(&format!("echo '<ip>' >> '{}'", fast_log.display())),
+                ]),
+            )
+            .await,
+            "set act_fast actionban",
+        );
+        assert_ok(
+            &rpc(&sock, PickleValue::List(vec![s("start"), s("fast")])).await,
+            "start fast",
+        );
+
+        // Fire slow SMTP ban and `sleep 2.0` concurrently.
+        let sock_a = sock.clone();
+        let slow_ban_task = tokio::spawn(async move {
+            rpc(
+                &sock_a,
+                PickleValue::List(vec![s("set"), s("slow"), s("banip"), s("192.0.2.101")]),
+            )
+            .await
+        });
+        let sock_b = sock.clone();
+        let sleep_task = tokio::spawn(async move {
+            rpc(
+                &sock_b,
+                PickleValue::List(vec![s("sleep"), PickleValue::Float(2.0)]),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), smtp_connected.notified())
+            .await
+            .expect("slow SMTP actionban must connect to mock server");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let t0 = Instant::now();
+        let pong = rpc(&sock, PickleValue::List(vec![s("ping")])).await;
+        let st_slow = rpc(&sock, PickleValue::List(vec![s("status"), s("slow")])).await;
+        let st_fast = rpc(&sock, PickleValue::List(vec![s("status"), s("fast")])).await;
+        let fast_ban = rpc(
+            &sock,
+            PickleValue::List(vec![s("set"), s("fast"), s("banip"), s("192.0.2.7")]),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "B5: ping/status/fast-ban must not wait on 2s slow SMTP ban or sleep RPC (took {elapsed:?})"
+        );
+        assert!(matches!(pong, PickleValue::Tuple(ref p) if p[0] == PickleValue::Int(0)));
+        assert!(matches!(st_slow, PickleValue::Tuple(ref p) if p[0] == PickleValue::Int(0)));
+        assert!(matches!(st_fast, PickleValue::Tuple(ref p) if p[0] == PickleValue::Int(0)));
+        assert!(matches!(fast_ban, PickleValue::Tuple(ref p) if p[0] == PickleValue::Int(0)));
+        assert!(fs::read_to_string(&fast_log).unwrap().contains("192.0.2.7"));
+
+        let _ = rpc(&sock, PickleValue::List(vec![s("stop")])).await;
+        let _ = slow_ban_task.await;
+        let _ = sleep_task.await;
+        let _ = smtp_srv.await;
+        let _ = srv_child.0.wait();
+    }
+
+    // B6: `fail2ban-client start` in default background mode must not leave a half-configured daemon running
+    // when either static preflight fails (unsupported .py action) or runtime server-stream fails mid-way.
+    {
+        let client_bin = env!("CARGO_BIN_EXE_fail2ban-client");
+        let server_bin = env!("CARGO_BIN_EXE_fail2ban-server");
+        let bin_dir = Path::new(server_bin).parent().unwrap();
+        let path_env = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        // Case 1: unsupported third-party .py action rejected in preflight before spawning daemon.
+        let cfg1 = dir.path().join("b6_cfg1");
+        let sock1 = dir.path().join("b6_1.sock");
+        let pid1 = dir.path().join("b6_1.pid");
+        let log1 = dir.path().join("b6_1.log");
+        fs::create_dir_all(cfg1.join("action.d")).unwrap();
+        fs::create_dir_all(cfg1.join("filter.d")).unwrap();
+        fs::write(&log1, "").unwrap();
+        fs::write(cfg1.join("action.d/bad_third_party.py"), "Action = None\n").unwrap();
+        fs::write(
+            cfg1.join("filter.d/simple.conf"),
+            "[Definition]\nfailregex = ^fail <HOST>$\n",
+        )
+        .unwrap();
+        fs::write(
+            cfg1.join("fail2ban.conf"),
+            format!(
+                "[Definition]\nloglevel = INFO\nlogtarget = STDERR\nsocket = {}\npidfile = {}\ndbfile = None\n",
+                sock1.display(),
+                pid1.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cfg1.join("jail.conf"),
+            format!(
+                "[DEFAULT]\nbackend = polling\n[good]\nenabled = true\nfilter = simple\nlogpath = {}\n[bad]\nenabled = true\nfilter = simple\nlogpath = {}\naction = bad_third_party.py\n",
+                log1.display(),
+                log1.display()
+            ),
+        )
+        .unwrap();
+        let out1 = Command::new(client_bin)
+            .env("PATH", &path_env)
+            .args(["-c", cfg1.to_str().unwrap(), "start"])
+            .output()
+            .unwrap();
+        assert!(
+            !out1.status.success(),
+            "B6 case1 must fail on unsupported .py action"
+        );
+        assert!(!sock1.exists(), "B6 case1 must not leave socket behind");
+
+        // Case 2: runtime server-stream failure (2nd jail uses an unwritable/directory logpath)
+        // after passing static preflight must stop the freshly spawned background daemon cleanly.
+        let cfg2 = dir.path().join("b6_cfg2");
+        let sock2 = dir.path().join("b6_2.sock");
+        let pid2 = dir.path().join("b6_2.pid");
+        let log2_ok = dir.path().join("b6_2_ok.log");
+        let log2_dir = dir.path().join("b6_2_is_a_dir");
+        fs::create_dir_all(cfg2.join("action.d")).unwrap();
+        fs::create_dir_all(cfg2.join("filter.d")).unwrap();
+        fs::create_dir_all(&log2_dir).unwrap();
+        fs::write(&log2_ok, "").unwrap();
+        fs::write(
+            cfg2.join("filter.d/simple.conf"),
+            "[Definition]\nfailregex = ^fail <HOST>$\n",
+        )
+        .unwrap();
+        fs::write(
+            cfg2.join("fail2ban.conf"),
+            format!(
+                "[Definition]\nloglevel = INFO\nlogtarget = STDERR\nsocket = {}\npidfile = {}\ndbfile = None\n",
+                sock2.display(),
+                pid2.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            cfg2.join("jail.conf"),
+            format!(
+                "[DEFAULT]\nbackend = polling\n[j1]\nenabled = true\nfilter = simple\nlogpath = {}\n[j2]\nenabled = true\nfilter = simple\nlogpath = {}\n",
+                log2_ok.display(),
+                log2_dir.display()
+            ),
+        )
+        .unwrap();
+        let out2 = Command::new(client_bin)
+            .env("PATH", &path_env)
+            .args(["-c", cfg2.to_str().unwrap(), "start"])
+            .output()
+            .unwrap();
+        assert!(
+            !out2.status.success(),
+            "B6 case2 must fail when 2nd jail logpath is a directory"
+        );
+        let ping2 = Command::new(client_bin)
+            .env("PATH", &path_env)
+            .args(["-c", cfg2.to_str().unwrap(), "ping"])
+            .output()
+            .unwrap();
+        assert!(
+            !ping2.status.success(),
+            "B6 case2 must shut down half-configured background daemon on server-stream error"
+        );
+        assert!(
+            !sock2.exists(),
+            "B6 case2 socket must be cleaned up after rollback stop"
+        );
+    }
+
+    // NB1: 120-byte exponential Pickle memo bomb must be rejected immediately without OOM.
+    {
+        let mut bomb = vec![0x80, 0x04, b'N', 0x94]; // PROTO 4, None, MEMOIZE (idx 0)
+        for i in 0u8..35 {
+            bomb.push(b'h'); // BINGET i
+            bomb.push(i);
+            bomb.push(b'h'); // BINGET i
+            bomb.push(i);
+            bomb.push(0x86); // TUPLE2
+            bomb.push(0x94); // MEMOIZE (idx i+1)
+        }
+        bomb.push(b'.');
+        let t0 = Instant::now();
+        let res = decode_pickle(&bomb);
+        assert!(
+            res.is_err(),
+            "NB1: exponential pickle memo bomb must be rejected"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "NB1: memo bomb must fail fast, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // NB2: SMTP multiline reply exceeding 64 KiB must be rejected cleanly.
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"220 mock.local ESMTP\r\n").await.unwrap();
+            let (r, mut w) = sock.into_split();
+            let mut br = BufReader::new(r);
+            let mut line = String::new();
+            let _ = br.read_line(&mut line).await;
+            // Flood > 70 KiB of 250- continuation lines.
+            let chunk = format!("250-{}\r\n", "X".repeat(1000));
+            for _ in 0..80 {
+                if w.write_all(chunk.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            let _ = w.write_all(b"250 OK\r\n").await;
+        });
+
+        let smtp = SmtpAction::from_json(
+            "nb2j".to_owned(),
+            "smtp".to_owned(),
+            &format!(
+                r#"{{"host":"127.0.0.1:{}","fromaddr":"a@b.test","toaddr":"c@d.test"}}"#,
+                addr.port()
+            ),
+        )
+        .unwrap();
+        let mut act = ActionKind::Smtp(smtp);
+        let err = act.start(false).await.unwrap_err().to_string();
+        assert!(
+            err.contains("65536"),
+            "NB2: oversized SMTP multiline reply must fail with 65536-byte cap error, got: {err}"
+        );
+        let _ = srv.await;
+    }
+
+    // NB4: `scripts/install.sh --uninstall` removes unmodified compiled `apache-fakegooglebot`
+    // so subsequent reinstall upgrades it, while preserving user-modified helpers.
+    {
+        let install_sh = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+        let dest = dir.path().join("nb4_dest");
+        let make_tar = |ver: &str, helper_body: &str| -> PathBuf {
+            let stage = dir.path().join(format!("nb4_stage_{ver}"));
+            let root = stage.join(format!("fail2ban-rs-{ver}-linux-amd64"));
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::create_dir_all(root.join("man")).unwrap();
+            fs::create_dir_all(root.join("config/filter.d/ignorecommands")).unwrap();
+            for b in ["fail2ban-server", "fail2ban-client", "fail2ban-regex"] {
+                fs::write(root.join("bin").join(b), format!("#!/bin/sh\necho {ver}\n")).unwrap();
+            }
+            fs::write(root.join("fail2ban.service"), "[Unit]\n").unwrap();
+            fs::write(root.join("fail2ban.socket"), "[Socket]\n").unwrap();
+            for m in [
+                "fail2ban.1",
+                "fail2ban-server.1",
+                "fail2ban-client.1",
+                "fail2ban-regex.1",
+                "jail.conf.5",
+            ] {
+                fs::write(root.join("man").join(m), ".TH TEST 1\n").unwrap();
+            }
+            fs::write(
+                root.join("config/filter.d/ignorecommands/apache-fakegooglebot"),
+                helper_body,
+            )
+            .unwrap();
+            let tar_path = dir
+                .path()
+                .join(format!("fail2ban-rs-{ver}-linux-amd64.tar.gz"));
+            let st = Command::new("tar")
+                .args([
+                    "-czf",
+                    tar_path.to_str().unwrap(),
+                    "-C",
+                    stage.to_str().unwrap(),
+                    &format!("fail2ban-rs-{ver}-linux-amd64"),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let sha_out = Command::new("sha256sum").arg(&tar_path).output().unwrap();
+            assert!(sha_out.status.success());
+            fs::write(format!("{}.sha256", tar_path.display()), sha_out.stdout).unwrap();
+            tar_path
+        };
+
+        let tar_v1 = make_tar("1.1.2", "RUST-HELPER-V1\n");
+        let tar_v2 = make_tar("1.1.3", "RUST-HELPER-V2\n");
+        let helper_dest = dest.join("etc/fail2ban/filter.d/ignorecommands/apache-fakegooglebot");
+
+        let s1 = Command::new("bash")
+            .arg(&install_sh)
+            .arg(&tar_v1)
+            .env("DESTDIR", &dest)
+            .status()
+            .unwrap();
+        assert!(s1.success());
+        assert_eq!(
+            fs::read_to_string(&helper_dest).unwrap(),
+            "RUST-HELPER-V1\n"
+        );
+
+        // Uninstall must remove unmodified installed helper.
+        let su = Command::new("bash")
+            .arg(&install_sh)
+            .arg("--uninstall")
+            .env("DESTDIR", &dest)
+            .status()
+            .unwrap();
+        assert!(su.success());
+        assert!(
+            !helper_dest.exists(),
+            "NB4: --uninstall must remove unmodified compiled apache-fakegooglebot"
+        );
+
+        // Reinstall with v2 must install v2 helper cleanly.
+        let s2 = Command::new("bash")
+            .arg(&install_sh)
+            .arg(&tar_v2)
+            .env("DESTDIR", &dest)
+            .status()
+            .unwrap();
+        assert!(s2.success());
+        assert_eq!(
+            fs::read_to_string(&helper_dest).unwrap(),
+            "RUST-HELPER-V2\n"
+        );
+
+        // User-modified helper must be preserved across --uninstall.
+        fs::write(&helper_dest, "USER-CUSTOM-HELPER\n").unwrap();
+        let su2 = Command::new("bash")
+            .arg(&install_sh)
+            .arg("--uninstall")
+            .env("DESTDIR", &dest)
+            .status()
+            .unwrap();
+        assert!(su2.success());
+        assert_eq!(
+            fs::read_to_string(&helper_dest).unwrap(),
+            "USER-CUSTOM-HELPER\n",
+            "NB4: --uninstall must preserve user-modified apache-fakegooglebot"
+        );
     }
 }

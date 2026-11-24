@@ -32,23 +32,26 @@ fn check(args: &[String]) -> Result<bool, String> {
     let TicketId::Ip(ip) = id else {
         return Ok(false);
     };
-    let name = if timeout == 0.0 {
-        ip_to_name(&ip)
+    let verify = move || {
+        ip_to_name(&ip).is_some_and(|name| {
+            (name.ends_with(".google.com") || name.ends_with(".googlebot.com"))
+                && dns_to_ip(&name).contains(&id)
+        })
+    };
+    let matched = if timeout == 0.0 {
+        verify()
     } else {
         let limit = Duration::try_from_secs_f64(timeout.max(0.0))
             .map_err(|_| format!("Invalid timeout: {raw_timeout}"))?;
         let (send, receive) = mpsc::sync_channel(1);
         thread::Builder::new()
             .spawn(move || {
-                let _ = send.send(ip_to_name(&ip));
+                let _ = send.send(verify());
             })
             .map_err(|err| err.to_string())?;
-        receive.recv_timeout(limit).ok().flatten()
+        receive.recv_timeout(limit).unwrap_or(false)
     };
-    Ok(name.is_some_and(|name| {
-        (name.ends_with(".google.com") || name.ends_with(".googlebot.com"))
-            && dns_to_ip(&name).contains(&id)
-    }))
+    Ok(matched)
 }
 
 fn main() -> ExitCode {

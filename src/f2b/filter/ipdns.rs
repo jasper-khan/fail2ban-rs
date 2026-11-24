@@ -5,12 +5,17 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+
+use crate::action::tags::{ShellCommand, build_shell_command_from_resolver};
 use crate::config::spec;
 use crate::duration::{parse_bool, str2seconds};
 use crate::error::{Error, Result};
@@ -147,6 +152,7 @@ fn detect_system_ipv6() -> bool {
 struct CacheEntry<V> {
     val: V,
     expires_at: Instant,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -154,7 +160,8 @@ struct TtlCache<V> {
     max_count: usize,
     max_time: Duration,
     entries: HashMap<String, CacheEntry<V>>,
-    order: VecDeque<String>,
+    order: VecDeque<(String, u64)>,
+    next_gen: u64,
 }
 
 impl<V: Clone> TtlCache<V> {
@@ -169,6 +176,7 @@ impl<V: Clone> TtlCache<V> {
             max_time: Duration::from_secs_f64(secs),
             entries: HashMap::new(),
             order: VecDeque::new(),
+            next_gen: 0,
         }
     }
 
@@ -189,8 +197,15 @@ impl<V: Clone> TtlCache<V> {
         }
         let now = Instant::now();
         if self.entries.len() >= self.max_count && !self.entries.contains_key(&key) {
-            while let Some(oldest) = self.order.pop_front() {
-                if let Some(ev) = self.entries.remove(&oldest)
+            while let Some((oldest_key, oldest_gen)) = self.order.pop_front() {
+                let is_current = self
+                    .entries
+                    .get(&oldest_key)
+                    .is_some_and(|e| e.generation == oldest_gen);
+                if !is_current {
+                    continue;
+                }
+                if let Some(ev) = self.entries.remove(&oldest_key)
                     && ev.expires_at > now
                     && self.entries.len() < self.max_count
                 {
@@ -198,14 +213,26 @@ impl<V: Clone> TtlCache<V> {
                 }
             }
         }
+        self.next_gen = self.next_gen.wrapping_add(1);
+        let generation = self.next_gen;
         self.entries.insert(
             key.clone(),
             CacheEntry {
                 val,
                 expires_at: now + self.max_time,
+                generation,
             },
         );
-        self.order.push_back(key);
+        self.order.push_back((key, generation));
+        let compact_threshold = self.max_count.saturating_mul(2).max(16);
+        if self.order.len() > compact_threshold {
+            self.entries.retain(|_, e| e.expires_at > now);
+            self.order.retain(|(k, g)| {
+                self.entries
+                    .get(k)
+                    .is_some_and(|e| e.generation == *g && e.expires_at > now)
+            });
+        }
     }
 
     fn clear(&mut self) {
@@ -271,21 +298,17 @@ pub fn parse_ticket_ip_or_net(raw: &str) -> Option<TicketId> {
 }
 
 /// Construct a `TicketId` from a captured IP string and optional CIDR prefix length,
-/// matching upstream `IPAddr(ip, cidr)`.
-pub fn parse_ip_with_cidr(raw: &str, cidr: Option<u8>) -> TicketId {
+/// matching upstream `IPAddr(ip, cidr)` + `isValid` filtering.
+/// Returns `None` if `raw` is not a valid IP address or `cidr` exceeds the family maximum.
+pub fn parse_ip_with_cidr(raw: &str, cidr: Option<u8>) -> Option<TicketId> {
     let trimmed = raw.trim();
     let stripped = if trimmed.len() > 2 && trimmed.starts_with('[') && trimmed.ends_with(']') {
         &trimmed[1..trimmed.len() - 1]
     } else {
         trimmed
     };
-    if let Ok(ip) = stripped.parse::<IpAddr>() {
-        if let Some(p) = cidr {
-            return TicketId::from_ip_cidr(ip, Some(p));
-        }
-        return TicketId::Ip(canonical_ip(ip));
-    }
-    TicketId::parse(stripped)
+    let ip = stripped.parse::<IpAddr>().ok()?;
+    TicketId::try_from_ip_cidr(ip, cidr)
 }
 
 fn mask_to_prefix_len(target: IpAddr, mask: IpAddr) -> Option<u8> {
@@ -316,6 +339,9 @@ fn mask_to_prefix_len(target: IpAddr, mask: IpAddr) -> Option<u8> {
 /// respecting `UseDns` and `allow_ipv6()`.
 pub fn text_to_ip(text: &str, use_dns: UseDns) -> Vec<TicketId> {
     if let Some(id) = parse_ticket_ip_or_net(text) {
+        if !allow_ipv6() && id.is_ipv6() {
+            return Vec::new();
+        }
         return vec![id];
     }
     if use_dns == UseDns::Raw {
@@ -338,6 +364,19 @@ pub fn text_to_ip(text: &str, use_dns: UseDns) -> Vec<TicketId> {
         return resolved;
     }
     Vec::new()
+}
+
+/// Non-blocking cache probe for [`dns_to_ip`]; returns `None` on cache miss.
+pub(crate) fn dns_to_ip_cached(host: &str) -> Option<Vec<TicketId>> {
+    if host.is_empty() {
+        return Some(Vec::new());
+    }
+    let ipv6_ok = allow_ipv6();
+    let cache_key = format!("{}:{host}", if ipv6_ok { "6" } else { "4" });
+    name_to_ip_cache()
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.get(&cache_key))
 }
 
 /// Resolve a hostname to IP addresses via `ToSocketAddrs`, respecting `allow_ipv6()` and caching.
@@ -645,7 +684,7 @@ struct FileIpList {
     spec: String,
     path: PathBuf,
     entries: Vec<TicketId>,
-    last_stat: Option<(i64, u64, u64)>,
+    last_stat: Option<(i64, i64, u64, u64)>,
     next_check: Instant,
 }
 
@@ -677,7 +716,7 @@ impl FileIpList {
         self.next_check = now + Duration::from_secs(1);
         match fs::metadata(&self.path) {
             Ok(meta) => {
-                let st = (meta.mtime(), meta.ino(), meta.size());
+                let st = (meta.mtime(), meta.mtime_nsec(), meta.ino(), meta.size());
                 if self.last_stat == Some(st) {
                     return;
                 }
@@ -798,7 +837,11 @@ impl IgnoreConfig {
             parse_ticket_ip_or_net(target).unwrap_or_else(|| TicketId::Raw(target.to_owned()));
         if let Some(pos) = self.ignore_nets.iter().position(|n| n == &parsed) {
             self.ignore_nets.remove(pos);
-            if let Some(ipos) = self.ignore_ips.iter().position(|s| s == target) {
+            if let Some(ipos) = self.ignore_ips.iter().position(|s| {
+                s == target
+                    || parse_ticket_ip_or_net(s).unwrap_or_else(|| TicketId::Raw(s.clone()))
+                        == parsed
+            }) {
                 self.ignore_ips.remove(ipos);
             }
             return true;
@@ -806,18 +849,52 @@ impl IgnoreConfig {
         false
     }
 
-    /// Check whether `id` (and optional `ticket`) is ignored under `ignoreself`,
-    /// `ignoreip`, or `ignorecommand` (with `ignorecache` memoization).
-    pub fn is_ignored(&mut self, id: &TicketId, ticket: Option<&Ticket>, jail_name: &str) -> bool {
+    /// Return deduplicated hostnames in `ignoreip` / `file:` lists whose forward DNS
+    /// lookups are not currently cached, so async callers can prefetch them off-thread.
+    pub fn uncached_ignore_hosts(&mut self) -> Vec<String> {
+        let mut hosts = Vec::new();
+        let mut seen = BTreeSet::new();
+        for net in &self.ignore_nets {
+            if let TicketId::Raw(host) = net
+                && dns_to_ip_cached(host).is_none()
+                && seen.insert(host.clone())
+            {
+                hosts.push(host.clone());
+            }
+        }
+        for fl in &mut self.ignore_files {
+            fl.reload_if_needed();
+            for net in &fl.entries {
+                if let TicketId::Raw(host) = net
+                    && dns_to_ip_cached(host).is_none()
+                    && seen.insert(host.clone())
+                {
+                    hosts.push(host.clone());
+                }
+            }
+        }
+        hosts
+    }
+
+    /// Evaluate fast in-memory ignore rules (`ignorecache`, `ignoreself`, `ignoreip`, `file:`).
+    ///
+    /// When an external `ignorecommand` must run, returns [`IgnoreDecision::RunCommand`]
+    /// so async callers can drop locks before spawning the subprocess.
+    pub fn check_ignore_static(
+        &mut self,
+        id: &TicketId,
+        ticket: Option<&Ticket>,
+        jail_name: &str,
+    ) -> IgnoreDecision {
         let target_ip = ticket.map_or(id, Ticket::target_ip);
         let cache_key = self
             .ignore_cache
             .as_ref()
-            .map(|c| expand_ignore_tags(c.key_template(), id, target_ip, ticket, jail_name, false));
+            .map(|c| expand_ignore_key(c.key_template(), id, target_ip, ticket, jail_name));
         if let (Some(cache), Some(k)) = (self.ignore_cache.as_mut(), cache_key.as_ref())
             && let Some(cached) = cache.get(k)
         {
-            return cached;
+            return IgnoreDecision::Decided(cached);
         }
 
         let mut ignored = false;
@@ -861,18 +938,19 @@ impl IgnoreConfig {
             && let Some(cmd_tmpl) = self.ignore_command.as_deref()
             && !cmd_tmpl.trim().is_empty()
         {
-            let cmd = expand_ignore_tags(cmd_tmpl, id, target_ip, ticket, jail_name, true);
+            let cmd = build_ignore_shell_command(cmd_tmpl, id, target_ip, ticket, jail_name);
             if get_level() <= LogLevel::Debug {
                 log_msg(
                     LogLevel::Debug,
                     "fail2ban.filter",
-                    &format!("ignore command: {cmd}"),
+                    &format!("ignore command: {}", cmd.script),
                 );
             }
-            if run_ignore_command(&cmd) {
-                ignored = true;
-                source = "command";
-            }
+            return IgnoreDecision::RunCommand(PendingIgnoreCommand {
+                cmd,
+                cache_key,
+                target_ip: target_ip.to_string(),
+            });
         }
 
         if ignored {
@@ -887,31 +965,162 @@ impl IgnoreConfig {
             cache.set(k, ignored);
         }
 
+        IgnoreDecision::Decided(ignored)
+    }
+
+    /// Record the result of an externally executed `ignorecommand` into logs and `ignorecache`.
+    pub fn finish_ignore_command(
+        &mut self,
+        pending: PendingIgnoreCommand,
+        jail_name: &str,
+        ignored: bool,
+    ) -> bool {
+        if ignored {
+            log_msg(
+                LogLevel::Info,
+                "fail2ban.filter",
+                &format!("[{jail_name}] Ignore {} by command", pending.target_ip),
+            );
+        }
+        if let (Some(cache), Some(k)) = (self.ignore_cache.as_mut(), pending.cache_key) {
+            cache.set(k, ignored);
+        }
         ignored
+    }
+
+    /// Check whether `id` (and optional `ticket`) is ignored under `ignoreself`,
+    /// `ignoreip`, or `ignorecommand` (with `ignorecache` memoization).
+    pub fn is_ignored(&mut self, id: &TicketId, ticket: Option<&Ticket>, jail_name: &str) -> bool {
+        match self.check_ignore_static(id, ticket, jail_name) {
+            IgnoreDecision::Decided(ignored) => ignored,
+            IgnoreDecision::RunCommand(pending) => {
+                let ignored = run_ignore_command_sync(&pending.cmd);
+                self.finish_ignore_command(pending, jail_name, ignored)
+            }
+        }
     }
 }
 
-fn run_ignore_command(cmd: &str) -> bool {
-    match Command::new("sh").arg("-c").arg(cmd).status() {
-        Ok(status) => matches!(status.code(), Some(0)),
+/// Timeout applied to `ignorecommand` execution, matching Fail2Ban 1.1.1's 60s default.
+pub const IGNORE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Prepared `ignorecommand` subprocess plus cache metadata for lock-free execution.
+#[derive(Debug, Clone)]
+pub struct PendingIgnoreCommand {
+    pub cmd: ShellCommand,
+    pub cache_key: Option<String>,
+    pub target_ip: String,
+}
+
+/// Outcome of fast in-memory ignore checks before executing an external `ignorecommand`.
+#[derive(Debug, Clone)]
+pub enum IgnoreDecision {
+    Decided(bool),
+    RunCommand(PendingIgnoreCommand),
+}
+
+/// Execute `ignorecommand` asynchronously under a 60s timeout with process-group cleanup.
+///
+/// Matches Fail2Ban 1.1.1 `CommandAction.executeCmd(..., success_codes=(0, 1))`:
+/// exit 0 => ignored (`true`), exit 1 => not ignored (`false`), other/timeout => logged error + `false`.
+pub async fn run_ignore_command_async(cmd: &ShellCommand) -> bool {
+    run_ignore_command_async_with_timeout(cmd, IGNORE_COMMAND_TIMEOUT).await
+}
+
+pub(crate) async fn run_ignore_command_async_with_timeout(
+    cmd: &ShellCommand,
+    timeout: Duration,
+) -> bool {
+    match crate::action::cmd::run_shell_cmd_args(&cmd.script, &cmd.args, timeout, &[0, 1]).await {
+        Ok((true, 0)) => true,
+        Ok(_) => false,
         Err(err) => {
             log_msg(
                 LogLevel::Error,
                 "fail2ban.filter",
-                &format!("Failed to execute ignorecommand {cmd:?}: {err}"),
+                &format!("Failed to execute ignorecommand {:?}: {err}", cmd.script),
             );
             false
         }
     }
 }
 
-fn expand_ignore_tags(
+fn run_ignore_command_sync(cmd: &ShellCommand) -> bool {
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        .arg(&cmd.script)
+        .args(&cmd.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            log_msg(
+                LogLevel::Error,
+                "fail2ban.filter",
+                &format!("Failed to execute ignorecommand {:?}: {err}", cmd.script),
+            );
+            return false;
+        }
+    };
+    let deadline = Instant::now() + IGNORE_COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return matches!(status.code(), Some(0)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    if let Ok(pgid) = i32::try_from(child.id()) {
+                        let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    log_msg(
+                        LogLevel::Error,
+                        "fail2ban.filter",
+                        &format!(
+                            "ignorecommand {:?} timed out after {}s and was killed",
+                            cmd.script,
+                            IGNORE_COMMAND_TIMEOUT.as_secs()
+                        ),
+                    );
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                log_msg(
+                    LogLevel::Error,
+                    "fail2ban.filter",
+                    &format!("Failed waiting for ignorecommand {:?}: {err}", cmd.script),
+                );
+                return false;
+            }
+        }
+    }
+}
+
+fn build_ignore_shell_command(
     template: &str,
     fid: &TicketId,
     target_ip: &TicketId,
     ticket: Option<&Ticket>,
     jail_name: &str,
-    escape_shell: bool,
+) -> ShellCommand {
+    let mut cached_ip_host: Option<String> = None;
+    build_shell_command_from_resolver(template, |name| {
+        resolve_ignore_tag_raw(name, fid, target_ip, ticket, jail_name, &mut cached_ip_host)
+    })
+}
+
+fn expand_ignore_key(
+    template: &str,
+    fid: &TicketId,
+    target_ip: &TicketId,
+    ticket: Option<&Ticket>,
+    jail_name: &str,
 ) -> String {
     if !template.contains('<') {
         return template.to_owned();
@@ -932,13 +1141,12 @@ fn expand_ignore_tags(
                 let Some(name) = template.get(open + 1..index).filter(|s| !s.is_empty()) else {
                     continue;
                 };
-                if let Some(repl) = resolve_ignore_tag(
+                if let Some((repl, _)) = resolve_ignore_tag_raw(
                     name,
                     fid,
                     target_ip,
                     ticket,
                     jail_name,
-                    escape_shell,
                     &mut cached_ip_host,
                 ) {
                     if let Some(lit) = template.get(literal_start..open) {
@@ -957,61 +1165,57 @@ fn expand_ignore_tags(
     out
 }
 
-fn resolve_ignore_tag(
+fn resolve_ignore_tag_raw(
     name: &str,
     fid: &TicketId,
     target_ip: &TicketId,
     ticket: Option<&Ticket>,
     jail_name: &str,
-    escape_shell: bool,
     cached_ip_host: &mut Option<String>,
-) -> Option<String> {
-    let maybe_escape = |val: String| -> String {
-        if escape_shell {
-            escape_shell_tag(&val)
-        } else {
-            val
-        }
-    };
+) -> Option<(String, bool)> {
     match name {
-        "ip" | "IP" => Some(maybe_escape(target_ip.to_string())),
-        "fid" => Some(maybe_escape(fid.to_string())),
-        "ip-rev" => Some(target_ip.ip_rev()),
+        "ip" | "IP" => Some((target_ip.to_string(), true)),
+        "fid" => Some((fid.to_string(), true)),
+        "ip-rev" => Some((target_ip.ip_rev(), true)),
         "ip-host" => {
             if let Some(cached) = cached_ip_host.as_ref() {
-                return Some(maybe_escape(cached.clone()));
+                return Some((cached.clone(), true));
             }
             let resolved = target_ip
                 .ip()
                 .and_then(|ip| ip_to_name(&ip))
                 .unwrap_or_else(|| target_ip.to_string());
             *cached_ip_host = Some(resolved.clone());
-            Some(maybe_escape(resolved))
+            Some((resolved, true))
         }
-        "family" => Some(target_ip.family().to_owned()),
-        "name" | "jail.name" => Some(maybe_escape(jail_name.to_owned())),
-        "failures" => Some(ticket.map_or(1, |t| t.attempts).to_string()),
+        "family" => Some((target_ip.family().to_owned(), true)),
+        "name" | "jail.name" => Some((jail_name.to_owned(), true)),
+        "failures" => Some((ticket.map_or(1, |t| t.attempts).to_string(), true)),
         "matches" => {
             let joined = ticket.map(|t| t.matches.join("\n")).unwrap_or_default();
-            Some(maybe_escape(joined))
+            Some((joined, true))
         }
-        "time" => Some(ticket.map_or(0.0, |t| t.time).to_string()),
-        "subnet" => Some(match target_ip {
-            TicketId::Ip(IpAddr::V4(v4)) => format!("{v4}/32"),
-            TicketId::Ip(IpAddr::V6(v6)) => format!("{v6}/128"),
-            TicketId::Net(net) => net.to_string(),
-            TicketId::Raw(s) => maybe_escape(s.clone()),
-        }),
-        "cidr" => Some(
+        "time" => Some((ticket.map_or(0.0, |t| t.time).to_string(), true)),
+        "subnet" => Some((
+            match target_ip {
+                TicketId::Ip(IpAddr::V4(v4)) => format!("{v4}/32"),
+                TicketId::Ip(IpAddr::V6(v6)) => format!("{v6}/128"),
+                TicketId::Net(net) => net.to_string(),
+                TicketId::Raw(s) => s.clone(),
+            },
+            true,
+        )),
+        "cidr" => Some((
             target_ip
                 .prefix_len()
                 .map_or_else(String::new, |p| p.to_string()),
-        ),
-        "mask" => Some(target_ip.netmask()),
-        "fq-hostname" => Some(system_hostnames().0),
-        "sh-hostname" => Some(system_hostnames().1),
-        "br" => Some("\n".to_owned()),
-        "sp" => Some(" ".to_owned()),
+            true,
+        )),
+        "mask" => Some((target_ip.netmask(), true)),
+        "fq-hostname" => Some((system_hostnames().0, true)),
+        "sh-hostname" => Some((system_hostnames().1, true)),
+        "br" => Some(("\n".to_owned(), false)),
+        "sp" => Some((" ".to_owned(), false)),
         _ => {
             let suffix = name.strip_prefix("F-")?;
             let data = ticket.map(|t| &t.data)?;
@@ -1033,26 +1237,9 @@ fn resolve_ignore_tag(
                 })
                 .cloned()
                 .unwrap_or_default();
-            Some(maybe_escape(val))
+            Some((val, true))
         }
     }
-}
-
-fn escape_shell_tag(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\n' => out.push_str(r"\n"),
-            '\r' => out.push_str(r"\r"),
-            '\\' | '#' | '&' | ';' | '`' | '|' | '*' | '?' | '~' | '<' | '>' | '^' | '(' | ')'
-            | '[' | ']' | '{' | '}' | '$' | '\'' | '"' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 /// Team Cymru DNS TXT lookup result for `status <jail> cymru`.
@@ -1281,10 +1468,11 @@ fn query_dns_txt(
         };
         let _ = sock.set_read_timeout(Some(timeout));
         let _ = sock.set_write_timeout(Some(timeout));
-        if sock.send_to(&query, server).is_err() {
+        // Connect the ephemeral UDP socket to the target resolver so the kernel filters spoofed packets.
+        if sock.connect(server).is_err() || sock.send(&query).is_err() {
             continue;
         }
-        if let Ok((n, _)) = sock.recv_from(&mut buf) {
+        if let Ok(n) = sock.recv(&mut buf) {
             return parse_dns_txt_response(&buf[..n], txid);
         }
     }
@@ -1297,7 +1485,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn usedns_and_allow_ipv6_parsing() {
+    fn usedns_allow_ipv6_and_ip_parsing_contracts() {
         assert_eq!(UseDns::parse("yes"), UseDns::Yes);
         assert_eq!(UseDns::parse("WARN"), UseDns::Warn);
         assert_eq!(UseDns::parse("no"), UseDns::No);
@@ -1305,15 +1493,9 @@ mod tests {
         assert_eq!(UseDns::parse("bogus"), UseDns::No);
 
         let prev = allow_ipv6_mode();
-        set_allow_ipv6(AllowIpv6::No);
-        assert!(!allow_ipv6());
         set_allow_ipv6(AllowIpv6::Yes);
         assert!(allow_ipv6());
-        set_allow_ipv6(prev);
-    }
 
-    #[test]
-    fn parses_ips_subnets_netmasks_and_raw() {
         assert_eq!(
             text_to_ip("192.0.2.10", UseDns::No),
             vec![TicketId::parse("192.0.2.10")]
@@ -1335,6 +1517,60 @@ mod tests {
             vec![TicketId::Raw("alice".to_owned())]
         );
         assert!(text_to_ip("nonexistent.invalid", UseDns::No).is_empty());
+
+        // B2: invalid IPs and out-of-range CIDRs must be rejected rather than degraded to Raw.
+        assert_eq!(parse_ip_with_cidr("999.999.999.999", None), None);
+        assert_eq!(parse_ip_with_cidr(":::", None), None);
+        assert_eq!(parse_ip_with_cidr("12:34:56", None), None);
+        assert_eq!(parse_ip_with_cidr("192.0.2.1", Some(99)), None);
+        assert_eq!(parse_ip_with_cidr("2001:db8::1", Some(129)), None);
+
+        // B2: allowipv6=no must filter literal IPv6 while keeping IPv4 and IPv4-mapped IPv6.
+        set_allow_ipv6(AllowIpv6::No);
+        assert!(!allow_ipv6());
+        assert!(text_to_ip("[2001:db8::1]", UseDns::No).is_empty());
+        assert!(text_to_ip("2001:db8::/32", UseDns::No).is_empty());
+        assert_eq!(
+            text_to_ip("::ffff:192.0.2.5", UseDns::No),
+            vec![TicketId::parse("192.0.2.5")]
+        );
+
+        let mut flt = crate::filter::Filter::new("b2_v6");
+        flt.set_check_find_time(false);
+        flt.set_ignore_self(false);
+        flt.set_use_dns(UseDns::No).unwrap();
+        flt.add_fail_regex(r"fail from <HOST>$").unwrap();
+        assert!(
+            flt.process_line("May 14 08:30:15 h app: fail from 2001:db8::99", None)
+                .is_empty()
+        );
+        assert_eq!(
+            flt.process_line("May 14 08:30:16 h app: fail from ::ffff:192.0.2.5", None)
+                .len(),
+            1
+        );
+
+        set_allow_ipv6(prev);
+    }
+
+    #[test]
+    fn ttl_cache_deduplicates_order_queue_and_preserves_refreshed_entries() {
+        let mut cache = TtlCache::new(2, 60.0);
+        // Repeated refreshes of the same key must keep `order` bounded (NB3).
+        for i in 0..50u32 {
+            cache.set("hot".to_owned(), i);
+        }
+        assert!(cache.order.len() <= 16, "order len={}", cache.order.len());
+        assert_eq!(cache.get("hot"), Some(49));
+
+        // Insert a second key, refresh "hot" again, then trigger eviction with a third key:
+        // stale queue entries for "hot" must NOT evict the freshly updated "hot".
+        cache.set("cold".to_owned(), 100);
+        cache.set("hot".to_owned(), 50);
+        cache.set("new".to_owned(), 200);
+        assert_eq!(cache.get("hot"), Some(50));
+        assert_eq!(cache.get("cold"), None);
+        assert_eq!(cache.get("new"), Some(200));
     }
 
     #[test]
