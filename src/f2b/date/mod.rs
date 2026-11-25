@@ -221,7 +221,7 @@ impl DateDetector {
         for &raw in DEFAULT_TEMPLATES {
             let already_anchored = raw.starts_with("{^LN-BEG}") || raw.starts_with('^');
             if already_anchored {
-                let mut tmpl = DateTemplate::from_pattern(raw)?;
+                let mut tmpl = DateTemplate::from_default_pattern(raw)?;
                 if line_begin_only {
                     tmpl.weight = LINE_BEGIN_WEIGHT;
                     anchored.push(tmpl);
@@ -230,12 +230,12 @@ impl DateDetector {
                 }
             } else {
                 let ln_pat = format!("{{^LN-BEG}}{raw}");
-                let mut ln_tmpl = DateTemplate::from_pattern(&ln_pat)?;
+                let mut ln_tmpl = DateTemplate::from_default_pattern(&ln_pat)?;
                 ln_tmpl.weight = LINE_BEGIN_WEIGHT;
                 anchored.push(ln_tmpl);
 
                 if !line_begin_only {
-                    unanchored.push(DateTemplate::from_pattern(raw)?);
+                    unanchored.push(DateTemplate::from_default_pattern(raw)?);
                 }
             }
         }
@@ -500,5 +500,20 @@ mod tests {
         let (t_plus2, _, _) = dd.get_time(line).unwrap();
         let (t_utc, _, _) = dd_utc.get_time(line).unwrap();
         assert!((t_utc - t_plus2 - 7200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_templates_compile_lazily_and_share_regex_slots() {
+        let pat = r"^lazy-cache-probe %Y-%m-%d %H:%M:%S";
+        let t1 = DateTemplate::from_default_pattern(pat).unwrap();
+        let t2 = DateTemplate::from_default_pattern(pat).unwrap();
+        assert!(!t1.is_compiled());
+        assert!(!t2.is_compiled());
+        assert!(
+            t1.match_date("lazy-cache-probe 2024-05-14 08:30:15 ok")
+                .is_some()
+        );
+        assert!(t1.is_compiled());
+        assert!(t2.is_compiled());
     }
 }

@@ -5,7 +5,7 @@
 //! `{UNB}`, and `{^LN-BEG}` boundary wrapping.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::filter::regex::CompiledRegex;
@@ -33,6 +33,54 @@ enum TemplateKind {
     NoneSentinel,
 }
 
+type LazyCompiledRegex = Arc<OnceLock<Option<CompiledRegex>>>;
+
+#[derive(Debug, Clone)]
+enum CompiledSlot {
+    None,
+    Eager(Arc<CompiledRegex>),
+    Lazy(LazyCompiledRegex),
+}
+
+impl CompiledSlot {
+    fn get(&self, pattern: &str) -> Option<&CompiledRegex> {
+        match self {
+            Self::None => None,
+            Self::Eager(re) => Some(re),
+            Self::Lazy(slot) => slot
+                .get_or_init(|| CompiledRegex::compile(pattern, false).ok())
+                .as_ref(),
+        }
+    }
+}
+
+fn shared_lazy_slot(rx: &str) -> CompiledSlot {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, LazyCompiledRegex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let slot = match cache.lock() {
+        Ok(mut guard) => guard
+            .entry(rx.to_owned())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .entry(rx.to_owned())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone(),
+    };
+    CompiledSlot::Lazy(slot)
+}
+
+fn compile_slot(rx: &str, lazy: bool) -> Result<CompiledSlot> {
+    if lazy {
+        Ok(shared_lazy_slot(rx))
+    } else {
+        Ok(CompiledSlot::Eager(Arc::new(CompiledRegex::compile(
+            rx, false,
+        )?)))
+    }
+}
+
 /// Compiled Fail2Ban date matching template and usage counters.
 #[derive(Debug, Clone)]
 pub struct DateTemplate {
@@ -42,7 +90,7 @@ pub struct DateTemplate {
     pub pattern: Option<String>,
     /// Expanded regular expression string.
     pub regex: String,
-    compiled: Option<CompiledRegex>,
+    compiled: CompiledSlot,
     /// Bitmask of `FLAG_*` boundary flags.
     pub flags: u8,
     /// Priority weight (`100.0` for line-begin templates, `0.0` otherwise).
@@ -61,13 +109,22 @@ impl DateTemplate {
     /// `{^LN-BEG}` line-begin anchoring, `{UNB}` unbinding, `**` boundary
     /// suppression, and `%...` `strptime` directives.
     pub fn from_pattern(pattern: &str) -> Result<Self> {
+        Self::build(pattern, false)
+    }
+
+    // Built-in default templates defer regex compilation until first match and share it across jails.
+    pub(crate) fn from_default_pattern(pattern: &str) -> Result<Self> {
+        Self::build(pattern, true)
+    }
+
+    fn build(pattern: &str, lazy: bool) -> Result<Self> {
         let trimmed = pattern.trim();
         if trimmed.eq_ignore_ascii_case("{NONE}") {
             return Ok(Self {
                 name: "{NONE}".to_owned(),
                 pattern: Some(pattern.to_owned()),
                 regex: String::new(),
-                compiled: None,
+                compiled: CompiledSlot::None,
                 flags: 0,
                 weight: 0.0,
                 hits: 0,
@@ -77,17 +134,17 @@ impl DateTemplate {
         }
 
         if let Some((line_begin, long_frm)) = match_standalone_epoch(trimmed) {
-            return Self::new_epoch(pattern, line_begin, long_frm);
+            return Self::new_epoch(pattern, line_begin, long_frm, lazy);
         }
 
         if let Some(line_begin) = match_standalone_tai64n(trimmed) {
-            return Self::new_tai64n(pattern, line_begin);
+            return Self::new_tai64n(pattern, line_begin, lazy);
         }
 
-        Self::new_pattern(pattern)
+        Self::new_pattern(pattern, lazy)
     }
 
-    fn new_epoch(orig_pattern: &str, line_begin: bool, long_frm: bool) -> Result<Self> {
+    fn new_epoch(orig_pattern: &str, line_begin: bool, long_frm: bool, lazy: bool) -> Result<Self> {
         let num_re = if long_frm { LONG_EPOCH_RE } else { EPOCH_RE };
         let rx = if line_begin {
             format!(r"(?:^({num_re})|(?<=^\[)({num_re})(?=\]))(?=\b|\W|$)")
@@ -96,7 +153,7 @@ impl DateTemplate {
                 r"(?:^({num_re})|(?<=^\[)({num_re})(?=\])|(?<=\baudit\()({num_re})(?=:\d+\)))(?=\b|\W|$)"
             )
         };
-        let compiled = CompiledRegex::compile(&rx, false)?;
+        let compiled = compile_slot(&rx, lazy)?;
         let flags = if line_begin {
             FLAG_LINE_BEGIN | FLAG_WORD_END
         } else {
@@ -112,7 +169,7 @@ impl DateTemplate {
             name,
             pattern: Some(orig_pattern.to_owned()),
             regex: rx,
-            compiled: Some(compiled),
+            compiled,
             flags,
             weight: 0.0,
             hits: 0,
@@ -121,7 +178,7 @@ impl DateTemplate {
         })
     }
 
-    fn new_tai64n(orig_pattern: &str, line_begin: bool) -> Result<Self> {
+    fn new_tai64n(orig_pattern: &str, line_begin: bool, lazy: bool) -> Result<Self> {
         let (rx, flags) = if line_begin {
             (
                 format!(r"^(?:\W{{0,2}})?({TAI64N_RE})(?=\b|\W|$)"),
@@ -133,7 +190,7 @@ impl DateTemplate {
                 FLAG_WORD_BEGIN | FLAG_WORD_END,
             )
         };
-        let compiled = CompiledRegex::compile(&rx, false)?;
+        let compiled = compile_slot(&rx, lazy)?;
         let name = if line_begin {
             "{^LN-BEG}TAI64N"
         } else {
@@ -144,7 +201,7 @@ impl DateTemplate {
             name,
             pattern: Some(orig_pattern.to_owned()),
             regex: rx,
-            compiled: Some(compiled),
+            compiled,
             flags,
             weight: 0.0,
             hits: 0,
@@ -153,7 +210,7 @@ impl DateTemplate {
         })
     }
 
-    fn new_pattern(orig_pattern: &str) -> Result<Self> {
+    fn new_pattern(orig_pattern: &str, lazy: bool) -> Result<Self> {
         let mut work = orig_pattern.to_owned();
         let mut unbound = false;
         let mut line_beg_tag = false;
@@ -207,7 +264,7 @@ impl DateTemplate {
             expanded = format!("(?iu){expanded}");
         }
 
-        let compiled = CompiledRegex::compile(&expanded, false)?;
+        let compiled = compile_slot(&expanded, lazy)?;
         let kind = match embedded_epoch {
             Some(long_frm) => TemplateKind::Epoch { long_frm },
             None => TemplateKind::Pattern,
@@ -223,7 +280,7 @@ impl DateTemplate {
             name,
             pattern: Some(orig_pattern.to_owned()),
             regex: expanded,
-            compiled: Some(compiled),
+            compiled,
             flags,
             weight: 0.0,
             hits: 0,
@@ -235,6 +292,15 @@ impl DateTemplate {
     /// Return `true` if this template is the `{NONE}` sentinel.
     pub fn is_none_sentinel(&self) -> bool {
         self.kind == TemplateKind::NoneSentinel
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_compiled(&self) -> bool {
+        match &self.compiled {
+            CompiledSlot::None => false,
+            CompiledSlot::Eager(_) => true,
+            CompiledSlot::Lazy(slot) => slot.get().is_some(),
+        }
     }
 
     /// Return `true` if this template requires matching at the start of a line.
@@ -259,7 +325,7 @@ impl DateTemplate {
         start: usize,
         end: usize,
     ) -> Option<(usize, usize, BTreeMap<String, String>)> {
-        let re = self.compiled.as_ref()?;
+        let re = self.compiled.get(&self.regex)?;
         let m = re.search_range(line, start, end)?;
         let (s, e) = match self.kind {
             TemplateKind::Epoch { .. } => {

@@ -88,7 +88,8 @@ fn launch(mut client: Fail2banClient, command: &[String]) -> Result<()> {
         "Starting Fail2ban v{VERSION}"
     );
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(2));
+    builder.worker_threads(workers).enable_all();
     // shortcut: ignore stack sizes below 1 MiB for Tokio workers to prevent Rust regex stack overflows; upgrade if smaller worker stacks are required.
     if let Some(kib) = config.as_deref().and_then(initial_thread_stacksize_kib)
         && kib >= 1024

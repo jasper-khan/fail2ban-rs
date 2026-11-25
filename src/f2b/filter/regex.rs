@@ -1,6 +1,7 @@
 //! Pure-Rust port of Fail2Ban 1.1.1 `fail2ban/server/failregex.py` with
 //! dual-engine compilation (`regex::Regex` fast path + `fancy_regex::Regex` fallback).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
@@ -9,6 +10,10 @@ use super::ipdns::{IP_4_RE, IP_6_RE, UseDns};
 
 const FAILURE_ID_GROUPS: &[&str] = &["fid", "ip4", "ip6", "dns"];
 const FAILURE_ID_PRESENTS: &[&str] = &["fid", "ip4", "ip6", "dns", "mlfid"];
+// Every iteration of `(?:[0-9a-fA-F]{1,4}::?|:){1,7}` ends in `:`, so `(?<=:)` is redundant
+// and would otherwise force all `<HOST>`/`<ADDR>` regexes onto `fancy_regex`.
+const IP_6_RE_FAST: &str = r"(?:[0-9a-fA-F]{1,4}::?|:){1,7}(?:[0-9a-fA-F]{1,4}|:)";
+const REGEX_DFA_SIZE_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 enum Engine {
@@ -86,9 +91,15 @@ impl CompiledRegex {
     /// Compile a Python-flavored regex pattern using `regex::Regex` first and
     /// falling back to `fancy_regex::Regex` on lookaround/backref/conditionals.
     pub fn compile(pattern: &str, multiline: bool) -> Result<Self> {
-        let norm = normalize_python_regex(pattern);
+        let simplified = if pattern.contains(IP_6_RE) {
+            Cow::Owned(pattern.replace(IP_6_RE, IP_6_RE_FAST))
+        } else {
+            Cow::Borrowed(pattern)
+        };
+        let norm = normalize_python_regex(&simplified);
         if let Ok(re) = regex::RegexBuilder::new(&norm)
             .multi_line(multiline)
+            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
             .build()
         {
             let capture_names = re.capture_names().map(|n| n.map(str::to_owned)).collect();
@@ -106,6 +117,7 @@ impl CompiledRegex {
         let (fancy_pat, extracted_names) = strip_group_names_for_fancy(&raw_fancy);
         let re = fancy_regex::RegexBuilder::new(&fancy_pat)
             .backtrack_limit(200_000)
+            .delegate_dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
             .build()
             .map_err(|err| {
                 Error::regex(format!(
@@ -1229,5 +1241,33 @@ mod tests {
         assert!(skip_re.search(&FailRegex::tuple_lines_buf(&multi), &multi));
         assert_eq!(skip_re.matched_lines().len(), 2);
         assert_eq!(skip_re.unmatched_lines(), vec!["t2  noise line".to_owned()]);
+    }
+
+    #[test]
+    fn host_and_addr_use_fast_regex_engine_and_match_ipv6_edge_cases() {
+        let mut re = FailRegex::new(r"^from <ADDR>$", None, false, UseDns::No).unwrap();
+        assert!(matches!(re.compiled.engine, Engine::Fast(_)));
+        assert!(re.regex().contains(IP_6_RE));
+        for valid in [
+            "from ::",
+            "from ::1",
+            "from 2001:db8::",
+            "from 2001:db8::1",
+            "from fe80::",
+            "from 192.0.2.1",
+        ] {
+            let line = vec![(String::new(), String::new(), valid.to_owned())];
+            assert!(
+                re.search(&FailRegex::tuple_lines_buf(&line), &line),
+                "{valid}"
+            );
+        }
+        for invalid in ["from :", "from a:"] {
+            let line = vec![(String::new(), String::new(), invalid.to_owned())];
+            assert!(
+                !re.search(&FailRegex::tuple_lines_buf(&line), &line),
+                "{invalid}"
+            );
+        }
     }
 }
