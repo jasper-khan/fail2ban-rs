@@ -13,7 +13,7 @@ const FAILURE_ID_PRESENTS: &[&str] = &["fid", "ip4", "ip6", "dns", "mlfid"];
 // Every iteration of `(?:[0-9a-fA-F]{1,4}::?|:){1,7}` ends in `:`, so `(?<=:)` is redundant
 // and would otherwise force all `<HOST>`/`<ADDR>` regexes onto `fancy_regex`.
 const IP_6_RE_FAST: &str = r"(?:[0-9a-fA-F]{1,4}::?|:){1,7}(?:[0-9a-fA-F]{1,4}|:)";
-const REGEX_DFA_SIZE_LIMIT: usize = 256 * 1024;
+const REGEX_DFA_SIZE_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 enum Engine {
