@@ -1148,7 +1148,7 @@ fn disp_usage(is_server: bool) {
     output("    -s, --socket <FILE>     socket path");
     output("    -p, --pidfile <FILE>    pidfile path");
     output(
-        "    --pname <NAME>          name of the process (main thread) to identify instance (default fail2ban-server)",
+        "    --pname <NAME>          name of the process (main thread) to identify instance (default fail2ban-rs)",
     );
     output("    --loglevel <LEVEL>      logging level");
     output(

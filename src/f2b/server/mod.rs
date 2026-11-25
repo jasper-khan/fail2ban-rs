@@ -73,8 +73,7 @@ fn launch(mut client: Fail2banClient, command: &[String]) -> Result<()> {
         None
     };
     #[cfg(target_os = "linux")]
-    if let Ok(name) =
-        std::ffi::CString::new(client.opts.pname.as_deref().unwrap_or("fail2ban-server"))
+    if let Ok(name) = std::ffi::CString::new(client.opts.pname.as_deref().unwrap_or("fail2ban-rs"))
     {
         let _ = nix::sys::prctl::set_name(&name);
     }
