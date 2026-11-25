@@ -768,31 +768,16 @@ async fn reload_safety_action_handoff_sqlite_restore_live_eof_idle_reconfig_jour
     .await
     .unwrap();
 
-    // 4a. Explicit unban when actionunban fails matches upstream Actions.removeBannedIP:
-    //     logs the hook failure, removes 192.0.2.88, and returns count 1.
+    let unban = PickleValue::List(vec![s("set"), s("healthy"), s("unbanip"), s("192.0.2.88")]);
+    assert!(tr.dispatch(&unban).await.is_err());
     assert_eq!(
-        tr.dispatch(&PickleValue::List(vec![
-            s("set"),
-            s("healthy"),
-            s("unbanip"),
-            s("192.0.2.88")
-        ]))
-        .await
-        .unwrap(),
-        PickleValue::Int(1)
+        tr.dispatch(&PickleValue::List(vec![s("get"), s("healthy"), s("banip")]))
+            .await
+            .unwrap(),
+        PickleValue::List(vec![s("192.0.2.88")])
     );
-    let after_unban = tr
-        .dispatch(&PickleValue::List(vec![s("get"), s("healthy"), s("banip")]))
-        .await
-        .unwrap();
-    assert_eq!(
-        after_unban,
-        PickleValue::List(vec![]),
-        "explicit unban must remove ticket even when actionunban fails (matching upstream)"
-    );
-
-    // Allow unban to succeed and re-ban 192.0.2.88 for subsequent reload tests
     fs::write(&unban_flag, "ok").unwrap();
+    assert_eq!(tr.dispatch(&unban).await.unwrap(), PickleValue::Int(1));
     tr.dispatch(&PickleValue::List(vec![
         s("set"),
         s("healthy"),
@@ -1512,22 +1497,14 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
     .await
     .unwrap();
 
-    // 2a. Explicit multi-IP unban matches upstream Actions.removeBannedIP: deletes history and
-    //     removes ticket for first IP even when its hook fails, logs hook error, processes second IP,
-    //     and returns 2 when both were banned and DB deletes succeeded.
-    assert_eq!(
-        tr2.dispatch(&PickleValue::List(vec![
-            s("set"),
-            s("multi"),
-            s("unbanip"),
-            s("192.0.2.80"),
-            s("192.0.2.82"),
-        ]))
-        .await
-        .unwrap(),
-        PickleValue::Int(2),
-        "multi-IP unban must log first hook failure, process second IP, and return count 2"
-    );
+    let unban = PickleValue::List(vec![
+        s("set"),
+        s("multi"),
+        s("unbanip"),
+        s("192.0.2.80"),
+        s("192.0.2.82"),
+    ]);
+    assert!(tr2.dispatch(&unban).await.is_err());
     let recorded_unbans = fs::read_to_string(&unban_log).unwrap();
     assert!(
         recorded_unbans.contains("flaky:192.0.2.80")
@@ -1540,36 +1517,22 @@ async fn round2_action_handoff_journal_cursor_tick_priority_tail_reconfig_unban_
         tr2.dispatch(&PickleValue::List(vec![s("get"), s("multi"), s("banip")]))
             .await
             .unwrap(),
-        PickleValue::List(vec![])
+        PickleValue::List(vec![s("192.0.2.80")])
     );
     {
-        let check_db = Fail2BanDb::open(unban_db_path.to_str().unwrap(), 86_400, 10).unwrap();
-        let active = check_db
+        let db = Fail2BanDb::open(unban_db_path.to_str().unwrap(), 86_400, 10).unwrap();
+        let active = db
             .get_current_bans(Some("multi"), None, None, current_unix_seconds() as i64)
             .unwrap();
-        assert!(
-            active.is_empty(),
-            "SQLite ban rows for both IPs must be cleared on explicit per-IP unban"
-        );
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].fid.to_string(), "192.0.2.80");
     }
-
-    // 2b. Bulk `unban --all` matches upstream 1.1.1 contract: logs action failures, clears ban_manager
-    //     and SQLite history so restart will not restore the ban, and returns the unbanned count.
-    tr2.dispatch(&PickleValue::List(vec![
-        s("set"),
-        s("multi"),
-        s("banip"),
-        s("192.0.2.80"),
-    ]))
-    .await
-    .unwrap();
-    assert_eq!(
-        tr2.dispatch(&PickleValue::List(vec![s("unban"), s("--all")]))
-            .await
-            .unwrap(),
-        PickleValue::Int(1),
-        "bulk unban --all must return count even when an action fails (matching upstream)"
-    );
+    let bulk = PickleValue::List(vec![s("unban"), s("--all")]);
+    assert!(tr2.dispatch(&bulk).await.is_err());
+    fs::write(&flaky_ok, "").unwrap();
+    assert_eq!(tr2.dispatch(&bulk).await.unwrap(), PickleValue::Int(1));
+    let calls = fs::read_to_string(&unban_log).unwrap();
+    assert_eq!(calls.lines().filter(|l| *l == "ok:192.0.2.80").count(), 1);
     assert_eq!(
         tr2.dispatch(&PickleValue::List(vec![s("get"), s("multi"), s("banip")]))
             .await
@@ -2712,6 +2675,33 @@ async fn round4_installer_reload_unban_journal_and_runtime_flag_test() {
         );
     };
 
+    let partial = dir.path().join("partial");
+    fs::create_dir_all(partial.join("usr/local/lib")).unwrap();
+    let obstruction = partial.join("usr/local/lib/systemd");
+    fs::write(&obstruction, "occupied").unwrap();
+    let output = Command::new("bash")
+        .arg(&install_script)
+        .arg(&archive)
+        .env("DESTDIR", &partial)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(partial.join("usr/local/bin/fail2ban-server").exists());
+    assert!(
+        partial
+            .join("usr/local/lib/fail2ban-rs/installing")
+            .exists()
+    );
+    assert!(!partial.join("usr/local/lib/fail2ban-rs/installed").exists());
+    run_installer(&partial, "--uninstall");
+    assert!(!partial.join("usr/local/bin/fail2ban-server").exists());
+    assert!(
+        !partial
+            .join("usr/local/lib/fail2ban-rs/installing")
+            .exists()
+    );
+    assert_eq!(fs::read_to_string(obstruction).unwrap(), "occupied");
+
     let dest = dir.path().join("dest_install");
     fs::create_dir_all(dest.join("etc/fail2ban/filter.d/ignorecommands")).unwrap();
     fs::write(dest.join("etc/fail2ban/jail.local"), "USER-jail.local\n").unwrap();
@@ -3305,8 +3295,8 @@ async fn round5_subnet_unban_and_flush_recovery_test() {
             ]))
             .await
             .unwrap(),
-        PickleValue::Int(0),
-        "first IP already unbanned before lock"
+        PickleValue::Int(1),
+        "retain the first ticket until its database delete commits"
     );
     assert_eq!(
         tr_sub
@@ -3332,8 +3322,7 @@ async fn round5_subnet_unban_and_flush_recovery_test() {
         let active = check_db
             .get_current_bans(Some("subj"), None, None, current_unix_seconds() as i64)
             .unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].fid.to_string(), "192.0.2.20");
+        assert_eq!(active.len(), 2);
     }
 
     // Retry subnet unban after lock release cleanly removes 192.0.2.20 from DB, memory, and firewall.
@@ -3347,7 +3336,7 @@ async fn round5_subnet_unban_and_flush_recovery_test() {
             ]))
             .await
             .unwrap(),
-        PickleValue::Int(1)
+        PickleValue::Int(2)
     );
     assert_eq!(
         tr_sub
@@ -3362,6 +3351,7 @@ async fn round5_subnet_unban_and_flush_recovery_test() {
         PickleValue::Int(0)
     );
     let fw_after = fs::read_to_string(&sub_fw).unwrap();
+    assert_eq!(fw_after.matches("unban:192.0.2.10").count(), 1);
     assert!(
         fw_after.contains("unban:192.0.2.20"),
         "retry subnet unban must run firewall unban for remaining IP:\n{fw_after}"
@@ -3377,7 +3367,7 @@ async fn round5_subnet_unban_and_flush_recovery_test() {
 
     // 2. Flush exceptions follow upstream consistencyCheck recovery and stop-specific repair
     //    decisions before selecting individual-unban fallback.
-    // 2a. Bulk unban --all (stop=False): failed flush runs check + repair and skips individual unban.
+    // 2a. Bulk unban --all (stop=False): failed flush runs check + repair before individual unban.
     let broken_marker = dir.path().join("broken_bulk.flag");
     let bulk_log = dir.path().join("flush_bulk.log");
     let mut tr_bulk = Transmitter::default();
@@ -3484,8 +3474,8 @@ async fn round5_subnet_unban_and_flush_recovery_test() {
         "bulk flush error must run actionrepair:\n{bulk_events}"
     );
     assert!(
-        !bulk_events.contains("unban:192.0.2.190"),
-        "action with consistencyCheck must skip individual unban fallback:\n{bulk_events}"
+        bulk_events.contains("unban:192.0.2.190"),
+        "a repaired action still needs to remove the ticket after a failed flush:\n{bulk_events}"
     );
     assert!(
         !broken_marker.exists(),
@@ -3734,9 +3724,9 @@ async fn round6_unban_cidr_and_stop_reload_test() {
             locked_res.is_err(),
             "unban --all must fail when SQLite is write-locked: {locked_res:?}"
         );
-        assert!(
-            !unban_log.exists(),
-            "per-IP actionunban must not run when DB delete fails under lock"
+        assert_eq!(
+            fs::read_to_string(&unban_log).unwrap().trim(),
+            "192.0.2.211"
         );
         let still_banned = tr
             .dispatch(&PickleValue::List(vec![s("get"), s("ufwj"), s("banip")]))

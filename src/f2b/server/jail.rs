@@ -242,6 +242,8 @@ impl JailActions {
 
 /// Synchronous per-jail Fail2Ban state machine (never held across async I/O).
 pub struct JailState {
+    pending_unbans: BTreeMap<TicketId, PendingUnban>,
+    dirty_bans: BTreeMap<TicketId, Ticket>,
     pub name: String,
     pub backend_spec: String,
     pub real_backend: BackendKind,
@@ -273,6 +275,19 @@ pub struct JailState {
     reloading: bool,
     reload_logs: Option<BTreeSet<PathBuf>>,
     reload_snapshot: Option<ReloadSnapshot>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnbanReason {
+    Explicit,
+    Automatic,
+    Stop,
+}
+
+#[derive(Default)]
+struct PendingUnban {
+    forget_history: bool,
+    completed: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for JailState {
@@ -330,6 +345,8 @@ impl JailState {
             filter,
             fail_manager: FailManager::new(),
             ban_manager: BanManager::new(),
+            pending_unbans: BTreeMap::new(),
+            dirty_bans: BTreeMap::new(),
             ban_extra: BanTimeExtra::new(),
             log_paths: Vec::new(),
             journal_matches: Vec::new(),
@@ -636,19 +653,7 @@ impl JailState {
 
     /// Synchronous state step for the 1-second maintenance tick: expire bans, clean stale failures,
     /// flush batched checkpoints, and report whether periodic action consistency checks are due.
-    fn prepare_periodic_tick(
-        &mut self,
-        now: f64,
-    ) -> (String, Vec<(TicketId, ActionContext)>, bool) {
-        let expired = self.ban_manager.unban(now);
-        let expired_ctxs = expired
-            .into_iter()
-            .map(|ticket| {
-                // Keep expired entries in SQLite `bips` (cleaned by `purge`) so `bantime.increment` sees prior bans.
-                let ctx = self.build_action_context(&ticket, false);
-                (ticket.fid, ctx)
-            })
-            .collect();
+    fn prepare_periodic_tick(&mut self, now: f64) -> (String, Vec<TicketId>, bool) {
         self.fail_manager.cleanup(now);
         self.flush_file_checkpoints_to_db();
 
@@ -662,7 +667,13 @@ impl JailState {
         } else {
             false
         };
-        (self.name.clone(), expired_ctxs, due_check)
+        let mut due = self.ban_manager.expired_ids(now);
+        due.retain(|id| !self.pending_unbans.contains_key(id));
+        if due_check {
+            due.extend(self.pending_unbans.keys().cloned());
+            self.retry_ban_writes();
+        }
+        (self.name.clone(), due, due_check)
     }
 
     /// Synchronous state transition for banning a ticket; returns the action work to run unlocked.
@@ -770,30 +781,14 @@ impl JailState {
             .into_iter()
             .filter_map(|id| self.ban_manager.get_ticket_by_id(&id))
             .chain(self.ban_manager.pending_tickets())
-            .filter(|ticket| skip_fid != Some(&ticket.fid))
+            .filter(|ticket| {
+                skip_fid != Some(&ticket.fid) && !self.pending_unbans.contains_key(&ticket.fid)
+            })
             .map(|t| {
                 let ctx = self.build_action_context(t, false);
                 (t.fid.clone(), ctx)
             })
             .collect()
-    }
-
-    fn drain_for_flush(
-        &mut self,
-        clear_db: bool,
-    ) -> Result<(String, Vec<(TicketId, ActionContext)>)> {
-        if clear_db {
-            self.db_del_ban(None)?;
-        }
-        let tickets = self.ban_manager.flush_ban_list();
-        let ctxs = tickets
-            .into_iter()
-            .map(|t| {
-                let ctx = self.build_action_context(&t, false);
-                (t.fid, ctx)
-            })
-            .collect();
-        Ok((self.name.clone(), ctxs))
     }
 
     fn record_attempt_failure(
@@ -1240,18 +1235,47 @@ impl JailState {
         self.journal_dirty = false;
     }
 
-    fn db_add_ban(&self, ticket: &Ticket) {
-        if let Some(ref db_arc) = self.db
-            && let Ok(guard) = db_arc.lock()
-            && let Err(err) = guard.add_ban(&self.name, ticket, self.ban_manager.ban_time())
-        {
+    fn write_ban(&self, ticket: &Ticket) -> Result<()> {
+        if let Some(db) = &self.db {
+            db.lock()
+                .map_err(|_| Error::database("database lock poisoned"))?
+                .add_ban(&self.name, ticket, self.ban_manager.ban_time())?;
+        }
+        Ok(())
+    }
+
+    fn db_add_ban(&mut self, ticket: &Ticket) {
+        if let Err(err) = self.write_ban(ticket) {
             f2b_log!(
                 LogLevel::Error,
                 "fail2ban.jail",
-                "Failed to persist ban for '{}' ({}): {err}",
+                "Failed to persist ban for '{}' ({}), will retry: {err}",
                 self.name,
                 ticket.fid
             );
+            let mut pending = ticket.clone();
+            pending.ban_time = Some(ticket.effective_ban_time(self.ban_manager.ban_time()));
+            self.dirty_bans.insert(ticket.fid.clone(), pending);
+        } else {
+            self.dirty_bans.remove(&ticket.fid);
+        }
+    }
+
+    fn retry_ban_writes(&mut self) {
+        // A locked/full database affects the whole batch. Wait until the next tick
+        // after one failed write instead of waiting out the busy timeout for every IP.
+        while let Some(entry) = self.dirty_bans.first_key_value() {
+            if let Err(err) = self.write_ban(entry.1) {
+                f2b_log!(
+                    LogLevel::Error,
+                    "fail2ban.jail",
+                    "Ban persistence still pending for '{}' ({}): {err}",
+                    self.name,
+                    entry.0
+                );
+                break;
+            }
+            self.dirty_bans.pop_first();
         }
     }
 
@@ -1357,10 +1381,11 @@ async fn flush_actions_or_check(
                         if !continue_on_error {
                             break;
                         }
-                        skip_unban.insert(act_name.clone());
                         continue;
                     }
-                    skip_unban.insert(act_name.clone());
+                    if on_stop && !continue_on_error {
+                        skip_unban.insert(act_name.clone());
+                    }
                 }
             }
         }
@@ -1568,6 +1593,13 @@ impl Jail {
         now: f64,
     ) -> Result<()> {
         let mut st = self.state.lock().await;
+        if st.pending_unbans.contains_key(&ticket.fid) {
+            let id = ticket.fid.clone();
+            drop(st);
+            self.unban_one_locked(acts, &id, UnbanReason::Automatic)
+                .await?;
+            st = self.state.lock().await;
+        }
         let (prepared, actions) =
             if let Some((stored, pending)) = st.ban_manager.pending_ban(&ticket.fid) {
                 let actions = pending.clone();
@@ -1577,11 +1609,9 @@ impl Jail {
                     .is_some_and(|end| end < now)
                 {
                     // Expire the old actions before accepting a fresh ban for this ID.
-                    st.ban_manager.remove_by_id(&stored.fid);
-                    let ctx = st.build_action_context(&stored, false);
-                    let name = st.name.clone();
                     drop(st);
-                    Self::unban_ticket_actions_locked(acts, &name, &stored.fid, &ctx, false).await;
+                    self.unban_one_locked(acts, &stored.fid, UnbanReason::Automatic)
+                        .await?;
                     st = self.state.lock().await;
                     (st.prepare_ban_ticket(ticket, now), None)
                 } else {
@@ -1807,72 +1837,130 @@ impl Jail {
         }
     }
 
-    async fn unban_ticket_actions_locked(
+    // Keep the ticket and its durable record until every required action succeeds.
+    // Remember successful actions: deleting an nftables element a second time can fail.
+    async fn unban_one_locked(
+        &self,
         acts: &mut JailActions,
-        jail_name: &str,
-        fid: &TicketId,
-        ctx: &ActionContext,
-        log_notice: bool,
-    ) {
-        if log_notice {
-            f2b_log!(
-                LogLevel::Notice,
-                "fail2ban.actions",
-                "[{jail_name}] Unban {fid}"
-            );
-        }
-        for (act_name, act) in &mut acts.entries {
-            if let Err(err) = act.unban(ctx).await {
-                f2b_log!(
-                    LogLevel::Error,
-                    "fail2ban.actions",
-                    "Failed to execute unban jail '{jail_name}' action '{act_name}' for {fid}: {err}"
-                );
+        id: &TicketId,
+        reason: UnbanReason,
+    ) -> Result<()> {
+        let (ctx, jail_name, completed, forget_history) = {
+            let mut st = self.state.lock().await;
+            let Some(ticket) = st.ban_manager.get_ticket_by_id(id) else {
+                return Ok(());
+            };
+            let ctx = st.build_action_context(ticket, false);
+            let jail_name = st.name.clone();
+            let pending = st.pending_unbans.entry(id.clone()).or_default();
+            pending.forget_history |= reason == UnbanReason::Explicit;
+            (
+                ctx,
+                jail_name,
+                pending.completed.clone(),
+                pending.forget_history,
+            )
+        };
+        let mut failure = None;
+        for (name, act) in &mut acts.entries {
+            if completed.contains(name) {
+                continue;
+            }
+            match act.unban(&ctx).await {
+                Ok(()) => {
+                    let mut st = self.state.lock().await;
+                    st.pending_unbans
+                        .entry(id.clone())
+                        .or_default()
+                        .completed
+                        .insert(name.clone());
+                }
+                Err(err) => {
+                    f2b_log!(
+                        LogLevel::Error,
+                        "fail2ban.actions",
+                        "[{jail_name}] Unban {id} failed for action '{name}', will retry: {err}"
+                    );
+                    failure.get_or_insert(err);
+                }
             }
         }
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        let mut st = self.state.lock().await;
+        if forget_history {
+            st.db_del_ban(Some(id))?;
+            st.dirty_bans.remove(id);
+        }
+        st.pending_unbans.remove(id);
+        st.ban_manager.remove_by_id_deferred(id);
+        let operation = if reason == UnbanReason::Stop && !forget_history {
+            "Repeal Ban"
+        } else {
+            "Unban"
+        };
+        f2b_log!(
+            LogLevel::Notice,
+            "fail2ban.actions",
+            "[{jail_name}] {operation} {id}"
+        );
+        Ok(())
     }
 
     async fn flush_bans_locked(
         &self,
         acts: &mut JailActions,
         jail_name: &str,
-        clear_db: bool,
         on_stop: bool,
     ) -> Result<usize> {
+        let clear_db = !on_stop;
+        let reason = if on_stop {
+            UnbanReason::Stop
+        } else {
+            UnbanReason::Explicit
+        };
         let pass = flush_actions_or_check(jail_name, &mut acts.entries, on_stop, on_stop).await;
+        let ids = {
+            let mut st = self.state.lock().await;
+            let ids = st.ban_manager.ordered_ids(|_| true);
+            if clear_db || !pass.skip_unban.is_empty() {
+                // A flush applies to the entire jail, even if a later SQLite delete fails.
+                for id in &ids {
+                    let pending = st.pending_unbans.entry(id.clone()).or_default();
+                    pending.forget_history |= clear_db;
+                    pending.completed.extend(pass.skip_unban.iter().cloned());
+                }
+            }
+            ids
+        };
         if !on_stop && let Some(err) = pass.first_error {
             return Err(err);
         }
-        // Match upstream Actions.__flushBan: clear jail database history after flush/check
-        // and before draining in-memory tickets or running per-ticket unbans so retries recover.
-        let (_, ctxs) = self.state.lock().await.drain_for_flush(clear_db)?;
         for (act_name, act) in &acts.entries {
             acts.action_ban_epochs
                 .insert(act_name.clone(), act.ban_epoch());
         }
-        let log_prefix = if on_stop { "Repeal Ban" } else { "Unban" };
-        let mut unbanned = 0usize;
-        for (fid, ctx) in ctxs {
-            f2b_log!(
-                LogLevel::Notice,
-                "fail2ban.actions",
-                "[{jail_name}] {log_prefix} {fid}"
-            );
-            for (act_name, act) in &mut acts.entries {
-                if pass.skip_unban.contains(act_name) {
-                    continue;
-                }
-                if let Err(err) = act.unban(&ctx).await {
-                    f2b_log!(
-                        LogLevel::Error,
-                        "fail2ban.actions",
-                        "Failed to execute unban jail '{jail_name}' action '{act_name}' for {fid}: {err}"
-                    );
+        let mut failure = None;
+        for id in &ids {
+            if let Err(err) = self.unban_one_locked(acts, id, reason).await {
+                let db_failed = matches!(err, Error::Database(_));
+                failure.get_or_insert(err);
+                if db_failed && !on_stop {
+                    break;
                 }
             }
-            unbanned += 1;
         }
-        Ok(unbanned)
+        let mut st = self.state.lock().await;
+        st.ban_manager.recompute_next_unban();
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        if clear_db {
+            st.db_del_ban(None)?;
+            st.dirty_bans.clear();
+        }
+        Ok(ids.len())
     }
 
     /// Manually ban one or more IPs/CIDRs/IDs (`set <jail> banip ...`).
@@ -1899,93 +1987,49 @@ impl Jail {
         match ips {
             None => {
                 let jail_name = self.state.lock().await.name.clone();
-                self.flush_bans_locked(&mut acts, &jail_name, true, false)
-                    .await
+                self.flush_bans_locked(&mut acts, &jail_name, false).await
             }
             Some(targets) => {
-                let jail_name = self.state.lock().await.name.clone();
                 let mut cnt = 0usize;
                 let mut missed = Vec::new();
-                let mut db_err = None;
-                let mut touched_bm = false;
-
-                enum UnbanStep {
-                    Exact(TicketId, Box<ActionContext>),
-                    Matched(Vec<TicketId>),
-                    Missed,
-                }
-
+                let mut failure = None;
                 'targets: for raw in targets {
                     let target = TicketId::parse(raw);
-                    let step = {
+                    let ids = {
                         let mut st = self.state.lock().await;
-                        // Always delete ip from database (also if currently not banned), propagating DB errors.
-                        if let Err(err) = st.db_del_ban(Some(&target)) {
-                            db_err = Some(err);
-                            break 'targets;
-                        }
-                        if let Some(ticket) = st.ban_manager.remove_by_id_deferred(&target) {
-                            touched_bm = true;
-                            let ctx = st.build_action_context(&ticket, false);
-                            UnbanStep::Exact(ticket.fid, Box::new(ctx))
+                        if st.ban_manager.get_ticket_by_id(&target).is_some() {
+                            vec![target]
                         } else {
-                            let matched = st.ban_manager.matching_ids(&target);
-                            if !matched.is_empty() {
-                                UnbanStep::Matched(matched)
-                            } else {
-                                UnbanStep::Missed
+                            // A target may have expired history but no active ticket.
+                            if let Err(err) = st.db_del_ban(Some(&target)) {
+                                failure = Some(err);
+                                break;
                             }
+                            st.dirty_bans.remove(&target);
+                            st.ban_manager.matching_ids(&target)
                         }
                     };
-
-                    match step {
-                        UnbanStep::Exact(fid, ctx) => {
-                            Self::unban_ticket_actions_locked(
-                                &mut acts, &jail_name, &fid, &ctx, true,
-                            )
-                            .await;
-                            cnt += 1;
-                        }
-                        UnbanStep::Matched(matched) => {
-                            for id in matched {
-                                let removed = {
-                                    let mut st = self.state.lock().await;
-                                    if let Err(err) = st.db_del_ban(Some(&id)) {
-                                        db_err = Some(err);
-                                        break 'targets;
-                                    }
-                                    st.ban_manager.remove_by_id_deferred(&id).map(|ticket| {
-                                        touched_bm = true;
-                                        let ctx = st.build_action_context(&ticket, false);
-                                        (ticket.fid, ctx)
-                                    })
-                                };
-                                if let Some((fid, ctx)) = removed {
-                                    Self::unban_ticket_actions_locked(
-                                        &mut acts, &jail_name, &fid, &ctx, true,
-                                    )
-                                    .await;
-                                    cnt += 1;
+                    if ids.is_empty() && !ifexists {
+                        missed.push(raw.clone());
+                    }
+                    for id in ids {
+                        match self
+                            .unban_one_locked(&mut acts, &id, UnbanReason::Explicit)
+                            .await
+                        {
+                            Ok(()) => cnt += 1,
+                            Err(err) => {
+                                let db_failed = matches!(err, Error::Database(_));
+                                failure.get_or_insert(err);
+                                if db_failed {
+                                    break 'targets;
                                 }
-                            }
-                        }
-                        UnbanStep::Missed => {
-                            f2b_log!(
-                                LogLevel::Notice,
-                                "fail2ban.actions",
-                                "{target} is not banned"
-                            );
-                            if !ifexists {
-                                missed.push(raw.clone());
                             }
                         }
                     }
                 }
-
-                if touched_bm {
-                    self.state.lock().await.ban_manager.recompute_next_unban();
-                }
-                if let Some(err) = db_err {
+                self.state.lock().await.ban_manager.recompute_next_unban();
+                if let Some(err) = failure {
                     return Err(err);
                 }
                 if !missed.is_empty() {
@@ -2044,15 +2088,26 @@ impl Jail {
     /// and periodically check action consistency without holding `state` across action I/O.
     pub async fn periodic_tick(&self, now: f64) {
         let mut acts = self.actions.lock().await;
-        let (jail_name, expired_ctxs, due_check) =
-            self.state.lock().await.prepare_periodic_tick(now);
-        for (fid, ctx) in expired_ctxs {
-            Self::unban_ticket_actions_locked(&mut acts, &jail_name, &fid, &ctx, true).await;
+        let (jail_name, expired, due_check) = self.state.lock().await.prepare_periodic_tick(now);
+        if !expired.is_empty() {
+            for id in expired {
+                if let Err(Error::Database(_)) = self
+                    .unban_one_locked(&mut acts, &id, UnbanReason::Automatic)
+                    .await
+                {
+                    break;
+                }
+            }
+            self.state.lock().await.ban_manager.recompute_next_unban();
         }
         if due_check {
             let pending: Vec<_> = {
                 let st = self.state.lock().await;
-                st.ban_manager.pending_tickets().cloned().collect()
+                st.ban_manager
+                    .pending_tickets()
+                    .filter(|t| !st.pending_unbans.contains_key(&t.fid))
+                    .cloned()
+                    .collect()
             };
             for ticket in pending {
                 let _ = self.ban_ticket_locked(&mut acts, ticket, now).await;
@@ -2346,15 +2401,13 @@ impl Jail {
             let mut st = self.state.lock().await;
             st.flush_file_checkpoints_to_db();
             st.flush_journal_pos_to_db(current_unix_seconds());
+            st.retry_ban_writes();
             let should_flush = st.alive
                 || !st.ban_manager.get_ban_list(false).is_empty()
                 || !acts.entries.is_empty();
             (st.name.clone(), should_flush)
         };
-        if should_flush
-            && let Err(err) = self
-                .flush_bans_locked(&mut acts, &jail_name, false, true)
-                .await
+        if should_flush && let Err(err) = self.flush_bans_locked(&mut acts, &jail_name, true).await
         {
             f2b_log!(
                 LogLevel::Error,
@@ -2469,6 +2522,29 @@ impl Jail {
             return Err(err);
         }
 
+        let pending: Vec<_> = self
+            .state
+            .lock()
+            .await
+            .pending_unbans
+            .keys()
+            .cloned()
+            .collect();
+        for id in &pending {
+            if let Err(err) = self
+                .unban_one_locked(&mut acts, id, UnbanReason::Automatic)
+                .await
+            {
+                acts.reload_abort();
+                let idle = self.state.lock().await.reload_abort_state();
+                drop(acts);
+                self.sync_idle_signal(idle).await;
+                return Err(err);
+            }
+        }
+        if !pending.is_empty() {
+            self.state.lock().await.ban_manager.recompute_next_unban();
+        }
         if let Some(reload_acts) = acts.reload_actions.take() {
             for (act_name, options) in &reload_acts {
                 if let Some(act) = acts.get_mut(act_name)
@@ -2844,6 +2920,71 @@ mod tests {
         drop(guard);
         tick.await;
         assert!(!jail.state.lock().await.ban_manager.in_ban_list(&id));
+    }
+
+    #[tokio::test]
+    async fn retries_failed_ban_writes_with_original_deadline_and_skips_unbanned_ips() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("bans.sqlite");
+        let db = Arc::new(std::sync::Mutex::new(
+            Fail2BanDb::open(file.to_str().unwrap(), 86400, 10).unwrap(),
+        ));
+        let jail = Jail::new("test", "polling", Some(db)).unwrap();
+        let control = rusqlite::Connection::open(file).unwrap();
+        control.execute_batch("CREATE TRIGGER offline BEFORE INSERT ON bips BEGIN SELECT RAISE(FAIL, 'offline'); END;").unwrap();
+        let ips = ["192.0.2.6".to_owned(), "192.0.2.7".to_owned()];
+        jail.ban_ip(&ips).await.unwrap();
+        jail.unban_ip(Some(&ips[1..]), false).await.unwrap();
+        let (start, duration) = {
+            let mut st = jail.state.lock().await;
+            let t = st
+                .ban_manager
+                .get_ticket_by_id(&TicketId::parse(&ips[0]))
+                .unwrap();
+            let original = (
+                t.time.round_ties_even() as i64,
+                t.effective_ban_time(st.ban_manager.ban_time()),
+            );
+            st.ban_manager.set_ban_time(12345);
+            original
+        };
+        control.execute_batch("DROP TRIGGER offline").unwrap();
+        jail.periodic_tick(current_unix_seconds()).await;
+        jail.periodic_tick(current_unix_seconds() + PERIODIC_CHECK_INTERVAL_SECS + 1.0)
+            .await;
+        let row: (String, i64, i64, i64) = control
+            .query_row(
+                "SELECT ip, timeofban, bantime, (SELECT count(*) FROM bans) FROM bips",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (ips[0].clone(), start, duration, 1));
+    }
+
+    #[tokio::test]
+    async fn expiry_retries_failed_unban_after_action_recovers() {
+        let dir = TempDir::new().unwrap();
+        let ready = dir.path().join("ready");
+        let jail = Jail::new("test", "polling", None).unwrap();
+        jail.add_action("fw", None, None).await.unwrap();
+        jail.actions
+            .lock()
+            .await
+            .get_mut("fw")
+            .unwrap()
+            .set_property("actionunban", &format!("test -f '{}'", ready.display()))
+            .await
+            .unwrap();
+        let ips = ["192.0.2.6".to_owned()];
+        jail.ban_ip(&ips).await.unwrap();
+        let now = current_unix_seconds() + 1000.0;
+        jail.periodic_tick(now).await;
+        assert_eq!(jail.state.lock().await.ban_manager.size(), 1);
+        std::fs::write(ready, "").unwrap();
+        jail.periodic_tick(now + PERIODIC_CHECK_INTERVAL_SECS + 1.0)
+            .await;
+        assert_eq!(jail.state.lock().await.ban_manager.size(), 0);
     }
 
     #[tokio::test]

@@ -795,10 +795,16 @@ impl DispatchPlan {
             }
             Self::Unban { ips, jails } => {
                 let mut count = 0;
+                let mut failure = None;
                 for jail in jails {
-                    count += jail.unban_ip(ips.as_deref(), true).await?;
+                    match jail.unban_ip(ips.as_deref(), true).await {
+                        Ok(n) => count += n,
+                        Err(err) => {
+                            failure.get_or_insert(err);
+                        }
+                    }
                 }
-                Ok(integer(count))
+                failure.map_or_else(|| Ok(integer(count)), Err)
             }
             Self::JailGet { jail, key, args } => execute_jail_get(&jail, &key, &args).await,
             Self::JailSet {

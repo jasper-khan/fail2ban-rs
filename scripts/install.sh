@@ -11,6 +11,7 @@ man="$root/usr/local/share/man"
 state_dir="$root/usr/local/lib/fail2ban-rs"
 install_marker="$state_dir/installed"
 helper_sha_file="$state_dir/apache-fakegooglebot.sha256"
+installing="$state_dir/installing"
 stock_fakegooglebot_sha="0069a4f1828849673a23841e5b796bfd88e2fcdf1f4f5854f9723e7f3989f9da"
 
 case "${1:-}" in
@@ -44,7 +45,7 @@ can_upgrade_fakegooglebot() {
 }
 
 if [[ "${1:-}" == --uninstall ]]; then
-    if [[ ! -f "$install_marker" && ! -f "$state_dir/python.zip" ]]; then
+    if [[ ! -f "$install_marker" && ! -f "$installing" && ! -f "$state_dir/python.zip" ]]; then
         exit 0
     fi
     if [[ -z "$root" ]] && {
@@ -69,6 +70,7 @@ if [[ "${1:-}" == --uninstall ]]; then
         "$state_dir/python.zip" \
         "$helper_sha_file" \
         "$install_marker" \
+        "$installing" \
         "$man/man1/fail2ban.1" \
         "$man/man1/fail2ban-server.1" \
         "$man/man1/fail2ban-client.1" \
@@ -130,7 +132,16 @@ install_member() {
     tar -xOzf "$archive" "$name/$1" > "$work/member"
     install -D -m "$2" "$work/member" "$3"
 }
-printf '%s\n' "$name" > "$install_marker"
+if [[ ! -f "$install_marker" && ! -f "$installing" && ! -f "$state_dir/python.zip" ]]; then
+    for path in "$bin"/fail2ban-{server,client,regex} "$units"/fail2ban.{service,socket} \
+        "$man"/man1/{fail2ban,fail2ban-server,fail2ban-client,fail2ban-regex}.1 \
+        "$man/man5/jail.conf.5" "$helper_sha_file"; do
+        [[ ! -e "$path" && ! -L "$path" ]] || die "Unmanaged installation file already exists: $path"
+    done
+fi
+# An interrupted upgrade must never advertise either version as complete.
+printf '%s\n' "$name" > "$installing"
+rm -f -- "$install_marker"
 for binary in fail2ban-server fail2ban-client fail2ban-regex; do
     install_member "bin/$binary" 0755 "$bin/$binary"
 done
@@ -169,5 +180,8 @@ done < "$work/members"
 
 if [[ -z "$root" ]]; then
     systemctl daemon-reload
+fi
+mv -fT -- "$installing" "$install_marker"
+if [[ -z "$root" ]]; then
     echo 'Start Fail2Ban with systemctl enable --now fail2ban.service.'
 fi

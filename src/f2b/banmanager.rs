@@ -255,32 +255,37 @@ impl BanManager {
 
     /// Remove and return all expired tickets (`now > end_of_ban`) in insertion order.
     pub fn unban(&mut self, now: f64) -> Vec<Ticket> {
-        if self.next_unban_time >= now {
-            return Vec::new();
-        }
-        let mut due: Vec<(u64, TicketId)> = self
-            .ban_list
-            .iter()
-            .filter_map(|(id, entry)| {
-                let eob = entry.ticket.end_of_ban(self.ban_time)?;
-                if now > eob {
-                    Some((entry.insertion, id.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let due = self.expired_ids(now);
         if due.is_empty() {
-            self.recompute_next_unban();
             return Vec::new();
         }
-        due.sort_unstable_by_key(|(seq, _)| *seq);
         let removed: Vec<Ticket> = due
             .into_iter()
-            .filter_map(|(_, id)| self.remove_by_id_deferred(&id))
+            .filter_map(|id| self.remove_by_id_deferred(&id))
             .collect();
         self.recompute_next_unban();
         removed
+    }
+
+    pub(crate) fn expired_ids(&self, now: f64) -> Vec<TicketId> {
+        if self.next_unban_time >= now {
+            return Vec::new();
+        }
+        self.ordered_ids(|ticket| {
+            ticket
+                .end_of_ban(self.ban_time)
+                .is_some_and(|end| now > end)
+        })
+    }
+
+    pub(crate) fn ordered_ids(&self, include: impl Fn(&Ticket) -> bool) -> Vec<TicketId> {
+        let mut matches: Vec<_> = self
+            .ban_list
+            .values()
+            .filter(|e| include(&e.ticket))
+            .collect();
+        matches.sort_unstable_by_key(|e| e.insertion);
+        matches.into_iter().map(|e| e.ticket.fid.clone()).collect()
     }
 
     /// Remove and return all active ban tickets in insertion order.
@@ -309,19 +314,7 @@ impl BanManager {
     /// Return all active ban IDs equal to or contained in `target` (supports CIDR/subnet)
     /// in insertion order without removing them.
     pub fn matching_ids(&self, target: &TicketId) -> Vec<TicketId> {
-        let mut matches: Vec<(u64, TicketId)> = self
-            .ban_list
-            .iter()
-            .filter_map(|(id, entry)| {
-                if id.is_in_net(target) {
-                    Some((entry.insertion, id.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        matches.sort_unstable_by_key(|(seq, _)| *seq);
-        matches.into_iter().map(|(_, id)| id).collect()
+        self.ordered_ids(|ticket| ticket.fid.is_in_net(target))
     }
 
     /// Recompute the earliest expiration timestamp across all active bans.
