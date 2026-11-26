@@ -177,10 +177,12 @@ impl FilterPoll {
         self.discover_changed_paths();
         let mut events = Vec::new();
         while let Some(path) = self.pop_dirty() {
-            let has_more = self.collect_path_batch(&path, &mut events);
+            let mut batch = Vec::new();
+            let has_more = self.collect_path_batch(&path, &mut batch);
             if has_more {
                 self.enqueue_dirty(path);
             }
+            events.extend(batch);
         }
         events
     }
@@ -188,21 +190,23 @@ impl FilterPoll {
     /// Run the asynchronous polling loop until `shutdown` signals `true` or `tx` closes.
     ///
     /// Drains each changed file in bounded batches, awaiting channel capacity between batches
-    /// before sleeping for `poll_interval`.
+    /// while continuing to discover changes on other monitored paths on `poll_interval`.
     pub async fn run(
         mut self,
         tx: mpsc::Sender<LogEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
+        let mut next_poll = tokio::time::Instant::now();
         loop {
             if *shutdown.borrow() {
                 break;
             }
-            self.discover_changed_paths();
-            while let Some(path) = self.pop_dirty() {
-                if *shutdown.borrow() {
-                    return Ok(());
-                }
+            let now = tokio::time::Instant::now();
+            if now >= next_poll {
+                self.discover_changed_paths();
+                next_poll = now + self.poll_interval;
+            }
+            if let Some(path) = self.pop_dirty() {
                 let mut batch = Vec::new();
                 let has_more = self.collect_path_batch(&path, &mut batch);
                 if has_more {
@@ -211,6 +215,7 @@ impl FilterPoll {
                 if !batch.is_empty() && !send_events(&tx, &mut shutdown, batch).await {
                     return Ok(());
                 }
+                continue;
             }
             tokio::select! {
                 res = shutdown.changed() => {
@@ -218,7 +223,7 @@ impl FilterPoll {
                         break;
                     }
                 }
-                () = tokio::time::sleep(self.poll_interval) => {}
+                () = tokio::time::sleep_until(next_poll) => {}
             }
         }
         Ok(())
@@ -547,5 +552,195 @@ mod tests {
         assert_eq!(remainder, expected[stop_after..]);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn polling_poll_once_handles_more_than_max_batch_lines_without_hanging() {
+        let path = unique_temp_path("sync_over_512");
+        let total_lines = 1_200usize;
+        let expected: Vec<String> = (0..total_lines)
+            .map(|i| format!("sync-line-{i:04}-{}", "y".repeat(96)))
+            .collect();
+        let mut payload = String::new();
+        for line in &expected {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+        fs::write(&path, payload.as_bytes()).unwrap();
+
+        let mut poller = FilterPoll::new(
+            vec![FileLogConfig {
+                path: path.clone(),
+                tail: false,
+                resume_fingerprint: None,
+                resume_offset: 0,
+                auto_seek: None,
+            }],
+            LogEncoding::Utf8,
+        );
+
+        let evs = poller.poll_once();
+        let lines: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                LogEvent::Line { line, .. } => Some(line.clone()),
+                LogEvent::Checkpoint { .. } => None,
+            })
+            .collect();
+        let checkpoints = evs
+            .iter()
+            .filter(|e| matches!(e, LogEvent::Checkpoint { .. }))
+            .count();
+        assert_eq!(lines, expected);
+        assert_eq!(checkpoints, 1);
+
+        // Append another >512 lines and verify a second synchronous poll_once returns cleanly.
+        let extra_expected: Vec<String> = (0..600usize)
+            .map(|i| format!("sync-extra-{i:04}-{}", "z".repeat(96)))
+            .collect();
+        let mut extra_payload = String::new();
+        for line in &extra_expected {
+            extra_payload.push_str(line);
+            extra_payload.push('\n');
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(extra_payload.as_bytes())
+            .unwrap();
+
+        let evs2 = poller.poll_once();
+        let lines2: Vec<String> = evs2
+            .iter()
+            .filter_map(|e| match e {
+                LogEvent::Line { line, .. } => Some(line.clone()),
+                LogEvent::Checkpoint { .. } => None,
+            })
+            .collect();
+        let checkpoints2 = evs2
+            .iter()
+            .filter(|e| matches!(e, LogEvent::Checkpoint { .. }))
+            .count();
+        assert_eq!(lines2, extra_expected);
+        assert_eq!(checkpoints2, 1);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn polling_discovers_second_file_while_first_file_is_still_draining() {
+        let path_a = unique_temp_path("multi_a");
+        let path_b = unique_temp_path("multi_b");
+
+        let total_a = 3_000usize;
+        let expected_a: Vec<String> = (0..total_a)
+            .map(|i| format!("a-line-{i:04}-{}", "a".repeat(120)))
+            .collect();
+        let mut payload_a = String::new();
+        for line in &expected_a {
+            payload_a.push_str(line);
+            payload_a.push('\n');
+        }
+        fs::write(&path_a, payload_a.as_bytes()).unwrap();
+        fs::write(&path_b, b"").unwrap();
+
+        let poller = FilterPoll::with_interval(
+            vec![
+                FileLogConfig {
+                    path: path_a.clone(),
+                    tail: false,
+                    resume_fingerprint: None,
+                    resume_offset: 0,
+                    auto_seek: None,
+                },
+                FileLogConfig {
+                    path: path_b.clone(),
+                    tail: false,
+                    resume_fingerprint: None,
+                    resume_offset: 0,
+                    auto_seek: None,
+                },
+            ],
+            LogEncoding::Utf8,
+            Duration::from_millis(25),
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let handle = tokio::spawn(poller.run(tx, shut_rx));
+
+        let mut got_a = Vec::with_capacity(total_a);
+        let mut got_b = Vec::new();
+        let mut a_count_when_first_b_arrived: Option<usize> = None;
+        let path_b_str = path_b.to_string_lossy().into_owned();
+
+        // Wait until file B's initial startup checkpoint is drained so B is no longer in
+        // `dirty_queue`, while file A still has most of its backlog unread on disk.
+        let mut b_initial_drained = false;
+        let setup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !b_initial_drained && tokio::time::Instant::now() < setup_deadline {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match ev {
+                LogEvent::Line { line, .. } => {
+                    assert!(line.starts_with("a-line-"));
+                    got_a.push(line);
+                }
+                LogEvent::Checkpoint { path, .. } if path == path_b_str => {
+                    b_initial_drained = true;
+                }
+                LogEvent::Checkpoint { .. } => {}
+            }
+        }
+        assert!(b_initial_drained, "file B initial checkpoint must arrive");
+        assert!(
+            got_a.len() < total_a - 1_000,
+            "file A must still have substantial backlog remaining before writing file B (got {})",
+            got_a.len()
+        );
+
+        // Write file B while A is still mid-drain, then let poll_interval elapse under backpressure.
+        let expected_b = vec![
+            "b-line-0".to_owned(),
+            "b-line-1".to_owned(),
+            "b-line-2".to_owned(),
+        ];
+        fs::write(&path_b, b"b-line-0\nb-line-1\nb-line-2\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (got_a.len() < total_a || got_b.len() < expected_b.len())
+            && tokio::time::Instant::now() < deadline
+        {
+            if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+                && let LogEvent::Line { line, .. } = ev
+            {
+                if line.starts_with("b-line-") {
+                    if a_count_when_first_b_arrived.is_none() {
+                        a_count_when_first_b_arrived = Some(got_a.len());
+                    }
+                    got_b.push(line);
+                } else {
+                    got_a.push(line);
+                }
+            }
+        }
+
+        let _ = shut_tx.send(true);
+        handle.await.unwrap().unwrap();
+
+        let first_b_at = a_count_when_first_b_arrived
+            .expect("second file must be discovered and delivered while first file drains");
+        assert!(
+            first_b_at < total_a,
+            "expected file B to be delivered before file A finished draining (got B after {first_b_at}/{total_a} lines of A)"
+        );
+        assert_eq!(got_a, expected_a);
+        assert_eq!(got_b, expected_b);
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
     }
 }

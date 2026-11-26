@@ -198,6 +198,7 @@ impl WatchedFile {
     /// Returns `true` when additional buffered or unread data remains to be drained in a later batch.
     pub(crate) fn collect_events_batch(&mut self, out: &mut Vec<LogEvent>) -> bool {
         let path_str = self.config.path.to_string_lossy().into_owned();
+        let mut lines_in_batch = 0usize;
 
         // Drain complete lines already buffered in `self.pending` from an earlier chunk first
         // so tiny-line bursts stay capped without dropping unread bytes across reopen checks.
@@ -206,11 +207,12 @@ impl WatchedFile {
             if consumed > 0 {
                 self.identity.set_pos(self.identity.pos + consumed as u64);
                 self.emitted_since_checkpoint = true;
+                lines_in_batch += emitted;
             }
             if self.pending.is_empty() && self.pending.capacity() > READ_CHUNK_SIZE * 2 {
                 self.pending.shrink_to(READ_CHUNK_SIZE);
             }
-            if emitted >= MAX_BATCH_LINES {
+            if lines_in_batch >= MAX_BATCH_LINES {
                 return true;
             }
         }
@@ -221,14 +223,14 @@ impl WatchedFile {
             .map(|m| m.dev() == self.identity.dev && m.ino() == self.identity.ino)
             .unwrap_or(false);
 
-        if !same_inode && self.drain_current_fd_batch(&path_str, out) {
+        if !same_inode && self.drain_current_fd_batch(&path_str, out, &mut lines_in_batch) {
             return true;
         }
 
         match self.identity.check_reopen(&mut self.file) {
-            Ok(Reopen::Same) => self.drain_current_fd_batch(&path_str, out),
+            Ok(Reopen::Same) => self.drain_current_fd_batch(&path_str, out, &mut lines_in_batch),
             Ok(Reopen::Rotated | Reopen::Truncated) => {
-                let had_lines = out.iter().any(|ev| matches!(ev, LogEvent::Line { .. }));
+                let had_lines = lines_in_batch > 0;
                 self.flush_pending_on_reset(out);
                 self.active_encoding = self.encoding;
                 self.emitted_since_checkpoint = false;
@@ -238,7 +240,7 @@ impl WatchedFile {
                     // Deliver old-file lines and reset checkpoint first; drain new file next batch.
                     return true;
                 }
-                self.drain_current_fd_batch(&path_str, out)
+                self.drain_current_fd_batch(&path_str, out, &mut lines_in_batch)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // Temporarily absent (e.g. mid-rotation); keep fd open until recreated.
@@ -271,7 +273,12 @@ impl WatchedFile {
         }
     }
 
-    fn drain_current_fd_batch(&mut self, path_str: &str, out: &mut Vec<LogEvent>) -> bool {
+    fn drain_current_fd_batch(
+        &mut self,
+        path_str: &str,
+        out: &mut Vec<LogEvent>,
+        lines_in_batch: &mut usize,
+    ) -> bool {
         let seek_target = self.identity.pos + self.pending.len() as u64;
         if let Err(err) = self.file.seek(SeekFrom::Start(seek_target)) {
             log_msg(
@@ -284,13 +291,9 @@ impl WatchedFile {
 
         let mut buf = [0u8; READ_CHUNK_SIZE];
         let mut bytes_read = 0usize;
-        let mut lines_in_batch = out
-            .iter()
-            .filter(|ev| matches!(ev, LogEvent::Line { .. }))
-            .count();
 
         loop {
-            if lines_in_batch >= MAX_BATCH_LINES {
+            if *lines_in_batch >= MAX_BATCH_LINES {
                 return true;
             }
             match self.file.read(&mut buf) {
@@ -318,13 +321,13 @@ impl WatchedFile {
                             self.identity.set_pos(self.identity.pos + bom as u64);
                         }
                     }
-                    let remaining_lines = MAX_BATCH_LINES.saturating_sub(lines_in_batch);
+                    let remaining_lines = MAX_BATCH_LINES.saturating_sub(*lines_in_batch);
                     let (consumed, emitted) =
                         self.emit_complete_lines(path_str, out, remaining_lines);
                     if consumed > 0 {
                         self.identity.set_pos(self.identity.pos + consumed as u64);
                         self.emitted_since_checkpoint = true;
-                        lines_in_batch += emitted;
+                        *lines_in_batch += emitted;
                     }
                     if self.pending.len() >= MAX_PENDING_LINE_BYTES {
                         self.ensure_fingerprint();
@@ -341,14 +344,14 @@ impl WatchedFile {
                             journal_cursor: None,
                         });
                         self.emitted_since_checkpoint = true;
-                        lines_in_batch += 1;
+                        *lines_in_batch += 1;
                     }
                     if self.pending.is_empty() && self.pending.capacity() > READ_CHUNK_SIZE * 2 {
                         self.pending.shrink_to(READ_CHUNK_SIZE);
                     }
                     // Yield after one bounded chunk once lines were emitted (never mark EOF early).
-                    if lines_in_batch >= MAX_BATCH_LINES
-                        || (bytes_read >= READ_CHUNK_SIZE && lines_in_batch > 0)
+                    if *lines_in_batch >= MAX_BATCH_LINES
+                        || (bytes_read >= READ_CHUNK_SIZE && *lines_in_batch > 0)
                     {
                         return true;
                     }
