@@ -98,7 +98,7 @@ cleanup() {
 }
 trap cleanup EXIT
 if [[ $# -eq 0 ]]; then
-    version="${FAIL2BAN_VERSION:-1.1.6}"
+    version="${FAIL2BAN_VERSION:-1.1.7}"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid Fail2Ban version."
     case "$(uname -m)" in
         x86_64|amd64) arch=amd64 ;;
