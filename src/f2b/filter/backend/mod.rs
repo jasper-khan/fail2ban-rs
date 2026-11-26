@@ -23,6 +23,8 @@ use super::file_identity::{FileIdentityState, Reopen};
 
 /// Read chunk size for log tailing (64 KiB).
 const READ_CHUNK_SIZE: usize = 64 * 1024;
+/// Upper bound on complete lines emitted per bounded read batch (below `EVENT_CHANNEL_CAPACITY`).
+pub(crate) const MAX_BATCH_LINES: usize = 512;
 /// Maximum raw bytes held for a single unterminated log line before force-flushing.
 const MAX_PENDING_LINE_BYTES: usize = 1024 * 1024;
 /// Probe chunk size and per-line cap for binary `seek_to_time`.
@@ -135,6 +137,8 @@ pub(crate) struct WatchedFile {
     file: File,
     pending: Vec<u8>,
     in_operation: bool,
+    emitted_since_checkpoint: bool,
+    needs_initial_checkpoint: bool,
 }
 
 impl WatchedFile {
@@ -183,34 +187,62 @@ impl WatchedFile {
             file,
             pending: Vec::new(),
             in_operation,
+            emitted_since_checkpoint: false,
+            needs_initial_checkpoint: true,
         })
     }
 
-    /// Read any newly appended bytes, handle rotation/truncation, and emit
-    /// complete lines and offset checkpoints into `out`.
-    pub(crate) fn collect_events(&mut self, out: &mut Vec<LogEvent>) {
+    /// Read at most one bounded batch (up to `READ_CHUNK_SIZE` bytes / `MAX_BATCH_LINES` lines),
+    /// handle rotation/truncation, and emit lines plus EOF/reset checkpoints into `out`.
+    ///
+    /// Returns `true` when additional buffered or unread data remains to be drained in a later batch.
+    pub(crate) fn collect_events_batch(&mut self, out: &mut Vec<LogEvent>) -> bool {
+        let path_str = self.config.path.to_string_lossy().into_owned();
+
+        // Drain complete lines already buffered in `self.pending` from an earlier chunk first
+        // so tiny-line bursts stay capped without dropping unread bytes across reopen checks.
+        if !self.pending.is_empty() {
+            let (consumed, emitted) = self.emit_complete_lines(&path_str, out, MAX_BATCH_LINES);
+            if consumed > 0 {
+                self.identity.set_pos(self.identity.pos + consumed as u64);
+                self.emitted_since_checkpoint = true;
+            }
+            if self.pending.is_empty() && self.pending.capacity() > READ_CHUNK_SIZE * 2 {
+                self.pending.shrink_to(READ_CHUNK_SIZE);
+            }
+            if emitted >= MAX_BATCH_LINES {
+                return true;
+            }
+        }
+
         // Only drain old fd prior to reopen when path already switched to another inode
         // (e.g. logrotate rename), so tailing lines on the unlinked/renamed fd aren't lost.
         let same_inode = fs::metadata(&self.config.path)
             .map(|m| m.dev() == self.identity.dev && m.ino() == self.identity.ino)
             .unwrap_or(false);
 
-        if !same_inode {
-            self.drain_current_fd(out);
+        if !same_inode && self.drain_current_fd_batch(&path_str, out) {
+            return true;
         }
 
         match self.identity.check_reopen(&mut self.file) {
-            Ok(Reopen::Same) => {
-                self.drain_current_fd(out);
-            }
+            Ok(Reopen::Same) => self.drain_current_fd_batch(&path_str, out),
             Ok(Reopen::Rotated | Reopen::Truncated) => {
+                let had_lines = out.iter().any(|ev| matches!(ev, LogEvent::Line { .. }));
                 self.flush_pending_on_reset(out);
                 self.active_encoding = self.encoding;
+                self.emitted_since_checkpoint = false;
+                self.needs_initial_checkpoint = false;
                 out.push(self.checkpoint_event());
-                self.drain_current_fd(out);
+                if had_lines {
+                    // Deliver old-file lines and reset checkpoint first; drain new file next batch.
+                    return true;
+                }
+                self.drain_current_fd_batch(&path_str, out)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // Temporarily absent (e.g. mid-rotation); keep fd open until recreated.
+                false
             }
             Err(err) => {
                 log_msg(
@@ -218,6 +250,7 @@ impl WatchedFile {
                     "fail2ban.filter",
                     &format!("Unable to check {:?}: {err}", self.config.path),
                 );
+                false
             }
         }
     }
@@ -238,7 +271,7 @@ impl WatchedFile {
         }
     }
 
-    fn drain_current_fd(&mut self, out: &mut Vec<LogEvent>) {
+    fn drain_current_fd_batch(&mut self, path_str: &str, out: &mut Vec<LogEvent>) -> bool {
         let seek_target = self.identity.pos + self.pending.len() as u64;
         if let Err(err) = self.file.seek(SeekFrom::Start(seek_target)) {
             log_msg(
@@ -246,20 +279,33 @@ impl WatchedFile {
                 "fail2ban.filter",
                 &format!("Seek failed on {:?}: {err}", self.config.path),
             );
-            return;
+            return false;
         }
 
         let mut buf = [0u8; READ_CHUNK_SIZE];
-        let mut emitted_lines = false;
-        let path_str = self.config.path.to_string_lossy().into_owned();
+        let mut bytes_read = 0usize;
+        let mut lines_in_batch = out
+            .iter()
+            .filter(|ev| matches!(ev, LogEvent::Line { .. }))
+            .count();
 
         loop {
+            if lines_in_batch >= MAX_BATCH_LINES {
+                return true;
+            }
             match self.file.read(&mut buf) {
                 Ok(0) => {
                     self.in_operation = true;
-                    break;
+                    if self.emitted_since_checkpoint || self.needs_initial_checkpoint {
+                        self.ensure_fingerprint();
+                        out.push(self.checkpoint_event());
+                        self.emitted_since_checkpoint = false;
+                        self.needs_initial_checkpoint = false;
+                    }
+                    return false;
                 }
                 Ok(n) => {
+                    bytes_read += n;
                     self.pending.extend_from_slice(&buf[..n]);
                     if self.active_encoding == LogEncoding::Utf16
                         && self.identity.pos == 0
@@ -272,10 +318,13 @@ impl WatchedFile {
                             self.identity.set_pos(self.identity.pos + bom as u64);
                         }
                     }
-                    let consumed = self.emit_complete_lines(&path_str, out);
+                    let remaining_lines = MAX_BATCH_LINES.saturating_sub(lines_in_batch);
+                    let (consumed, emitted) =
+                        self.emit_complete_lines(path_str, out, remaining_lines);
                     if consumed > 0 {
                         self.identity.set_pos(self.identity.pos + consumed as u64);
-                        emitted_lines = true;
+                        self.emitted_since_checkpoint = true;
+                        lines_in_batch += emitted;
                     }
                     if self.pending.len() >= MAX_PENDING_LINE_BYTES {
                         self.ensure_fingerprint();
@@ -286,12 +335,22 @@ impl WatchedFile {
                         out.push(LogEvent::Line {
                             line,
                             preset_date: None,
-                            log_path: Some(path_str.clone()),
+                            log_path: Some(path_str.to_owned()),
                             in_operation: self.in_operation,
                             checkpoint: Some((self.identity.fingerprint.clone(), next_pos)),
                             journal_cursor: None,
                         });
-                        emitted_lines = true;
+                        self.emitted_since_checkpoint = true;
+                        lines_in_batch += 1;
+                    }
+                    if self.pending.is_empty() && self.pending.capacity() > READ_CHUNK_SIZE * 2 {
+                        self.pending.shrink_to(READ_CHUNK_SIZE);
+                    }
+                    // Yield after one bounded chunk once lines were emitted (never mark EOF early).
+                    if lines_in_batch >= MAX_BATCH_LINES
+                        || (bytes_read >= READ_CHUNK_SIZE && lines_in_batch > 0)
+                    {
+                        return true;
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -301,22 +360,24 @@ impl WatchedFile {
                         "fail2ban.filter",
                         &format!("Read failed on {:?}: {err}", self.config.path),
                     );
-                    break;
+                    return false;
                 }
             }
         }
-
-        if emitted_lines {
-            self.ensure_fingerprint();
-            out.push(self.checkpoint_event());
-        }
     }
 
-    fn emit_complete_lines(&mut self, path_str: &str, out: &mut Vec<LogEvent>) -> usize {
+    fn emit_complete_lines(
+        &mut self,
+        path_str: &str,
+        out: &mut Vec<LogEvent>,
+        max_lines: usize,
+    ) -> (usize, usize) {
         let mut start = 0usize;
+        let mut emitted = 0usize;
         let mut checked_fp = false;
-        while let Some((line_end, next_start)) =
-            self.active_encoding.split_line(&self.pending[start..])
+        while emitted < max_lines
+            && let Some((line_end, next_start)) =
+                self.active_encoding.split_line(&self.pending[start..])
         {
             if !checked_fp {
                 self.ensure_fingerprint();
@@ -335,11 +396,12 @@ impl WatchedFile {
                 journal_cursor: None,
             });
             start += next_start;
+            emitted += 1;
         }
         if start > 0 {
             self.pending.drain(..start);
         }
-        start
+        (start, emitted)
     }
 
     fn flush_pending_on_reset(&mut self, out: &mut Vec<LogEvent>) {
@@ -692,7 +754,7 @@ mod tests {
             )
             .unwrap();
             let mut evs = Vec::new();
-            wf.collect_events(&mut evs);
+            while wf.collect_events_batch(&mut evs) {}
             let lines: Vec<String> = evs
                 .into_iter()
                 .filter_map(|e| match e {
@@ -706,5 +768,101 @@ mod tests {
 
             let _ = fs::remove_file(&path);
         }
+    }
+
+    #[test]
+    fn watched_file_bounds_batches_preserves_cold_start_and_stitches_partial_lines() {
+        let path = temp_path("bounded_batch");
+        // Write > 3x READ_CHUNK_SIZE (~220 KiB) with odd line lengths so lines straddle 64 KiB boundaries.
+        let mut expected = Vec::new();
+        let mut content = String::new();
+        for i in 0..1600usize {
+            let line = format!(
+                "1700000001 line-{i:04}-payload-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
+            content.push_str(&line);
+            content.push('\n');
+            expected.push(line);
+        }
+        fs::write(&path, &content).unwrap();
+
+        let mut wf = WatchedFile::open(
+            FileLogConfig {
+                path: path.clone(),
+                tail: false,
+                resume_fingerprint: None,
+                resume_offset: 0,
+                auto_seek: None,
+            },
+            LogEncoding::Utf8,
+            None,
+        )
+        .unwrap();
+
+        let mut batches = 0usize;
+        let mut checkpoints = 0usize;
+        let mut seen = Vec::new();
+        loop {
+            let mut batch = Vec::new();
+            let has_more = wf.collect_events_batch(&mut batch);
+            batches += 1;
+            if batches == 1 {
+                assert!(
+                    has_more && wf.identity.pos < content.len() as u64,
+                    "first batch must deliver before reading the entire backlog"
+                );
+            }
+            let batch_lines = batch
+                .iter()
+                .filter(|ev| matches!(ev, LogEvent::Line { .. }))
+                .count();
+            assert!(
+                batch_lines <= MAX_BATCH_LINES,
+                "batch exceeded MAX_BATCH_LINES: {batch_lines}"
+            );
+            for ev in batch {
+                match ev {
+                    LogEvent::Line {
+                        line, in_operation, ..
+                    } => {
+                        // Cold start must remain false across every intermediate batch until EOF.
+                        assert!(
+                            !in_operation,
+                            "in_operation flipped true before EOF on cold start"
+                        );
+                        seen.push(line);
+                    }
+                    LogEvent::Checkpoint { .. } => {
+                        checkpoints += 1;
+                        assert!(!has_more, "checkpoint emitted before true EOF");
+                    }
+                }
+            }
+            if !has_more {
+                break;
+            }
+        }
+
+        assert!(
+            batches >= 3,
+            "expected multiple bounded batches, got {batches}"
+        );
+        assert_eq!(checkpoints, 1, "expected exactly one EOF checkpoint");
+        assert_eq!(seen, expected);
+
+        // Live append after EOF must carry in_operation = true.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "1700000002 live-after-eof").unwrap();
+        }
+        let mut live = Vec::new();
+        assert!(!wf.collect_events_batch(&mut live));
+        assert!(live.iter().any(|ev| matches!(
+            ev,
+            LogEvent::Line { line, in_operation: true, .. } if line == "1700000002 live-after-eof"
+        )));
+
+        let _ = fs::remove_file(&path);
     }
 }

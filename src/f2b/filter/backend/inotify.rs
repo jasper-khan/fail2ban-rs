@@ -2,7 +2,7 @@
 //! `fail2ban/server/filterpyinotify.py`.
 #![allow(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -10,6 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 
@@ -108,6 +109,9 @@ pub struct FilterPyinotify {
     dir_wds: BTreeMap<i32, PathBuf>,
     dir_to_wd: BTreeMap<PathBuf, i32>,
     dir_children: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    /// Round-robin queue of paths with pending bounded read batches (`dirty_flags` tracks watch refresh).
+    dirty_queue: VecDeque<PathBuf>,
+    dirty_flags: BTreeMap<PathBuf, bool>,
 }
 
 impl FilterPyinotify {
@@ -137,7 +141,24 @@ impl FilterPyinotify {
             dir_wds: BTreeMap::new(),
             dir_to_wd: BTreeMap::new(),
             dir_children: BTreeMap::new(),
+            dirty_queue: VecDeque::new(),
+            dirty_flags: BTreeMap::new(),
         }
+    }
+
+    fn enqueue_dirty(&mut self, path: PathBuf, refresh_watch: bool) {
+        if let Some(existing) = self.dirty_flags.get_mut(&path) {
+            *existing |= refresh_watch;
+        } else {
+            self.dirty_flags.insert(path.clone(), refresh_watch);
+            self.dirty_queue.push_back(path);
+        }
+    }
+
+    fn pop_dirty(&mut self) -> Option<(PathBuf, bool)> {
+        let path = self.dirty_queue.pop_front()?;
+        let refresh = self.dirty_flags.remove(&path).unwrap_or(false);
+        Some((path, refresh))
     }
 
     /// Run the async Linux inotify watcher loop until `shutdown` signals `true` or `tx` closes.
@@ -154,14 +175,10 @@ impl FilterPyinotify {
         let async_fd = AsyncFd::new(inotify_fd)
             .map_err(|err| Error::io("AsyncFd registration failed", err))?;
 
-        let mut startup_events = Vec::new();
         let initial_configs: Vec<FileLogConfig> = self.configs.values().cloned().collect();
         for cfg in initial_configs {
             self.register_dir_watch(async_fd.get_ref(), &cfg.path);
-            self.try_open_file(async_fd.get_ref(), cfg, None, &mut startup_events);
-        }
-        if !send_events(&tx, &mut shutdown, startup_events).await {
-            return Ok(());
+            self.try_open_file(async_fd.get_ref(), cfg, None);
         }
 
         let mut buf = vec![0u8; READ_BUF_BYTES];
@@ -183,6 +200,48 @@ impl FilterPyinotify {
                 pending_armed = true;
             }
 
+            if !self.dirty_queue.is_empty() {
+                if pending_armed && tokio::time::Instant::now() >= pending_sleep.deadline() {
+                    self.retry_pending(async_fd.get_ref());
+                    pending_armed = !self.pending.is_empty();
+                    if pending_armed {
+                        pending_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + self.pending_retry);
+                    }
+                }
+                if let Err(err) = async_fd.try_io(Interest::READABLE, |inner| {
+                    loop {
+                        match read_inotify_batch(inner.as_raw_fd(), &mut buf) {
+                            Ok(decoded) if decoded.is_empty() => return Ok(()),
+                            Ok(decoded) => self.handle_kernel_events(inner, &decoded),
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Err(err),
+                            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }) && err.kind() != io::ErrorKind::WouldBlock
+                {
+                    return Err(Error::io("inotify read failed", err));
+                }
+                if let Some((path, refresh_watch)) = self.pop_dirty() {
+                    let mut batch = Vec::new();
+                    let has_more = self.collect_path_batch(
+                        async_fd.get_ref(),
+                        &path,
+                        refresh_watch,
+                        &mut batch,
+                    );
+                    if has_more {
+                        self.enqueue_dirty(path, refresh_watch);
+                    }
+                    if !batch.is_empty() && !send_events(&tx, &mut shutdown, batch).await {
+                        break;
+                    }
+                }
+                continue;
+            }
+
             tokio::select! {
                 res = shutdown.changed() => {
                     if res.is_err() || *shutdown.borrow() {
@@ -190,10 +249,7 @@ impl FilterPyinotify {
                     }
                 }
                 () = &mut pending_sleep, if pending_armed => {
-                    let retry_events = self.retry_pending(async_fd.get_ref());
-                    if !send_events(&tx, &mut shutdown, retry_events).await {
-                        break;
-                    }
+                    self.retry_pending(async_fd.get_ref());
                     pending_armed = !self.pending.is_empty();
                     if pending_armed {
                         pending_sleep
@@ -209,16 +265,11 @@ impl FilterPyinotify {
                         }
                     };
 
-                    let mut batch_events = Vec::new();
                     loop {
                         match read_inotify_batch(guard.get_inner().as_raw_fd(), &mut buf) {
                             Ok(decoded) if decoded.is_empty() => break,
                             Ok(decoded) => {
-                                self.handle_kernel_events(
-                                    guard.get_inner(),
-                                    &decoded,
-                                    &mut batch_events,
-                                );
+                                self.handle_kernel_events(guard.get_inner(), &decoded);
                             }
                             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                                 guard.clear_ready();
@@ -229,10 +280,6 @@ impl FilterPyinotify {
                                 return Err(Error::io("inotify read failed", err));
                             }
                         }
-                    }
-
-                    if !send_events(&tx, &mut shutdown, batch_events).await {
-                        break;
                     }
                 }
             }
@@ -302,21 +349,14 @@ impl FilterPyinotify {
         fd: &InotifyFd,
         cfg: FileLogConfig,
         tail_override: Option<bool>,
-        out: &mut Vec<LogEvent>,
-    ) {
+    ) -> bool {
         let path = cfg.path.clone();
         match WatchedFile::open(cfg.clone(), self.encoding, tail_override) {
-            Ok(mut wf) => {
-                let before = out.len();
-                wf.collect_events(out);
-                if !out[before..]
-                    .iter()
-                    .any(|ev| matches!(ev, LogEvent::Checkpoint { .. }))
-                {
-                    out.push(wf.checkpoint_event());
-                }
+            Ok(wf) => {
                 self.watched.insert(path.clone(), wf);
                 self.refresh_file_watch(fd, &path);
+                self.enqueue_dirty(path, false);
+                true
             }
             Err(err) => {
                 if err.kind() != io::ErrorKind::NotFound {
@@ -327,30 +367,24 @@ impl FilterPyinotify {
                     );
                 }
                 self.pending.insert(path, cfg);
+                false
             }
         }
     }
 
-    fn retry_pending(&mut self, fd: &InotifyFd) -> Vec<LogEvent> {
-        let mut events = Vec::new();
+    fn retry_pending(&mut self, fd: &InotifyFd) {
         let pending_list: Vec<FileLogConfig> = self.pending.values().cloned().collect();
         for cfg in pending_list {
             self.register_dir_watch(fd, &cfg.path);
             if self.watched.contains_key(&cfg.path) {
-                self.process_path_event(fd, &cfg.path, true, &mut events);
+                self.enqueue_dirty(cfg.path, true);
             } else {
-                self.try_open_file(fd, cfg, Some(false), &mut events);
+                self.try_open_file(fd, cfg, Some(false));
             }
         }
-        events
     }
 
-    fn handle_kernel_events(
-        &mut self,
-        fd: &InotifyFd,
-        decoded: &[DecodedInotifyEvent],
-        out: &mut Vec<LogEvent>,
-    ) {
+    fn handle_kernel_events(&mut self, fd: &InotifyFd, decoded: &[DecodedInotifyEvent]) {
         let mut touched_paths = BTreeSet::new();
         let mut overflow = false;
 
@@ -413,32 +447,42 @@ impl FilterPyinotify {
             );
             let all_paths: Vec<PathBuf> = self.configs.keys().cloned().collect();
             for path in all_paths {
-                self.process_path_event(fd, &path, true, out);
+                self.enqueue_dirty(path, true);
             }
             return;
         }
 
         for (path, refresh_watch) in touched_paths {
-            self.process_path_event(fd, &path, refresh_watch, out);
+            self.enqueue_dirty(path, refresh_watch);
         }
     }
 
-    fn process_path_event(
+    fn collect_path_batch(
         &mut self,
         fd: &InotifyFd,
         path: &Path,
         refresh_watch: bool,
         out: &mut Vec<LogEvent>,
-    ) {
+    ) -> bool {
         if let Some(wf) = self.watched.get_mut(path) {
-            wf.collect_events(out);
-            if refresh_watch || !self.path_to_file_wd.contains_key(path) {
+            let has_more = wf.collect_events_batch(out);
+            if !has_more && (refresh_watch || !self.path_to_file_wd.contains_key(path)) {
                 self.refresh_file_watch(fd, path);
             }
-        } else if let Some(cfg) = self.pending.get(path).cloned() {
-            // File just created after startup -> read from offset 0.
-            self.try_open_file(fd, cfg, Some(false), out);
+            return has_more;
         }
+        if let Some(cfg) = self.pending.get(path).cloned() {
+            // File just created after startup -> open from offset 0, then drain first bounded batch.
+            if self.try_open_file(fd, cfg, Some(false)) {
+                // `try_open_file` queued `path`; pop it immediately and drain its first batch.
+                let _ = self.dirty_flags.remove(path);
+                self.dirty_queue.retain(|p| p != path);
+                if let Some(wf) = self.watched.get_mut(path) {
+                    return wf.collect_events_batch(out);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -686,5 +730,175 @@ mod tests {
         let _ = fs::remove_file(&active_path);
         let _ = fs::remove_file(&rotated_old);
         let _ = fs::remove_file(&late_path);
+    }
+
+    #[tokio::test]
+    async fn inotify_bounds_multi_batch_append_under_slow_consumer_and_resumes_from_checkpoint() {
+        let path = unique_temp_path("backpressure");
+        fs::write(&path, b"").unwrap();
+
+        let total_lines = 2000usize;
+        let expected: Vec<String> = (0..total_lines)
+            .map(|i| {
+                format!(
+                    "1700000100 seq-{i:04}-padding-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                )
+            })
+            .collect();
+        let mut payload = String::new();
+        for line in &expected {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+
+        // 1. Single multi-batch append delivered in order through a tiny channel (backpressure).
+        let backend = FilterPyinotify::with_pending_retry(
+            vec![FileLogConfig {
+                path: path.clone(),
+                tail: false,
+                resume_fingerprint: None,
+                resume_offset: 0,
+                auto_seek: None,
+            }],
+            LogEncoding::Utf8,
+            Duration::from_millis(50),
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let task = tokio::spawn(backend.run(tx, shut_rx));
+
+        // Wait for initial empty-file checkpoint before appending all lines in one write.
+        let init_ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(init_ev, LogEvent::Checkpoint { offset: 0, .. }));
+
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(payload.as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut received = Vec::with_capacity(total_lines);
+        let mut eof_checkpoints = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while received.len() < total_lines && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            {
+                match ev {
+                    LogEvent::Line {
+                        line, in_operation, ..
+                    } => {
+                        assert!(
+                            in_operation,
+                            "live multi-batch append must stay in_operation"
+                        );
+                        received.push(line);
+                        if received.len() == 1 || received.len() % 500 == 0 {
+                            // Slow consumer pacing: verifies producer makes forward progress across batches.
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                    LogEvent::Checkpoint { .. } => eof_checkpoints += 1,
+                }
+            }
+        }
+        // Drain final EOF checkpoint.
+        if let Ok(Some(LogEvent::Checkpoint { .. })) =
+            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            eof_checkpoints += 1;
+        }
+        let _ = shut_tx.send(true);
+        task.await.unwrap().unwrap();
+
+        assert_eq!(received, expected);
+        assert_eq!(
+            eof_checkpoints, 1,
+            "multi-batch append must emit only one EOF checkpoint"
+        );
+
+        // 2. Shutdown mid-backlog under slow consumer, then resume from last consumed line checkpoint.
+        let backend2 = FilterPyinotify::with_pending_retry(
+            vec![FileLogConfig {
+                path: path.clone(),
+                tail: false,
+                resume_fingerprint: None,
+                resume_offset: 0,
+                auto_seek: None,
+            }],
+            LogEncoding::Utf8,
+            Duration::from_millis(50),
+        );
+        let (tx2, mut rx2) = mpsc::channel(2);
+        let (shut_tx2, shut_rx2) = watch::channel(false);
+        let task2 = tokio::spawn(backend2.run(tx2, shut_rx2));
+
+        let stop_after = 600usize;
+        let mut first_part = Vec::with_capacity(stop_after);
+        let mut last_cp: Option<(String, u64)> = None;
+        while first_part.len() < stop_after {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx2.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let LogEvent::Line {
+                line,
+                in_operation,
+                checkpoint,
+                ..
+            } = ev
+            {
+                assert!(
+                    !in_operation,
+                    "cold-start catch-up must keep in_operation=false before EOF"
+                );
+                first_part.push(line);
+                last_cp = checkpoint;
+            }
+        }
+        let _ = shut_tx2.send(true);
+        tokio::time::timeout(Duration::from_secs(2), task2)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let (resume_fp, resume_off) = last_cp.unwrap();
+        assert!(!resume_fp.is_empty() && resume_off > 0);
+
+        let backend3 = FilterPyinotify::with_pending_retry(
+            vec![FileLogConfig {
+                path: path.clone(),
+                tail: false,
+                resume_fingerprint: Some(resume_fp),
+                resume_offset: resume_off,
+                auto_seek: None,
+            }],
+            LogEncoding::Utf8,
+            Duration::from_millis(50),
+        );
+        let (tx3, mut rx3) = mpsc::channel(4);
+        let (shut_tx3, shut_rx3) = watch::channel(false);
+        let task3 = tokio::spawn(backend3.run(tx3, shut_rx3));
+
+        let mut remainder = Vec::with_capacity(total_lines - stop_after);
+        while remainder.len() < total_lines - stop_after {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx3.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let LogEvent::Line { line, .. } = ev {
+                remainder.push(line);
+            }
+        }
+        let _ = shut_tx3.send(true);
+        task3.await.unwrap().unwrap();
+
+        assert_eq!(first_part, expected[..stop_after]);
+        assert_eq!(remainder, expected[stop_after..]);
+
+        let _ = fs::remove_file(&path);
     }
 }
